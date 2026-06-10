@@ -1,0 +1,78 @@
+{
+  "task": {
+    "model_role": "edge",
+    "target_group": "combined",
+    "label_names": [
+      "TSS+",
+      "TSS-",
+      "PolyA+",
+      "PolyA-"
+    ]
+  },
+  "data": {
+    "source": "hf",
+    "repo": "AIRI-Institute/genatator-gene-finding-dataset",
+    "train_split": "train",
+    "validation_split": "validation"
+  },
+  "tokenizer": {
+    "kind": "bpe",
+    "path": "AIRI-Institute/moderngena-base",
+    "max_tokens": 1024,
+    "trust_remote_code": true,
+    "local_files_only": false
+  },
+  "window": {
+    "mode": "random",
+    "nucleotide_length": 9216,
+    "overlap": 0.5,
+    "samples_per_epoch": 200000,
+    "min_length": 512
+  },
+  "model": {
+    "family": "modernbert_token_classifier",
+    "pretrained_model_name_or_path": "AIRI-Institute/moderngena-base",
+    "trust_remote_code": true,
+    "local_files_only": false,
+    "num_labels": 4,
+    "label_mode": "token",
+    "pos_weight": [
+      50.0,
+      50.0,
+      50.0,
+      50.0
+    ]
+  },
+  "training": {
+    "output_dir": "runs/finding/edge_moderngena_base",
+    "seed": 42,
+    "batch_size": 16,
+    "gradient_accumulation_steps": 1,
+    "num_workers": 8,
+    "mixed_precision": "bf16",
+    "backbone_trainable": true,
+    "max_steps": 500000,
+    "lr": 5e-05,
+    "weight_decay": 0.0001,
+    "scheduler": "constant_with_warmup",
+    "warmup_steps": 1000,
+    "log_every": 100,
+    "eval_every": 1000,
+    "save_every": 0,
+    "optimize_metric": "opt/pr_auc_mean",
+    "optimize_mode": "max",
+    "clip_grad_norm": 1.0
+  },
+  "eval": {
+    "thresholds": [
+      0.1,
+      0.2,
+      0.3,
+      0.5,
+      0.7
+    ]
+  },
+  "inference": {
+    "use_reverse_complement": false
+  }
+}

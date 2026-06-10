@@ -1,0 +1,96 @@
+{
+  "task": {
+    "model_role": "segmentation",
+    "label_names": [
+      "5UTR",
+      "exon",
+      "intron",
+      "3UTR",
+      "CDS"
+    ]
+  },
+  "data": {
+    "source": "hf",
+    "repo": "AIRI-Institute/genatator-gene-segmentation-dataset",
+    "train_name": "train-multi-specie",
+    "validation_name": "val-human",
+    "train_split": "train",
+    "validation_split": "validation",
+    "representative_only": true
+  },
+  "tokenizer": {
+    "kind": "nucleotide",
+    "path": "kuleshov-group/caduceus-ps_seqlen-131k_d_model-256_n_layer-16",
+    "max_tokens": 4096,
+    "pad_token_id": 4,
+    "eos_token_id": 1,
+    "add_eos": true,
+    "pad_side": "left",
+    "trust_remote_code": true,
+    "local_files_only": false
+  },
+  "window": {
+    "mode": "random",
+    "nucleotide_length": 4095,
+    "overlap": 0.5,
+    "samples_per_epoch": 200000,
+    "min_length": 512
+  },
+  "model": {
+    "family": "auto_encoder",
+    "pretrained_model_name_or_path": "kuleshov-group/caduceus-ps_seqlen-131k_d_model-256_n_layer-16",
+    "trust_remote_code": true,
+    "local_files_only": false,
+    "config_overrides": {
+      "bidirectional_weight_tie": false
+    },
+    "adapter": {
+      "type": "none"
+    },
+    "num_labels": 5,
+    "label_mode": "token",
+    "dropout": 0.0,
+    "pos_weight": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ]
+  },
+  "training": {
+    "output_dir": "runs/segmentation/caduceus_ps",
+    "seed": 42,
+    "batch_size": 1,
+    "gradient_accumulation_steps": 1,
+    "num_workers": 8,
+    "mixed_precision": "bf16",
+    "backbone_trainable": true,
+    "max_steps": 500000,
+    "lr": 5e-05,
+    "weight_decay": 0.0001,
+    "scheduler": "constant_with_warmup",
+    "warmup_steps": 1000,
+    "log_every": 100,
+    "eval_every": 1000,
+    "save_every": 0,
+    "optimize_metric": "opt/interval_f1_exon",
+    "optimize_mode": "max",
+    "clip_grad_norm": 1.0
+  },
+  "eval": {
+    "thresholds": [
+      0.1,
+      0.2,
+      0.3,
+      0.5,
+      0.7,
+      0.9
+    ],
+    "gene_level": true,
+    "gene_level_threshold": 0.5
+  },
+  "inference": {
+    "use_reverse_complement": false
+  }
+}

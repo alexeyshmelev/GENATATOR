@@ -1,0 +1,16 @@
+{
+  "edge_config": "finding/configs/edge_moderngena_base.json",
+  "edge_checkpoint": "runs/finding/edge_moderngena_base/best/pytorch_model.bin",
+  "region_config": "finding/configs/region_moderngena_base.json",
+  "region_checkpoint": "runs/finding/region_moderngena_base/best/pytorch_model.bin",
+  "postprocess": {
+    "lp_frac": 0.05,
+    "pk_prom": 0.15,
+    "pk_dist": 50,
+    "pk_height": null,
+    "interval_window_size": 2000000,
+    "max_pairs_per_seed": 10,
+    "prob_threshold": 0.5,
+    "zero_fraction_drop_threshold": 0.01
+  }
+}

@@ -1,0 +1,8 @@
+[project]
+name = "genatator-clean"
+version = "0.1.0"
+description = "Clean first-pass finetuning repository for GENATATOR gene finding, segmentation, and transcript type models."
+requires-python = ">=3.10"
+
+[tool.setuptools]
+packages = ["genatator_core"]

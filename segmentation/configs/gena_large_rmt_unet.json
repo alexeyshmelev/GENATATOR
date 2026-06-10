@@ -1,0 +1,104 @@
+{
+  "task": {
+    "model_role": "segmentation",
+    "label_names": [
+      "5UTR",
+      "exon",
+      "intron",
+      "3UTR",
+      "CDS"
+    ]
+  },
+  "data": {
+    "source": "hf",
+    "repo": "AIRI-Institute/genatator-gene-segmentation-dataset",
+    "train_name": "train-multi-specie",
+    "validation_name": "val-human",
+    "train_split": "train",
+    "validation_split": "validation",
+    "representative_only": true
+  },
+  "tokenizer": {
+    "kind": "bpe",
+    "path": "AIRI-Institute/gena-lm-bert-large-t2t",
+    "max_tokens": 32768,
+    "trust_remote_code": true,
+    "local_files_only": false
+  },
+  "window": {
+    "mode": "random",
+    "nucleotide_length": 250000,
+    "overlap": 0.5,
+    "samples_per_epoch": 200000,
+    "min_length": 512
+  },
+  "model": {
+    "family": "auto_encoder",
+    "pretrained_model_name_or_path": "AIRI-Institute/gena-lm-bert-large-t2t",
+    "trust_remote_code": true,
+    "local_files_only": false,
+    "adapter": {
+      "type": "rmt",
+      "num_mem_tokens": 10,
+      "segment_size": 512,
+      "max_segments": 10000,
+      "bptt_depth": -1,
+      "cls_token_id": 1,
+      "sep_token_id": 2,
+      "pad_token_id": 3
+    },
+    "num_labels": 5,
+    "label_mode": "nucleotide_unet",
+    "nucleotide_embedding_dim": 768,
+    "unet_hidden_channels": 1536,
+    "unet_channels": [
+      192,
+      384,
+      768
+    ],
+    "unet_layers": 2,
+    "dropout": 0.0,
+    "pos_weight": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ]
+  },
+  "training": {
+    "output_dir": "runs/segmentation/gena_large_rmt_unet",
+    "seed": 42,
+    "batch_size": 1,
+    "gradient_accumulation_steps": 1,
+    "num_workers": 8,
+    "mixed_precision": "bf16",
+    "backbone_trainable": true,
+    "max_steps": 500000,
+    "lr": 5e-05,
+    "weight_decay": 0.0001,
+    "scheduler": "constant_with_warmup",
+    "warmup_steps": 1000,
+    "log_every": 100,
+    "eval_every": 1000,
+    "save_every": 0,
+    "optimize_metric": "opt/interval_f1_exon",
+    "optimize_mode": "max",
+    "clip_grad_norm": 1.0
+  },
+  "eval": {
+    "thresholds": [
+      0.1,
+      0.2,
+      0.3,
+      0.5,
+      0.7,
+      0.9
+    ],
+    "gene_level": true,
+    "gene_level_threshold": 0.5
+  },
+  "inference": {
+    "use_reverse_complement": false
+  }
+}

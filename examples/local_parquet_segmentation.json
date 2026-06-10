@@ -1,0 +1,10 @@
+{
+  "data": {
+    "source": "local_parquet",
+    "data_files": {
+      "train": "data/genatator-gene-segmentation-dataset/train-multi-specie/*.parquet",
+      "validation": "data/genatator-gene-segmentation-dataset/val-human/*.parquet"
+    },
+    "representative_only": true
+  }
+}

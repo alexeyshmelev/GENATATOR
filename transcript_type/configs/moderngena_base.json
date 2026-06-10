@@ -1,0 +1,67 @@
+{
+  "task": {
+    "model_role": "transcript_type",
+    "label_names": [
+      "lnc_RNA"
+    ]
+  },
+  "data": {
+    "source": "hf",
+    "repo": "AIRI-Institute/genatator-gene-segmentation-dataset",
+    "train_name": "train-multi-specie",
+    "validation_name": "val-human",
+    "train_split": "train",
+    "validation_split": "validation",
+    "representative_only": true
+  },
+  "tokenizer": {
+    "kind": "bpe",
+    "path": "AIRI-Institute/moderngena-base",
+    "max_tokens": 8192,
+    "trust_remote_code": true,
+    "local_files_only": false
+  },
+  "window": {
+    "mode": "random",
+    "nucleotide_length": 73728,
+    "overlap": 0.5,
+    "samples_per_epoch": 200000,
+    "min_length": 512
+  },
+  "model": {
+    "family": "auto_encoder",
+    "pretrained_model_name_or_path": "AIRI-Institute/moderngena-base",
+    "trust_remote_code": true,
+    "local_files_only": false,
+    "adapter": {
+      "type": "none"
+    },
+    "num_labels": 1,
+    "label_mode": "sequence",
+    "dropout": 0.0
+  },
+  "training": {
+    "output_dir": "runs/transcript_type/moderngena_base",
+    "seed": 42,
+    "batch_size": 4,
+    "gradient_accumulation_steps": 4,
+    "num_workers": 8,
+    "mixed_precision": "bf16",
+    "backbone_trainable": true,
+    "max_steps": 500000,
+    "lr": 5e-05,
+    "weight_decay": 0.0001,
+    "scheduler": "constant_with_warmup",
+    "warmup_steps": 1000,
+    "log_every": 100,
+    "eval_every": 1000,
+    "save_every": 0,
+    "optimize_metric": "opt/f1",
+    "optimize_mode": "max",
+    "clip_grad_norm": 1.0
+  },
+  "eval": {},
+  "inference": {
+    "use_reverse_complement": false
+  }
+}
