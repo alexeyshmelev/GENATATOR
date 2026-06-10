@@ -1,4 +1,4 @@
-# GENATATOR clean training repository — first pass
+# GENATATOR
 
 This repository is a simplified, unified rewrite of the current GENATATOR finetuning code. It keeps the public task layout explicit:
 
