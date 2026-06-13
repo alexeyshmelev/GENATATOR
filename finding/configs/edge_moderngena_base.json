@@ -1,78 +1,57 @@
 {
-  "task": {
-    "model_role": "edge",
-    "target_group": "combined",
-    "label_names": [
-      "TSS+",
-      "TSS-",
-      "PolyA+",
-      "PolyA-"
-    ]
-  },
-  "data": {
-    "source": "hf",
-    "repo": "AIRI-Institute/genatator-gene-finding-dataset",
-    "train_split": "train",
-    "validation_split": "validation"
-  },
-  "tokenizer": {
-    "kind": "bpe",
-    "path": "AIRI-Institute/moderngena-base",
-    "max_tokens": 1024,
-    "trust_remote_code": true,
-    "local_files_only": false
-  },
-  "window": {
-    "mode": "random",
-    "nucleotide_length": 9216,
-    "overlap": 0.5,
-    "samples_per_epoch": 200000,
-    "min_length": 512
-  },
+  "seed": 42,
   "model": {
-    "family": "modernbert_token_classifier",
-    "pretrained_model_name_or_path": "AIRI-Institute/moderngena-base",
-    "trust_remote_code": true,
-    "local_files_only": false,
+    "family": "moderngena_token",
+    "backbone_path": "AIRI-Institute/moderngena-base",
+    "tokenizer_path": "AIRI-Institute/moderngena-base",
     "num_labels": 4,
-    "label_mode": "token",
-    "pos_weight": [
-      50.0,
-      50.0,
-      50.0,
-      50.0
-    ]
+    "classifier_dropout": 0.0,
+    "trust_remote_code": true,
+    "backbone_trainable": true,
+    "checkpoint_path": ""
+  },
+  "train_dataset": {
+    "path": "AIRI-Institute/genatator-gene-finding-dataset",
+    "split": "train",
+    "genomes": [],
+    "chromosomes": [],
+    "target_group": "combined",
+    "max_tokens": 1024,
+    "max_nucleotides": 9216,
+    "overlap": 0.5,
+    "shuffle_starts": false,
+    "max_windows": null
+  },
+  "eval_dataset": {
+    "path": "AIRI-Institute/genatator-gene-finding-dataset",
+    "split": "validation",
+    "genomes": ["GCF_009914755.1"],
+    "chromosomes": ["NC_060944.1"],
+    "target_group": "combined",
+    "max_tokens": 1024,
+    "max_nucleotides": 9216,
+    "overlap": 0.5,
+    "max_windows": 1000
   },
   "training": {
-    "output_dir": "runs/finding/edge_moderngena_base",
-    "seed": 42,
-    "batch_size": 16,
-    "gradient_accumulation_steps": 1,
-    "num_workers": 8,
-    "mixed_precision": "bf16",
-    "backbone_trainable": true,
+    "output_dir": "runs/finding_edge_moderngena_base",
+    "resume_from_checkpoint": "",
     "max_steps": 500000,
-    "lr": 5e-05,
-    "weight_decay": 0.0001,
-    "scheduler": "constant_with_warmup",
+    "per_device_train_batch_size": 1,
+    "per_device_eval_batch_size": 1,
+    "gradient_accumulation_steps": 1,
+    "learning_rate": 5e-5,
+    "weight_decay": 1e-4,
     "warmup_steps": 1000,
-    "log_every": 100,
-    "eval_every": 1000,
-    "save_every": 0,
-    "optimize_metric": "opt/pr_auc_mean",
-    "optimize_mode": "max",
-    "clip_grad_norm": 1.0
-  },
-  "eval": {
-    "thresholds": [
-      0.1,
-      0.2,
-      0.3,
-      0.5,
-      0.7
-    ]
-  },
-  "inference": {
-    "use_reverse_complement": false
+    "lr_scheduler_type": "constant_with_warmup",
+    "logging_steps": 100,
+    "eval_steps": 1000,
+    "save_steps": 1000,
+    "save_total_limit": 3,
+    "load_best_model_at_end": true,
+    "metric_for_best_model": "eval_auc_mean",
+    "greater_is_better": true,
+    "bf16": true,
+    "dataloader_num_workers": 8
   }
 }

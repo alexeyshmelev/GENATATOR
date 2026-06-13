@@ -1,0 +1,72 @@
+{
+  "edge": {
+    "model": {
+      "family": "moderngena_token",
+      "backbone_path": "AIRI-Institute/moderngena-base",
+      "tokenizer_path": "AIRI-Institute/moderngena-base",
+      "num_labels": 4,
+      "trust_remote_code": true,
+      "backbone_trainable": true,
+      "checkpoint_path": ""
+    },
+    "dataset": {
+      "path": "AIRI-Institute/genatator-gene-finding-dataset",
+      "split": "validation",
+      "genomes": ["GCF_009914755.1"],
+      "chromosomes": ["NC_060944.1"],
+      "target_group": "combined",
+      "max_tokens": 1024,
+      "max_nucleotides": 9216,
+      "overlap": 0.5,
+      "max_windows": null
+    },
+    "inference": {
+      "checkpoint_path": "runs/finding_edge_moderngena_base/final_model",
+      "batch_size": 1
+    }
+  },
+  "region": {
+    "model": {
+      "family": "moderngena_token",
+      "backbone_path": "AIRI-Institute/moderngena-base",
+      "tokenizer_path": "AIRI-Institute/moderngena-base",
+      "num_labels": 2,
+      "trust_remote_code": true,
+      "backbone_trainable": true,
+      "checkpoint_path": ""
+    },
+    "dataset": {
+      "path": "AIRI-Institute/genatator-gene-finding-dataset",
+      "split": "validation",
+      "genomes": ["GCF_009914755.1"],
+      "chromosomes": ["NC_060944.1"],
+      "target_group": "combined",
+      "max_tokens": 8192,
+      "max_nucleotides": 73728,
+      "overlap": 0.5,
+      "max_windows": null
+    },
+    "inference": {
+      "checkpoint_path": "runs/finding_region_moderngena_base/final_model",
+      "batch_size": 1
+    }
+  },
+  "postprocess": {
+    "lp_frac": 0.05,
+    "pk_prom": 0.1,
+    "pk_dist": 50,
+    "pk_height": null,
+    "interval_window_size": 2000000,
+    "max_pairs_per_seed": 10,
+    "prob_threshold": 0.5,
+    "zero_fraction_drop_threshold": 0.01
+  },
+  "inference": {
+    "device": "cuda",
+    "output_gff": "runs/finding_inference/predictions.gff",
+    "true_gff": "",
+    "metrics_json": "runs/finding_inference/metrics.json",
+    "k_values": [0, 50, 100, 250, 500],
+    "use_strand": true
+  }
+}

@@ -1,14 +1,22 @@
 {
   "seed": 42,
   "model": {
-    "family": "moderngena_token",
+    "family": "armt",
     "backbone_path": "AIRI-Institute/moderngena-base",
     "tokenizer_path": "AIRI-Institute/moderngena-base",
-    "num_labels": 2,
+    "num_labels": 4,
     "classifier_dropout": 0.0,
     "trust_remote_code": true,
     "backbone_trainable": true,
-    "checkpoint_path": ""
+    "checkpoint_path": "",
+    "armt": {
+      "armt_repo_id": "irodkin/armt-neox-tiny",
+      "num_mem_tokens": 16,
+      "d_mem": 32,
+      "segment_size": 128,
+      "segment_alignment": "left",
+      "sliding_window": false
+    }
   },
   "train_dataset": {
     "path": "AIRI-Institute/genatator-gene-finding-dataset",
@@ -16,8 +24,8 @@
     "genomes": [],
     "chromosomes": [],
     "target_group": "combined",
-    "max_tokens": 8192,
-    "max_nucleotides": 73728,
+    "max_tokens": 1024,
+    "max_nucleotides": 9216,
     "overlap": 0.5,
     "shuffle_starts": false,
     "max_windows": null
@@ -32,13 +40,13 @@
       "NC_060944.1"
     ],
     "target_group": "combined",
-    "max_tokens": 8192,
-    "max_nucleotides": 73728,
+    "max_tokens": 1024,
+    "max_nucleotides": 9216,
     "overlap": 0.5,
     "max_windows": 1000
   },
   "training": {
-    "output_dir": "runs/finding_region_moderngena_base",
+    "output_dir": "runs/finding_edge_armt_moderngena_base",
     "resume_from_checkpoint": "",
     "max_steps": 500000,
     "per_device_train_batch_size": 1,

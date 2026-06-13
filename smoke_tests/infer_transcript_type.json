@@ -1,0 +1,33 @@
+{
+  "model": {
+    "family": "moderngena_token",
+    "backbone_path": "AIRI-Institute/moderngena-base",
+    "tokenizer_path": "AIRI-Institute/moderngena-base",
+    "trust_remote_code": true,
+    "backbone_trainable": true,
+    "checkpoint_path": ""
+  },
+  "dataset": {
+    "path": "smoke_tests/data/segmentation/validation.jsonl",
+    "config_name": null,
+    "split": "train",
+    "genomes": [
+      "smoke_genome"
+    ],
+    "chromosomes": [
+      "chrSmoke"
+    ],
+    "max_nucleotides": 512,
+    "overlap": 0.5,
+    "max_windows": 2,
+    "max_tokens": 128
+  },
+  "inference": {
+    "device": "cuda",
+    "checkpoint_path": "smoke_tests/runs/transcript_type_moderngena/final_model",
+    "batch_size": 1,
+    "threshold": 0.5,
+    "output_tsv": "smoke_tests/runs/transcript_type_infer/predictions.tsv",
+    "metrics_json": "smoke_tests/runs/transcript_type_infer/metrics.json"
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "model": {
+    "family": "caduceus",
+    "backbone_path": "kuleshov-group/caduceus-ps_seqlen-131k_d_model-256_n_layer-16",
+    "tokenizer_path": "kuleshov-group/caduceus-ps_seqlen-131k_d_model-256_n_layer-16",
+    "trust_remote_code": true,
+    "bidirectional_weight_tie": false,
+    "middle_loss": true,
+    "backbone_trainable": true,
+    "checkpoint_path": "",
+    "padding_side": "left"
+  },
+  "dataset": {
+    "path": "AIRI-Institute/genatator-gene-segmentation-dataset",
+    "config_name": "val-human",
+    "split": "validation",
+    "genomes": [
+      "GCF_009914755.1"
+    ],
+    "chromosomes": [
+      "NC_060944.1"
+    ],
+    "max_nucleotides": 250000,
+    "overlap": 0.5,
+    "max_windows": null
+  },
+  "inference": {
+    "device": "cuda",
+    "checkpoint_path": "runs/segmentation_caduceus_ps/final_model",
+    "batch_size": 1,
+    "threshold": 0.5,
+    "output_gff": "runs/segmentation_inference/predictions.gff",
+    "true_gff": "",
+    "metrics_json": "runs/segmentation_inference/metrics.json"
+  }
+}

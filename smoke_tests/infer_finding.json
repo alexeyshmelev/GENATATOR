@@ -1,0 +1,86 @@
+{
+  "edge": {
+    "model": {
+      "family": "moderngena_token",
+      "backbone_path": "AIRI-Institute/moderngena-base",
+      "tokenizer_path": "AIRI-Institute/moderngena-base",
+      "num_labels": 4,
+      "trust_remote_code": true,
+      "backbone_trainable": true,
+      "checkpoint_path": ""
+    },
+    "dataset": {
+      "path": "smoke_tests/data/finding/validation.jsonl",
+      "split": "train",
+      "genomes": [
+        "smoke_genome"
+      ],
+      "chromosomes": [
+        "chrSmoke"
+      ],
+      "target_group": "combined",
+      "max_tokens": 128,
+      "max_nucleotides": 512,
+      "overlap": 0.5,
+      "max_windows": 2
+    },
+    "inference": {
+      "checkpoint_path": "smoke_tests/runs/finding_edge/final_model",
+      "batch_size": 1
+    }
+  },
+  "region": {
+    "model": {
+      "family": "moderngena_token",
+      "backbone_path": "AIRI-Institute/moderngena-base",
+      "tokenizer_path": "AIRI-Institute/moderngena-base",
+      "num_labels": 2,
+      "trust_remote_code": true,
+      "backbone_trainable": true,
+      "checkpoint_path": ""
+    },
+    "dataset": {
+      "path": "smoke_tests/data/finding/validation.jsonl",
+      "split": "train",
+      "genomes": [
+        "smoke_genome"
+      ],
+      "chromosomes": [
+        "chrSmoke"
+      ],
+      "target_group": "combined",
+      "max_tokens": 128,
+      "max_nucleotides": 512,
+      "overlap": 0.5,
+      "max_windows": 2
+    },
+    "inference": {
+      "checkpoint_path": "smoke_tests/runs/finding_region/final_model",
+      "batch_size": 1
+    }
+  },
+  "postprocess": {
+    "lp_frac": 0.05,
+    "pk_prom": 0.1,
+    "pk_dist": 50,
+    "pk_height": null,
+    "interval_window_size": 2000000,
+    "max_pairs_per_seed": 10,
+    "prob_threshold": 0.5,
+    "zero_fraction_drop_threshold": 0.01
+  },
+  "inference": {
+    "device": "cuda",
+    "output_gff": "smoke_tests/runs/finding_infer/predictions.gff",
+    "true_gff": "smoke_tests/data/reference.gff",
+    "metrics_json": "smoke_tests/runs/finding_infer/metrics.json",
+    "k_values": [
+      0,
+      50,
+      100,
+      250,
+      500
+    ],
+    "use_strand": true
+  }
+}

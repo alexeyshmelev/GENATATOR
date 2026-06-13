@@ -1,0 +1,62 @@
+{
+  "max_parallel_jobs": 1,
+  "make_tiny_data": true,
+  "jobs": [
+    {
+      "name": "finding_edge_moderngena_base_train",
+      "enabled": true,
+      "gpus": "0",
+      "num_processes": 1,
+      "command": "python finding/train.py --task edge --config smoke_tests/edge_moderngena_base.json"
+    },
+    {
+      "name": "finding_region_moderngena_base_train",
+      "enabled": true,
+      "gpus": "0",
+      "num_processes": 1,
+      "command": "python finding/train.py --task region --config smoke_tests/region_moderngena_base.json"
+    },
+    {
+      "name": "finding_infer_metrics",
+      "enabled": true,
+      "gpus": "0",
+      "num_processes": 1,
+      "command": "python finding/infer.py --config smoke_tests/infer_finding.json"
+    },
+    {
+      "name": "segmentation_caduceus_ps_train",
+      "enabled": true,
+      "gpus": "0",
+      "num_processes": 1,
+      "command": "python segmentation/train.py --config smoke_tests/segmentation_caduceus_ps.json"
+    },
+    {
+      "name": "segmentation_infer_metrics",
+      "enabled": true,
+      "gpus": "0",
+      "num_processes": 1,
+      "command": "python segmentation/infer.py --config smoke_tests/infer_segmentation.json"
+    },
+    {
+      "name": "transcript_type_moderngena_base_train",
+      "enabled": true,
+      "gpus": "0",
+      "num_processes": 1,
+      "command": "python transcript_type/train.py --config smoke_tests/transcript_type_moderngena_base.json"
+    },
+    {
+      "name": "transcript_type_infer_metrics",
+      "enabled": true,
+      "gpus": "0",
+      "num_processes": 1,
+      "command": "python transcript_type/infer.py --config smoke_tests/infer_transcript_type.json"
+    },
+    {
+      "name": "segmentation_gena_large_rmt_cycles3_train",
+      "enabled": false,
+      "gpus": "1",
+      "num_processes": 1,
+      "command": "python segmentation/train.py --config segmentation/configs/gena_large_rmt_cycles3.json"
+    }
+  ]
+}

@@ -1,233 +1,125 @@
-# GENATATOR
+# Clean GENATATOR fine-tuning repository
 
-This repository is a simplified, unified rewrite of the current GENATATOR finetuning code. It keeps the public task layout explicit:
+This repository is a simplified first-pass training and inference codebase for GENATATOR-style ab initio gene annotation.
+It is only for **fine-tuning**, not pretraining.
+
+## Layout
 
 ```text
-finding/          edge and region models for transcript-interval discovery
-segmentation/     exon / intron / UTR / CDS segmentation models
-transcript_type/  mRNA vs lnc_RNA transcript classifier
-genatator_core/   shared dataset, model, training, inference, metrics code
+finding/              edge and region models for transcript interval discovery
+segmentation/         exon / intron / UTR / CDS segmentation models
+transcript_type/      mRNA vs lnc_RNA interval classifier
+genatator_core/       shared loaders, model builders, metrics, GFF writers
+smoke_tests/          tiny local datasets and a GPU-assignable smoke-test matrix
 ```
 
-The extra `genatator_core/` folder is the only shared layer. Without it, the same tokenizer alignment, DDP training, checkpointing, and metric code would be duplicated three times.
+## Main design decisions
 
-## What is unified
+There is no `source` field. Dataset paths, model backbone paths, tokenizer paths, and checkpoint paths are detected automatically:
 
-The old pipeline mixed shell launchers, Hydra YAML, task-specific datasets, model wrappers, and repeated Accelerate trainers. This version uses one JSON-driven path for all tasks:
+- if the path exists locally, it is used as a local path;
+- otherwise it is passed to Hugging Face as a repository id.
+
+Backbones are loaded from local/HF paths and the fine-tuning heads are created in this repository. Full GENATATOR checkpoints can be loaded through `model.checkpoint_path` or `inference.checkpoint_path`.
+
+ModernGENA fine-tuning uses `transformers.ModernBertForTokenClassification` in the task wrappers. This is intentionally different from the older `AnnotationModel` class that used `ModernBertModel` plus a separate classifier.
+
+The provided RMT and Caduceus class logic is preserved as much as possible:
+
+- `genatator_core/legacy_rmt.py` is copied from the supplied RMT/UNet code.
+- `genatator_core/legacy_caduceus.py` contains the selected Caduceus classes with only small marked edits: lazy output widths and Trainer-friendly transcript-type logits.
+- RMT repeater models with cycles=3 are hard-locked to `per_device_train_batch_size = 1` and `per_device_eval_batch_size = 1`.
+
+## Training
+
+Run one of the task trainers with a JSON config:
 
 ```bash
-accelerate launch finding/train.py --config finding/configs/edge_moderngena_base.json
-accelerate launch finding/train.py --config finding/configs/region_moderngena_base.json
-accelerate launch segmentation/train.py --config segmentation/configs/caduceus_ps.json
-accelerate launch segmentation/train.py --config segmentation/configs/gena_large_rmt_unet.json
-accelerate launch transcript_type/train.py --config transcript_type/configs/caduceus_ps.json
+python finding/train.py --task edge --config finding/configs/edge_moderngena_base.json
+python finding/train.py --task region --config finding/configs/region_moderngena_base.json
+python segmentation/train.py --config segmentation/configs/caduceus_ps.json
+python transcript_type/train.py --config transcript_type/configs/caduceus_ps.json
 ```
 
-Every config has the same sections:
+For multiple GPUs, use Hugging Face Accelerate or torchrun. The scripts use `transformers.Trainer`, so checkpointing, TensorBoard logging, tqdm progress bars, and resume are handled by Trainer.
+
+```bash
+accelerate launch --num_processes 4 segmentation/train.py --config segmentation/configs/caduceus_ps.json
+```
+
+Resume is controlled by the JSON field:
+
+```json
+"resume_from_checkpoint": "runs/segmentation_caduceus_ps/checkpoint-10000"
+```
+
+Use an empty string to start from scratch.
+
+## Training-time validation metrics
+
+The training scripts do not run a test phase.
+
+- `finding`: ROC-AUC per output channel and mean ROC-AUC.
+- `segmentation`: exact interval-level F1 for exon and CDS.
+- `transcript_type`: accuracy, F1, precision, recall.
+
+## Inference and final metrics
+
+Inference is separate:
+
+```bash
+python finding/infer.py --config finding/configs/infer_moderngena_base.json
+python segmentation/infer.py --config segmentation/configs/infer_caduceus_ps.json
+python transcript_type/infer.py --config transcript_type/configs/infer_caduceus_ps.json
+```
+
+The GFF-based evaluators use Hugging Face Evaluate:
+
+- `AIRI-Institute/genatator-ab-initio-annotation-leaderboard`
+- `AIRI-Institute/genatator-ab-initio-segmentation-leaderboard`, revision `metric-only`
+
+Set `true_gff` in an inference config to compute and store final metrics.
+
+## Dataset filtering
+
+Every train/eval/inference dataset block supports:
+
+```json
+"genomes": ["GCF_009914755.1"],
+"chromosomes": ["NC_060944.1"]
+```
+
+Empty lists mean no filtering.
+
+## Smoke tests
+
+Create tiny local datasets and run a matrix of training + inference jobs:
+
+```bash
+python smoke_tests/run_smoke.py --matrix smoke_tests/smoke_matrix.json
+```
+
+Each job has a `gpus` field, so tasks can be pinned to different GPUs:
 
 ```json
 {
-  "task": {},
-  "data": {},
-  "tokenizer": {},
-  "window": {},
-  "model": {},
-  "training": {},
-  "eval": {}
+  "name": "segmentation_caduceus_ps_train",
+  "gpus": "0",
+  "num_processes": 1,
+  "command": "python segmentation/train.py --config smoke_tests/segmentation_caduceus_ps.json"
 }
 ```
 
-No Hydra is used. Local and Hugging Face data are configured by changing only `data.source` and paths.
-
-## Supported data layouts
-
-### Hugging Face datasets
-
-Gene finding:
-
-```json
-"data": {
-  "source": "hf",
-  "repo": "AIRI-Institute/genatator-gene-finding-dataset",
-  "train_split": "train",
-  "validation_split": "validation"
-}
-```
-
-Segmentation and transcript type:
-
-```json
-"data": {
-  "source": "hf",
-  "repo": "AIRI-Institute/genatator-gene-segmentation-dataset",
-  "train_name": "train-multi-specie",
-  "validation_name": "val-human",
-  "train_split": "train",
-  "validation_split": "validation",
-  "representative_only": true
-}
-```
-
-### Local parquet mirror
-
-```json
-"data": {
-  "source": "local_parquet",
-  "data_files": {
-    "train": "data/train/part-*/*.parquet",
-    "validation": "data/validation/part-*/*.parquet"
-  }
-}
-```
-
-Set `tokenizer.local_files_only` and `model.local_files_only` to `true` when running without internet.
-
-## Model families
-
-### ModernGENA / ModernBERT
-
-Use:
-
-```json
-"model": {
-  "family": "modernbert_token_classifier",
-  "pretrained_model_name_or_path": "AIRI-Institute/moderngena-base",
-  "num_labels": 4,
-  "label_mode": "token"
-}
-```
-
-This intentionally uses `transformers.ModernBertForTokenClassification` and computes masked BCE outside the HF loss so edge, region, and multilabel tracks work correctly.
-
-### Caduceus PS / PH
-
-Use nucleotide tokenization and a linear token head:
-
-```json
-"tokenizer": {
-  "kind": "nucleotide",
-  "path": "kuleshov-group/caduceus-ps_seqlen-131k_d_model-256_n_layer-16",
-  "pad_token_id": 4,
-  "eos_token_id": 1,
-  "add_eos": true,
-  "pad_side": "left"
-}
-```
-
-### GENA base / large with RMT + U-Net
-
-Use BPE tokenization, the RMT adapter, and `label_mode = nucleotide_unet`:
-
-```json
-"model": {
-  "family": "auto_encoder",
-  "pretrained_model_name_or_path": "AIRI-Institute/gena-lm-bert-large-t2t",
-  "adapter": {
-    "type": "rmt",
-    "num_mem_tokens": 10,
-    "segment_size": 512,
-    "cls_token_id": 1,
-    "sep_token_id": 2,
-    "pad_token_id": 3
-  },
-  "label_mode": "nucleotide_unet"
-}
-```
-
-For BPE segmentation, token hidden states are repeated back to nucleotide resolution using tokenizer offsets, concatenated with nucleotide embeddings, and passed through a compact 1D U-Net.
-
-### ARMT
-
-Set:
-
-```json
-"adapter": {
-  "type": "armt",
-  "armt_repo_id": "irodkin/armt-neox-tiny",
-  "segment_size": 512,
-  "num_mem_tokens": 16
-}
-```
-
-This is wired in `genatator_core/modeling.py`, but it is the least tested part because the exact external ARMT wrapper API may differ between checkpoints.
-
-## Inference
-
-### Finding pipeline
-
-Train edge and region separately, then run the interval pipeline:
+To test only selected jobs:
 
 ```bash
-python finding/infer.py \
-  --config finding/configs/infer_pipeline.json \
-  --fasta genome_or_chromosome.fa \
-  --output-dir predictions/finding \
-  --device cuda
+python smoke_tests/run_smoke.py --only segmentation_caduceus_ps_train segmentation_infer_metrics
 ```
 
-For each FASTA record it writes:
+The smoke matrix includes a disabled RMT cycles=3 job; enable it when the large GENA backbone is available locally or you want to download it.
 
-```text
-<record>.tracks.npz       edge and region nucleotide probability tracks
-<record>.intervals.tsv    postprocessed stranded transcript intervals
-```
+## Known first-pass limitations
 
-The post-processing implements FFT low-pass smoothing, peak calling, TSS/PolyA pairing, and region-model filtering.
-
-### Segmentation
-
-```bash
-python segmentation/infer.py \
-  --config segmentation/configs/caduceus_ps.json \
-  --checkpoint runs/segmentation/caduceus_ps/best/pytorch_model.bin \
-  --fasta transcripts.fa \
-  --output-dir predictions/segmentation
-```
-
-### Transcript type
-
-```bash
-python transcript_type/infer.py \
-  --config transcript_type/configs/caduceus_ps.json \
-  --checkpoint runs/transcript_type/caduceus_ps/best/pytorch_model.bin \
-  --fasta transcript_candidates.fa \
-  --output predictions/transcript_type.tsv
-```
-
-## Logging and checkpoints
-
-TensorBoard logs are written to:
-
-```text
-<training.output_dir>/tb
-```
-
-Best checkpoints are written to:
-
-```text
-<training.output_dir>/best/pytorch_model.bin
-<training.output_dir>/best/config.json
-<training.output_dir>/best/metrics.json
-```
-
-The training loop uses `accelerate`, `DistributedSampler`, gradient accumulation, tqdm progress bars, AdamW, warmup scheduling, and best-checkpoint selection by any metric in the JSON config.
-
-## Metrics included
-
-`genatator_core/metrics.py` includes:
-
-- masked PR-AUC and ROC-AUC for token / nucleotide labels;
-- exact interval precision, recall, and F1 for segmentation classes;
-- a first gene-level segmentation utility that groups rows by `gene_id`;
-- kX-style interval boundary metrics for transcript discovery.
-
-The full chromosome-level gene-finding benchmark and full isoform-aware gene-level segmentation evaluation should be run as separate evaluation jobs after model inference, because they require complete chromosome/transcript reconstruction rather than mini-batch validation windows.
-
-## Problems and known first-pass gaps
-
-1. I did not download or run the HF datasets or model checkpoints. The repository compiles, but the tokenizer details for Caduceus and ARMT still need real-cluster smoke tests.
-2. The old code uses several experimental middle-loss and all-layer-loss variants. I kept the clean final-head path only; middle-loss can be added as a small optional model flag later.
-3. The full official gene-level benchmark needs a second pass: `segmentation/infer.py` produces per-sequence predictions, and the metric primitives are present, but a complete chromosome-20 evaluator that exactly reproduces the paper table is not yet implemented.
-4. ARMT support is config-wired but not validated against the exact checkpoint class API.
-5. Reverse-complement test-time augmentation is implemented behind `inference.use_reverse_complement`, but I did not smoke-test it with real GENATATOR checkpoints.
-6. The repository assumes that BPE tokenizers provide offset mappings. That is true for the intended ModernGENA/GENA fast-tokenizer path, but should be checked for every local tokenizer directory.
+- The code is organized for correctness and readability, but it has not been run against the full 30+ GB datasets in this environment.
+- ARMT support is wired through a class path and backend config, but should be validated with the exact ARMT remote-code version you use.
+- The finding inference GFF writer emits a one-exon transcript interval for boundary evaluation. If you want full GFFs after segmentation, run the segmentation inference stage.

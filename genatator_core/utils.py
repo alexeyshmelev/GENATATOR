@@ -1,66 +1,61 @@
+from __future__ import annotations
+
+import importlib
 import os
 import random
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, Tuple
+from typing import Any, Dict, Iterable, List
 
 import numpy as np
 import torch
 
 
-def seed_everything(seed: int) -> None:
+def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
 
-def dna_reverse_complement(seq: str) -> str:
-    return seq.translate(str.maketrans("ACGTNacgtn", "TGCANtgcan"))[::-1].upper()
+def get_class(path: str):
+    module, name = path.split(":")
+    return getattr(importlib.import_module(module), name)
 
 
-def dna_to_ids(seq: str) -> np.ndarray:
-    table = np.full(256, 4, dtype=np.int64)
-    for i, ch in enumerate(b"ACGT"):
-        table[ch] = i
-        table[ch + 32] = i
-    return table[np.frombuffer(seq.encode("ascii"), dtype=np.uint8)]
+def ensure_dir(path: str | Path) -> Path:
+    path = Path(path).expanduser()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
-def parse_fasta(path: str | Path) -> Iterator[Tuple[str, str]]:
-    name = None
-    chunks = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith(">"):
-                if name is not None:
-                    yield name, "".join(chunks).upper()
-                name = line[1:].split()[0]
-                chunks = []
-            else:
-                chunks.append(line)
-        if name is not None:
-            yield name, "".join(chunks).upper()
+def reverse_complement(seq: str) -> str:
+    table = str.maketrans("ACGTNacgtn", "TGCANtgcan")
+    return seq.translate(table)[::-1].upper()
 
 
-def sliding_windows(length: int, window: int, overlap: float) -> list[tuple[int, int]]:
-    step = max(1, int(window * (1.0 - overlap)))
-    starts = list(range(0, max(1, length), step))
-    out = []
-    for s in starts:
-        e = min(length, s + window)
-        if e > s:
-            out.append((s, e))
-        if e == length:
-            break
-    return out
+def tensor_to_list(x: Any):
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy().tolist()
+    if isinstance(x, np.ndarray):
+        return x.tolist()
+    if isinstance(x, dict):
+        return {k: tensor_to_list(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [tensor_to_list(v) for v in x]
+    return x
 
 
-def move_to_device(batch: Dict, device: torch.device) -> Dict:
-    return {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
+def first_existing_file(directory: str | Path, names: Iterable[str]) -> Path | None:
+    directory = Path(directory).expanduser()
+    for name in names:
+        p = directory / name
+        if p.exists():
+            return p
+    return None
 
 
-def main_process(accelerator) -> bool:
-    return accelerator.is_main_process
+def clean_env_for_gpu(gpus: str | None) -> Dict[str, str]:
+    env = os.environ.copy()
+    if gpus is not None:
+        env["CUDA_VISIBLE_DEVICES"] = gpus
+    return env

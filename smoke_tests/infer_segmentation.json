@@ -1,0 +1,36 @@
+{
+  "model": {
+    "family": "caduceus",
+    "backbone_path": "kuleshov-group/caduceus-ps_seqlen-131k_d_model-256_n_layer-16",
+    "tokenizer_path": "kuleshov-group/caduceus-ps_seqlen-131k_d_model-256_n_layer-16",
+    "trust_remote_code": true,
+    "bidirectional_weight_tie": false,
+    "middle_loss": true,
+    "backbone_trainable": true,
+    "checkpoint_path": "",
+    "padding_side": "left"
+  },
+  "dataset": {
+    "path": "smoke_tests/data/segmentation/validation.jsonl",
+    "config_name": null,
+    "split": "train",
+    "genomes": [
+      "smoke_genome"
+    ],
+    "chromosomes": [
+      "chrSmoke"
+    ],
+    "max_nucleotides": 512,
+    "overlap": 0.5,
+    "max_windows": 2
+  },
+  "inference": {
+    "device": "cuda",
+    "checkpoint_path": "smoke_tests/runs/segmentation_caduceus_ps/final_model",
+    "batch_size": 1,
+    "threshold": 0.5,
+    "output_gff": "smoke_tests/runs/segmentation_infer/predictions.gff",
+    "true_gff": "smoke_tests/data/reference.gff",
+    "metrics_json": "smoke_tests/runs/segmentation_infer/metrics.json"
+  }
+}

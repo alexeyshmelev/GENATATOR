@@ -1,63 +1,55 @@
-from typing import Dict, List
+from __future__ import annotations
+
+from typing import Dict, List, Tuple
+
 import numpy as np
 from scipy.signal import find_peaks
 
 
-def lowpass(signal: np.ndarray, keep_fraction: float) -> np.ndarray:
-    spec = np.fft.rfft(signal)
-    keep = max(1, int(len(spec) * keep_fraction))
+def lowpass_fft(x: np.ndarray, frac: float) -> np.ndarray:
+    spec = np.fft.rfft(x)
+    keep = max(1, int(len(spec) * frac))
     spec[keep:] = 0
-    return np.fft.irfft(spec, n=len(signal)).astype(np.float32)
+    return np.fft.irfft(spec, n=len(x))
 
 
-def peaks(track: np.ndarray, keep_fraction: float, prominence: float, distance: int, height=None) -> np.ndarray:
-    smooth = lowpass(track, keep_fraction)
-    idx, _ = find_peaks(smooth, prominence=prominence, distance=distance, height=height)
-    return idx.astype(np.int64)
+def peaks(x: np.ndarray, prominence: float, distance: int, height=None) -> np.ndarray:
+    kwargs = {"prominence": prominence, "distance": distance}
+    if height is not None:
+        kwargs["height"] = height
+    p, _ = find_peaks(x, **kwargs)
+    return p.astype(int)
 
 
-def build_intervals(edge_probs: np.ndarray, region_probs: np.ndarray, cfg: Dict) -> List[Dict]:
-    lp = float(cfg.get("lp_frac", 0.05))
-    prom = float(cfg.get("pk_prom", 0.15))
-    dist = int(cfg.get("pk_dist", 50))
-    height = cfg.get("pk_height")
-    window = int(cfg.get("interval_window_size", 2_000_000))
-    max_pairs = int(cfg.get("max_pairs_per_seed", 10))
-    prob_thr = float(cfg.get("prob_threshold", 0.5))
-    zero_thr = float(cfg.get("zero_fraction_drop_threshold", 0.01))
-
-    tss_p = peaks(edge_probs[:, 0], lp, prom, dist, height)
-    tss_m = peaks(edge_probs[:, 1], lp, prom, dist, height)
-    polya_p = peaks(edge_probs[:, 2], lp, prom, dist, height)
-    polya_m = peaks(edge_probs[:, 3], lp, prom, dist, height)
-    intervals = []
-
-    for t in tss_p:
-        partners = polya_p[(polya_p > t) & (polya_p <= t + window)][:max_pairs]
-        for p in partners:
-            mask = (region_probs[t:p + 1, 0] >= prob_thr)
-            if 1.0 - mask.mean() <= zero_thr:
-                intervals.append({"start": int(t), "end": int(p) + 1, "strand": "+"})
-
-    for t in tss_m:
-        partners = polya_m[(polya_m < t) & (polya_m >= t - window)][-max_pairs:]
-        for p in partners:
-            a, b = sorted([int(t), int(p)])
-            mask = (region_probs[a:b + 1, 1] >= prob_thr)
-            if 1.0 - mask.mean() <= zero_thr:
-                intervals.append({"start": a, "end": b + 1, "strand": "-"})
-
+def pair_intervals(edge_tracks: np.ndarray, region_tracks: np.ndarray, chrom: str, window_size: int, max_pairs_per_seed: int, prob_threshold: float, zero_fraction_drop_threshold: float) -> List[Dict]:
+    tss_p, tss_m, polya_p, polya_m = edge_tracks
+    intra_p, intra_m = region_tracks
+    records: List[Dict] = []
+    for strand, tss, polya, intra in [('+', tss_p, polya_p, intra_p), ('-', tss_m, polya_m, intra_m)]:
+        if strand == '+':
+            seeds = sorted(tss.tolist())
+            ends = sorted(polya.tolist())
+            for s in seeds:
+                partners = [e for e in ends if e > s and e - s <= window_size][:max_pairs_per_seed]
+                for e in partners:
+                    mask = intra[s:e] >= prob_threshold
+                    if len(mask) and float((~mask).mean()) <= zero_fraction_drop_threshold:
+                        records.append({"chrom": chrom, "start": s, "end": e + 1, "strand": strand})
+        else:
+            seeds = sorted(tss.tolist(), reverse=True)
+            ends = sorted(polya.tolist(), reverse=True)
+            for s in seeds:
+                partners = [e for e in ends if e < s and s - e <= window_size][:max_pairs_per_seed]
+                for e in partners:
+                    a, b = e, s + 1
+                    mask = intra[a:b] >= prob_threshold
+                    if len(mask) and float((~mask).mean()) <= zero_fraction_drop_threshold:
+                        records.append({"chrom": chrom, "start": a, "end": b, "strand": strand})
     seen = set()
     unique = []
-    for r in intervals:
-        key = (r["start"], r["end"], r["strand"])
+    for r in records:
+        key = (r["chrom"], r["start"], r["end"], r["strand"])
         if key not in seen:
-            unique.append(r); seen.add(key)
+            seen.add(key)
+            unique.append(r)
     return unique
-
-
-def write_intervals_tsv(intervals: List[Dict], path: str, chrom: str):
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("chrom\tstart\tend\tstrand\n")
-        for r in intervals:
-            f.write(f"{chrom}\t{r['start']}\t{r['end']}\t{r['strand']}\n")

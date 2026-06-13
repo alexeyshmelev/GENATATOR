@@ -11,51 +11,55 @@
     "checkpoint_path": ""
   },
   "train_dataset": {
-    "path": "AIRI-Institute/genatator-gene-finding-dataset",
+    "path": "smoke_tests/data/finding/train.jsonl",
     "split": "train",
-    "genomes": [],
-    "chromosomes": [],
-    "target_group": "combined",
-    "max_tokens": 8192,
-    "max_nucleotides": 73728,
-    "overlap": 0.5,
-    "shuffle_starts": false,
-    "max_windows": null
-  },
-  "eval_dataset": {
-    "path": "AIRI-Institute/genatator-gene-finding-dataset",
-    "split": "validation",
     "genomes": [
-      "GCF_009914755.1"
+      "smoke_genome"
     ],
     "chromosomes": [
-      "NC_060944.1"
+      "chrSmoke"
     ],
     "target_group": "combined",
-    "max_tokens": 8192,
-    "max_nucleotides": 73728,
+    "max_tokens": 128,
+    "max_nucleotides": 512,
     "overlap": 0.5,
-    "max_windows": 1000
+    "shuffle_starts": false,
+    "max_windows": 4
+  },
+  "eval_dataset": {
+    "path": "smoke_tests/data/finding/validation.jsonl",
+    "split": "train",
+    "genomes": [
+      "smoke_genome"
+    ],
+    "chromosomes": [
+      "chrSmoke"
+    ],
+    "target_group": "combined",
+    "max_tokens": 128,
+    "max_nucleotides": 512,
+    "overlap": 0.5,
+    "max_windows": 2
   },
   "training": {
-    "output_dir": "runs/finding_region_moderngena_base",
+    "output_dir": "smoke_tests/runs/finding_region",
     "resume_from_checkpoint": "",
-    "max_steps": 500000,
+    "max_steps": 2,
     "per_device_train_batch_size": 1,
     "per_device_eval_batch_size": 1,
     "gradient_accumulation_steps": 1,
     "learning_rate": 5e-05,
     "weight_decay": 0.0001,
-    "warmup_steps": 1000,
+    "warmup_steps": 0,
     "lr_scheduler_type": "constant_with_warmup",
-    "logging_steps": 100,
-    "eval_steps": 1000,
-    "save_steps": 1000,
-    "save_total_limit": 3,
+    "logging_steps": 1,
+    "eval_steps": 1,
+    "save_steps": 1,
+    "save_total_limit": 1,
     "load_best_model_at_end": true,
     "metric_for_best_model": "eval_auc_mean",
     "greater_is_better": true,
-    "bf16": true,
-    "dataloader_num_workers": 8
+    "bf16": false,
+    "dataloader_num_workers": 0
   }
 }

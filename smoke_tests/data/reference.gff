@@ -1,0 +1,8 @@
+##gff-version 3
+chrSmoke	smoke	gene	1	1024	.	+	.	ID=gene1
+chrSmoke	smoke	mRNA	1	1024	.	+	.	ID=tx1;Parent=gene1
+chrSmoke	smoke	exon	101	200	.	+	.	ID=tx1.exon1;Parent=tx1
+chrSmoke	smoke	exon	301	420	.	+	.	ID=tx1.exon2;Parent=tx1
+chrSmoke	smoke	exon	601	800	.	+	.	ID=tx1.exon3;Parent=tx1
+chrSmoke	smoke	CDS	321	400	.	+	0	ID=tx1.cds1;Parent=tx1
+chrSmoke	smoke	CDS	611	760	.	+	0	ID=tx1.cds2;Parent=tx1
