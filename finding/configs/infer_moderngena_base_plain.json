@@ -1,0 +1,83 @@
+{
+  "edge": {
+    "model": {
+      "family": "plain",
+      "backbone_kind": "moderngena",
+      "backbone_path": "AIRI-Institute/moderngena-base",
+      "tokenizer_path": "AIRI-Institute/moderngena-base",
+      "trust_remote_code": true,
+      "checkpoint_path": null
+    },
+    "dataset": {
+      "path": "AIRI-Institute/genatator-gene-finding-dataset",
+      "split": "test",
+      "genomes": [
+        "GCF_009914755.1"
+      ],
+      "chromosomes": [
+        "NC_060944.1"
+      ],
+      "max_nucleotides": 9216,
+      "max_tokens": 1024,
+      "overlap": 0.5,
+      "target_group": "primary"
+    },
+    "inference": {
+      "checkpoint_path": "runs/finding_edge_moderngena_base_plain/final_model",
+      "batch_size": 1
+    }
+  },
+  "region": {
+    "model": {
+      "family": "plain",
+      "backbone_kind": "moderngena",
+      "backbone_path": "AIRI-Institute/moderngena-base",
+      "tokenizer_path": "AIRI-Institute/moderngena-base",
+      "trust_remote_code": true,
+      "checkpoint_path": null
+    },
+    "dataset": {
+      "path": "AIRI-Institute/genatator-gene-finding-dataset",
+      "split": "test",
+      "genomes": [
+        "GCF_009914755.1"
+      ],
+      "chromosomes": [
+        "NC_060944.1"
+      ],
+      "max_nucleotides": 73728,
+      "max_tokens": 8192,
+      "overlap": 0.5,
+      "target_group": "primary"
+    },
+    "inference": {
+      "checkpoint_path": "runs/finding_region_moderngena_base_plain/final_model",
+      "batch_size": 1
+    }
+  },
+  "postprocess": {
+    "lp_frac": 0.05,
+    "pk_prom": 0.1,
+    "pk_dist": 50,
+    "pk_height": null,
+    "interval_window_size": 2000000,
+    "max_pairs_per_seed": 10,
+    "prob_threshold": 0.5,
+    "zero_fraction_drop_threshold": 0.01
+  },
+  "inference": {
+    "device": "cuda",
+    "use_reverse_complement": true,
+    "output_gff": "runs/inference/finding_predictions.gff",
+    "true_gff": null,
+    "metrics_json": "runs/inference/finding_metrics.json",
+    "k_values": [
+      0,
+      50,
+      100,
+      250,
+      500
+    ],
+    "use_strand": true
+  }
+}

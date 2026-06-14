@@ -1,0 +1,64 @@
+{
+  "seed": 42,
+  "model": {
+    "family": "rmt",
+    "backbone_kind": "moderngena",
+    "backbone_path": "AIRI-Institute/moderngena-base",
+    "tokenizer_path": "AIRI-Institute/moderngena-base",
+    "trust_remote_code": true,
+    "checkpoint_path": null,
+    "nucleotide_tokenizer_path": "kuleshov-group/caduceus-ps_seqlen-131k_d_model-256_n_layer-16",
+    "nucleotide_vocab_size": 1000,
+    "cycles": 3,
+    "rmt": {
+      "input_size": 512,
+      "max_n_segments": 10000,
+      "num_mem_tokens": 10,
+      "bptt_depth": -1,
+      "unet_sub_model_input_size": 8192
+    }
+  },
+  "train_dataset": {
+    "path": "AIRI-Institute/genatator-gene-finding-dataset",
+    "split": "train",
+    "genomes": [],
+    "chromosomes": [],
+    "max_nucleotides": 9216,
+    "max_tokens": 1024,
+    "overlap": 0.5,
+    "target_group": "primary"
+  },
+  "eval_dataset": {
+    "path": "AIRI-Institute/genatator-gene-finding-dataset",
+    "split": "validation",
+    "genomes": [],
+    "chromosomes": [],
+    "max_nucleotides": 9216,
+    "max_tokens": 1024,
+    "overlap": 0.5,
+    "target_group": "primary"
+  },
+  "training": {
+    "output_dir": "runs/finding_edge_moderngena_base_rmt_unet_cycles3",
+    "overwrite_output_dir": false,
+    "max_steps": 500000,
+    "per_device_train_batch_size": 1,
+    "per_device_eval_batch_size": 1,
+    "gradient_accumulation_steps": 1,
+    "learning_rate": 5e-05,
+    "weight_decay": 0.0001,
+    "warmup_steps": 1000,
+    "lr_scheduler_type": "constant_with_warmup",
+    "logging_steps": 100,
+    "eval_steps": 1000,
+    "save_steps": 1000,
+    "save_total_limit": 3,
+    "load_best_model_at_end": true,
+    "metric_for_best_model": "auc_mean",
+    "greater_is_better": true,
+    "dataloader_num_workers": 16,
+    "bf16": true,
+    "fp16": false,
+    "resume_from_checkpoint": null
+  }
+}

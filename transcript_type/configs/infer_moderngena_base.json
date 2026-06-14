@@ -1,0 +1,36 @@
+{
+  "model": {
+    "family": "plain",
+    "backbone_kind": "moderngena",
+    "backbone_path": "AIRI-Institute/moderngena-base",
+    "tokenizer_path": "AIRI-Institute/moderngena-base",
+    "trust_remote_code": true,
+    "checkpoint_path": null
+  },
+  "dataset": {
+    "path": "AIRI-Institute/genatator-gene-segmentation-dataset",
+    "config_name": "val-human",
+    "split": "validation",
+    "genomes": [
+      "GCF_009914755.1"
+    ],
+    "chromosomes": [
+      "NC_060944.1"
+    ],
+    "max_nucleotides": 250000,
+    "max_tokens": 32768,
+    "overlap": 0.5,
+    "statuses": [
+      1
+    ]
+  },
+  "inference": {
+    "device": "cuda",
+    "checkpoint_path": "runs/transcript_type_moderngena_base_plain/final_model",
+    "batch_size": 1,
+    "use_reverse_complement": true,
+    "threshold": 0.5,
+    "output_tsv": "runs/inference/transcript_type_predictions.tsv",
+    "metrics_json": "runs/inference/transcript_type_metrics.json"
+  }
+}
