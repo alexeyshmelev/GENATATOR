@@ -33,6 +33,34 @@ class ParsedMetadata:
     chrom_length: int = 0
 
 
+class MaterializedRows:
+    """Tiny in-memory dataset adapter used for HF streaming smoke slices.
+
+    It deliberately avoids `datasets.Dataset.from_list(...)` because gene-finding rows
+    can contain millions of nucleotide-level labels. Converting those rows to Arrow for
+    a two-step smoke test can use far more RAM than the actual model smoke needs.
+    """
+
+    def __init__(self, rows: List[Dict[str, Any]]):
+        self.rows = rows
+        keys = set()
+        for row in rows:
+            keys.update(row.keys())
+        self.column_names = sorted(keys)
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self.rows[key]
+        if isinstance(key, slice):
+            return self.rows[key]
+        if isinstance(key, str):
+            return [row.get(key) for row in self.rows]
+        raise TypeError(f"Unsupported MaterializedRows key type: {type(key)}")
+
+
 def parse_metadata(value: Any) -> ParsedMetadata:
     if isinstance(value, dict):
         return ParsedMetadata(
@@ -125,7 +153,49 @@ def _row_matches_cfg(row: Dict[str, Any], cfg: Dict[str, Any]) -> bool:
     return True
 
 
-def _materialize_streaming_dataset(iterable, cfg: Dict[str, Any]) -> HFDataset:
+def _maybe_trim_streaming_row(row: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any]:
+    if not bool(cfg.get("streaming_trim_rows", False)):
+        return row
+    if "dna_sequence" not in row:
+        return row
+
+    max_nt = int(cfg.get("max_nucleotides", cfg.get("context_length", len(row["dna_sequence"]))))
+    overlap = float(cfg.get("overlap", 0.5))
+    max_windows = int(cfg.get("max_windows") or 1)
+    step = max(1, int(max_nt * (1.0 - overlap)))
+    keep_len = max_nt + max(0, max_windows - 1) * step
+    dna = str(row["dna_sequence"])
+    keep_len = min(len(dna), keep_len)
+
+    trimmed = dict(row)
+    trimmed["dna_sequence"] = dna[:keep_len]
+    if "targets" in trimmed:
+        trimmed["targets"] = trimmed["targets"][:keep_len]
+    if "labels" in trimmed:
+        trimmed["labels"] = trimmed["labels"][:keep_len]
+
+    meta = parse_metadata(trimmed.get("metadata", {}))
+    meta_dict = dict(trimmed.get("metadata", {})) if isinstance(trimmed.get("metadata", {}), dict) else None
+    if meta_dict is not None:
+        meta_dict["start"] = int(meta.start)
+        meta_dict["end"] = int(meta.start + keep_len)
+        meta_dict.setdefault("chrom_length", int(meta.chrom_length))
+        trimmed["metadata"] = meta_dict
+    elif isinstance(trimmed.get("metadata"), str) and trimmed["metadata"].strip().startswith("{"):
+        meta_dict = json.loads(trimmed["metadata"])
+        meta_dict["start"] = int(meta.start)
+        meta_dict["end"] = int(meta.start + keep_len)
+        meta_dict.setdefault("chrom_length", int(meta.chrom_length))
+        trimmed["metadata"] = json.dumps(meta_dict)
+
+    logger.info(
+        "[dataset.streaming.trim] original_len=%d kept_len=%d max_nt=%d max_windows=%d overlap=%.3f",
+        len(dna), keep_len, max_nt, max_windows, overlap,
+    )
+    return trimmed
+
+
+def _materialize_streaming_dataset(iterable, cfg: Dict[str, Any]) -> MaterializedRows:
     max_rows = int(cfg.get("max_rows") or cfg.get("streaming_max_rows") or 32)
     max_scanned = int(cfg.get("streaming_max_scanned_rows") or 100000)
     rows = []
@@ -135,9 +205,9 @@ def _materialize_streaming_dataset(iterable, cfg: Dict[str, Any]) -> HFDataset:
     for row in iterable:
         scanned += 1
         if len(observed) < observed_limit:
-            observed.append(row)
+            observed.append({"metadata": row.get("metadata", {}), "status": row.get("status")})
         if _row_matches_cfg(row, cfg):
-            rows.append(row)
+            rows.append(_maybe_trim_streaming_row(row, cfg))
             if len(rows) >= max_rows:
                 break
         if scanned >= max_scanned:
@@ -151,8 +221,7 @@ def _materialize_streaming_dataset(iterable, cfg: Dict[str, Any]) -> HFDataset:
             f"Observed metadata summary from first {len(observed)} scanned rows: {json.dumps(summary, ensure_ascii=False)}"
         )
     logger.info("[dataset.streaming] materialized_rows=%d scanned_rows=%d max_rows=%d observed=%s", len(rows), scanned, max_rows, json.dumps(_metadata_summary_from_rows(rows), ensure_ascii=False))
-    return HFDataset.from_list(rows)
-
+    return MaterializedRows(rows)
 
 def load_dataset_auto(cfg: Dict[str, Any]) -> HFDataset:
     path = cfg["path"]
@@ -339,7 +408,7 @@ class ChromosomeAssembly:
             local_s = s - meta.start
             local_e = e - meta.start
             seq_parts.append(str(row["dna_sequence"])[local_s:local_e].upper())
-            lab_parts.append(np.asarray(row["targets"], dtype=np.float32)[local_s:local_e][:, target_indices])
+            lab_parts.append(np.asarray(row["targets"][local_s:local_e], dtype=np.float32)[:, target_indices])
         seq = "".join(seq_parts)
         labels = np.concatenate(lab_parts, axis=0) if lab_parts else np.zeros((0, len(target_indices)), dtype=np.float32)
         if len(seq) != labels.shape[0] or len(seq) != (rel_end - rel_start):
@@ -416,7 +485,7 @@ class GenatatorDataset(torch.utils.data.Dataset):
         row = self.raw[row_i]
         seq = str(row["dna_sequence"]).upper()
         s, e = self._crop_transcript(len(seq))
-        labels = np.asarray(row["labels"], dtype=np.float32)[s:e][:, self.target_indices]
+        labels = np.asarray(row["labels"][s:e], dtype=np.float32)[:, self.target_indices]
         meta = parse_metadata(row.get("metadata", {}))
         return seq[s:e], labels, meta, s
 

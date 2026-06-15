@@ -91,11 +91,13 @@ def model_cfg(model_name: str, family: str, extra: dict | None = None) -> dict:
     return cfg
 
 
-def finding_data(split: str, max_nt: int, max_tok: int, test: bool = False) -> dict:
-    # Smoke tests intentionally materialize only a few real rows through HF streaming.
-    # For finding, all smoke jobs use the T2T human chr20 test split so inference and
-    # metric GFFs are consistent with the supplied chr20 reference.
-    cfg = {
+def finding_data(max_nt: int, max_tok: int, inference_subset: bool = False) -> dict:
+    # Gene-finding smoke tests MUST use only the HF `test` split.
+    # The training, validation, and inference smoke configs all point to this same split
+    # to avoid touching the huge train split on CPU-only preprocessing machines.
+    # `streaming_trim_rows=true` keeps only the real nucleotide/target span needed by
+    # the tiny smoke windows, so a 10 Mb genomic block is not kept in memory.
+    return {
         "path": "AIRI-Institute/genatator-gene-finding-dataset",
         "split": "test",
         "genomes": None,
@@ -105,11 +107,11 @@ def finding_data(split: str, max_nt: int, max_tok: int, test: bool = False) -> d
         "overlap": 0.5,
         "target_group": "primary",
         "max_rows": 1,
-        "max_windows": 1 if test else 2,
+        "max_windows": 1 if inference_subset else 2,
         "streaming": True,
+        "streaming_trim_rows": True,
         "streaming_max_scanned_rows": 5000,
     }
-    return cfg
 
 
 def seg_data(config_name: str, split: str, max_nt: int, max_tok: int, test: bool = False) -> dict:
@@ -148,8 +150,8 @@ def make_finding_train_config(work: Path, model_name: str, task: str, variant: s
     cfg = {
         "seed": 42,
         "model": model_cfg(model_name, family, extra),
-        "train_dataset": finding_data("train", max_nt, max_tok, test=False),
-        "eval_dataset": finding_data("validation", max_nt, max_tok, test=False),
+        "train_dataset": finding_data(max_nt, max_tok, inference_subset=False),
+        "eval_dataset": finding_data(max_nt, max_tok, inference_subset=False),
         "training": tiny_training(str(work / name), "auc_mean", bs=1 if family in {"unet", "rmt"} else 2),
     }
     return write_json(work / "configs" / f"{name}.json", cfg)
@@ -190,8 +192,8 @@ def make_finding_infer_config(work: Path, model_name: str, variant: str, true_gf
     region_train = work / f"finding_region_{model_name}_{variant}"
     edge_cfg = json.loads((work / "configs" / f"finding_edge_{model_name}_{variant}.json").read_text())
     region_cfg = json.loads((work / "configs" / f"finding_region_{model_name}_{variant}.json").read_text())
-    edge_cfg = {"model": edge_cfg["model"], "dataset": finding_data("test", 512, 64, True), "inference": {"checkpoint_path": str(edge_train / "final_model"), "batch_size": 1}}
-    region_cfg = {"model": region_cfg["model"], "dataset": finding_data("test", 1024, 128, True), "inference": {"checkpoint_path": str(region_train / "final_model"), "batch_size": 1}}
+    edge_cfg = {"model": edge_cfg["model"], "dataset": finding_data(512, 64, inference_subset=True), "inference": {"checkpoint_path": str(edge_train / "final_model"), "batch_size": 1}}
+    region_cfg = {"model": region_cfg["model"], "dataset": finding_data(1024, 128, inference_subset=True), "inference": {"checkpoint_path": str(region_train / "final_model"), "batch_size": 1}}
     cfg = {"edge": edge_cfg, "region": region_cfg, "postprocess": {"lp_frac": 0.05, "pk_prom": 0.1, "pk_dist": 50, "pk_height": None, "interval_window_size": 2000000, "max_pairs_per_seed": 2, "prob_threshold": 0.5, "zero_fraction_drop_threshold": 0.5}, "inference": {"device": "cuda", "use_reverse_complement": False, "output_gff": str(work / f"finding_{model_name}_{variant}.gff"), "true_gff": true_gff, "metrics_json": str(work / f"finding_{model_name}_{variant}.metrics.json"), "k_values": [0, 50, 100, 250, 500], "use_strand": True}}
     return write_json(work / "configs" / f"infer_finding_{model_name}_{variant}.json", cfg)
 
