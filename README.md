@@ -303,3 +303,8 @@ genatator_core/model_builders.py
 ```
 
 The only memory-wrapper spelling used in configs and code is `amt` / `AMT`. Smoke tests use real HF datasets and a user-provided reference GFF.
+
+
+### Smoke-test dataset filtering note
+
+The smoke runner uses only real Hugging Face data. For gene finding it uses the `test` split of `AIRI-Institute/genatator-gene-finding-dataset`, which is the complete T2T human genome split. The public dataset card defines one row as one genomic block, with complete chromosomes reconstructed by selecting blocks with the same `metadata["genome"]` and `metadata["chrom"]`, then sorting by `metadata["start"]`. The smoke runner therefore filters by chr20 aliases only (`NC_060944.1`, `chr20`, `20`, plus the first seqid found in your supplied reference GFF) and does not force a brittle genome string. For transcript-level tasks it uses real chr20 rows from the segmentation dataset validation configuration with the same chromosome aliases. If filtering selects zero rows, the dataset loader now stops with an observed metadata summary so the exact remote/local metadata values are visible immediately.

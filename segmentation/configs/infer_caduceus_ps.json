@@ -12,11 +12,11 @@
     "path": "AIRI-Institute/genatator-gene-segmentation-dataset",
     "config_name": "val-human",
     "split": "validation",
-    "genomes": [
-      "GCF_009914755.1"
-    ],
+    "genomes": null,
     "chromosomes": [
-      "NC_060944.1"
+      "NC_060944.1",
+      "chr20",
+      "20"
     ],
     "max_nucleotides": 131000,
     "max_tokens": 131000,

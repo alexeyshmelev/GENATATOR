@@ -22,6 +22,21 @@ MODELS = {
     "moderngena_large": {"kind": "moderngena", "path": "AIRI-Institute/moderngena-large"},
 }
 NUC_TOKENIZER = "kuleshov-group/caduceus-ps_seqlen-131k_d_model-256_n_layer-16"
+CHR20_ALIASES = ["NC_060944.1", "chr20", "20"]
+
+
+def add_chr_alias_from_reference_gff(reference_gff: str) -> None:
+    # The user supplies the chr20 reference GFF. We keep the smoke configs pinned to chr20,
+    # but we add the exact seqid from the GFF because local references may use NC_060944.1, chr20, or 20.
+    path = Path(reference_gff)
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if not line.strip() or line.startswith("#"):
+                continue
+            seqid = line.split("\t", 1)[0].strip()
+            if seqid and seqid not in CHR20_ALIASES:
+                CHR20_ALIASES.insert(0, seqid)
+            break
 
 
 def write_json(path: Path, obj: dict) -> Path:
@@ -83,8 +98,8 @@ def finding_data(split: str, max_nt: int, max_tok: int, test: bool = False) -> d
     cfg = {
         "path": "AIRI-Institute/genatator-gene-finding-dataset",
         "split": "test",
-        "genomes": ["GCF_009914755.1"],
-        "chromosomes": ["NC_060944.1"],
+        "genomes": None,
+        "chromosomes": CHR20_ALIASES,
         "max_nucleotides": max_nt,
         "max_tokens": max_tok,
         "overlap": 0.5,
@@ -104,8 +119,8 @@ def seg_data(config_name: str, split: str, max_nt: int, max_tok: int, test: bool
         "path": "AIRI-Institute/genatator-gene-segmentation-dataset",
         "config_name": "val-human",
         "split": "validation",
-        "genomes": ["GCF_009914755.1"],
-        "chromosomes": ["NC_060944.1"],
+        "genomes": None,
+        "chromosomes": CHR20_ALIASES,
         "max_nucleotides": max_nt,
         "max_tokens": max_tok,
         "overlap": 0.5,
@@ -326,6 +341,8 @@ def main():
     true_gff = Path(args.reference_gff).expanduser()
     if not true_gff.exists():
         raise FileNotFoundError(f"Reference GFF does not exist: {true_gff}. Smoke tests never use dummy GFF files.")
+    add_chr_alias_from_reference_gff(str(true_gff))
+    print(f"Smoke tests will filter real HF data to chr20 aliases: {CHR20_ALIASES}")
     gpus = args.gpus.split(",") if args.gpus else [str(i) for i in range(args.num_gpus)]
     if not gpus:
         raise RuntimeError("At least one GPU is required")

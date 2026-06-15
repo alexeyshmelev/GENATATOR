@@ -11,11 +11,11 @@
     "dataset": {
       "path": "AIRI-Institute/genatator-gene-finding-dataset",
       "split": "test",
-      "genomes": [
-        "GCF_009914755.1"
-      ],
+      "genomes": null,
       "chromosomes": [
-        "NC_060944.1"
+        "NC_060944.1",
+        "chr20",
+        "20"
       ],
       "max_nucleotides": 9216,
       "max_tokens": 1024,
@@ -39,11 +39,11 @@
     "dataset": {
       "path": "AIRI-Institute/genatator-gene-finding-dataset",
       "split": "test",
-      "genomes": [
-        "GCF_009914755.1"
-      ],
+      "genomes": null,
       "chromosomes": [
-        "NC_060944.1"
+        "NC_060944.1",
+        "chr20",
+        "20"
       ],
       "max_nucleotides": 73728,
       "max_tokens": 8192,

@@ -66,15 +66,56 @@ def parse_metadata(value: Any) -> ParsedMetadata:
     return ParsedMetadata()
 
 
+def _norm_id(x: Any) -> str:
+    return str(x or "").strip()
+
+
+def _chrom_aliases(chrom: Any) -> set[str]:
+    value = _norm_id(chrom)
+    aliases = {value}
+    low = value.lower()
+    if low.startswith("chr") and len(value) > 3:
+        aliases.add(value[3:])
+    elif value and value.isdigit():
+        aliases.add(f"chr{value}")
+    return aliases
+
+
+def _matches_any(value: Any, allowed: set[str], is_chrom: bool = False) -> bool:
+    if not allowed:
+        return True
+    if is_chrom:
+        return bool(_chrom_aliases(value) & allowed)
+    return _norm_id(value) in allowed
+
+
+def _metadata_summary_from_rows(rows: List[Dict[str, Any]], limit: int = 20) -> Dict[str, Any]:
+    genomes: Dict[str, int] = {}
+    chroms: Dict[str, int] = {}
+    pairs: Dict[str, int] = {}
+    for row in rows:
+        meta = parse_metadata(row.get("metadata", {}))
+        g = meta.genome or "<empty>"
+        c = meta.chrom or "<empty>"
+        genomes[g] = genomes.get(g, 0) + 1
+        chroms[c] = chroms.get(c, 0) + 1
+        pairs[f"{g}|{c}"] = pairs.get(f"{g}|{c}", 0) + 1
+    def top(d):
+        return sorted(d.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+    return {"genomes": top(genomes), "chromosomes": top(chroms), "genome_chrom_pairs": top(pairs)}
+
+
 def _row_matches_cfg(row: Dict[str, Any], cfg: Dict[str, Any]) -> bool:
-    genomes = set(cfg.get("genomes") or [])
-    chromosomes = set(cfg.get("chromosomes") or [])
+    genomes = set(_norm_id(x) for x in (cfg.get("genomes") or []))
+    chromosomes = set()
+    for x in (cfg.get("chromosomes") or []):
+        chromosomes |= _chrom_aliases(x)
     statuses = cfg.get("statuses")
     statuses = set(int(x) for x in statuses) if statuses is not None else None
     meta = parse_metadata(row.get("metadata", {}))
-    if genomes and meta.genome not in genomes:
+    if not _matches_any(meta.genome, genomes):
         return False
-    if chromosomes and meta.chrom not in chromosomes:
+    if not _matches_any(meta.chrom, chromosomes, is_chrom=True):
         return False
     if statuses is not None:
         if "status" not in row:
@@ -89,8 +130,12 @@ def _materialize_streaming_dataset(iterable, cfg: Dict[str, Any]) -> HFDataset:
     max_scanned = int(cfg.get("streaming_max_scanned_rows") or 100000)
     rows = []
     scanned = 0
+    observed: List[Dict[str, Any]] = []
+    observed_limit = int(cfg.get("streaming_observed_metadata_limit") or 2000)
     for row in iterable:
         scanned += 1
+        if len(observed) < observed_limit:
+            observed.append(row)
         if _row_matches_cfg(row, cfg):
             rows.append(row)
             if len(rows) >= max_rows:
@@ -98,11 +143,14 @@ def _materialize_streaming_dataset(iterable, cfg: Dict[str, Any]) -> HFDataset:
         if scanned >= max_scanned:
             break
     if not rows:
+        summary = _metadata_summary_from_rows(observed)
         raise RuntimeError(
-            f"Streaming dataset materialization selected zero rows after scanning {scanned}. "
-            f"cfg filters: genomes={cfg.get('genomes')} chromosomes={cfg.get('chromosomes')} statuses={cfg.get('statuses')}"
+            "Streaming dataset materialization selected zero rows after "
+            f"scanning {scanned}. filters: genomes={cfg.get('genomes')} "
+            f"chromosomes={cfg.get('chromosomes')} statuses={cfg.get('statuses')}. "
+            f"Observed metadata summary from first {len(observed)} scanned rows: {json.dumps(summary, ensure_ascii=False)}"
         )
-    logger.info("[dataset.streaming] materialized_rows=%d scanned_rows=%d max_rows=%d", len(rows), scanned, max_rows)
+    logger.info("[dataset.streaming] materialized_rows=%d scanned_rows=%d max_rows=%d observed=%s", len(rows), scanned, max_rows, json.dumps(_metadata_summary_from_rows(rows), ensure_ascii=False))
     return HFDataset.from_list(rows)
 
 
@@ -147,8 +195,10 @@ def load_dataset_auto(cfg: Dict[str, Any]) -> HFDataset:
 
 
 def filter_row_indices(ds: HFDataset, cfg: Dict[str, Any]) -> List[int]:
-    genomes = set(cfg.get("genomes") or [])
-    chromosomes = set(cfg.get("chromosomes") or [])
+    genomes = set(_norm_id(x) for x in (cfg.get("genomes") or []))
+    chromosomes = set()
+    for x in (cfg.get("chromosomes") or []):
+        chromosomes |= _chrom_aliases(x)
     statuses = cfg.get("statuses")
     statuses = set(int(x) for x in statuses) if statuses is not None else None
     max_rows = cfg.get("max_rows")
@@ -157,11 +207,15 @@ def filter_row_indices(ds: HFDataset, cfg: Dict[str, Any]) -> List[int]:
         raise RuntimeError("statuses filter was requested but dataset has no status column")
     status_values = ds["status"] if statuses is not None else None
     indices: List[int] = []
+    observed = []
     for i, meta_value in enumerate(metadata_values):
+        row_meta = {"metadata": meta_value}
+        if len(observed) < 2000:
+            observed.append(row_meta)
         meta = parse_metadata(meta_value)
-        if genomes and meta.genome not in genomes:
+        if not _matches_any(meta.genome, genomes):
             continue
-        if chromosomes and meta.chrom not in chromosomes:
+        if not _matches_any(meta.chrom, chromosomes, is_chrom=True):
             continue
         if statuses is not None and status_values is not None and int(status_values[i]) not in statuses:
             continue
@@ -169,6 +223,13 @@ def filter_row_indices(ds: HFDataset, cfg: Dict[str, Any]) -> List[int]:
         if max_rows and len(indices) >= int(max_rows):
             break
     logger.info("[dataset.filter] selected_rows=%d / %d genomes=%s chromosomes=%s statuses=%s max_rows=%s", len(indices), len(ds), sorted(genomes), sorted(chromosomes), statuses, max_rows)
+    if not indices:
+        summary = _metadata_summary_from_rows(observed)
+        raise RuntimeError(
+            "Dataset filter selected zero rows. "
+            f"filters: genomes={cfg.get('genomes')} chromosomes={cfg.get('chromosomes')} statuses={cfg.get('statuses')}. "
+            f"Observed metadata summary from first {len(observed)} rows: {json.dumps(summary, ensure_ascii=False)}"
+        )
     return indices
 
 def make_windows(length: int, max_len: int, overlap: float) -> List[Tuple[int, int]]:
