@@ -90,7 +90,7 @@ The finding inference config has separate `edge` and `region` stage configs plus
 | `rmt` | RMT settings: `input_size`, `max_n_segments`, `num_mem_tokens`, `bptt_depth`, `unet_sub_model_input_size`. |
 | `amt` | AMT settings: `amt_repo_id`, `num_mem_tokens`, `d_mem`, `segment_size`, and optional AMT wrapper parameters. |
 
-The code logs detected hidden sizes, embedding-table shapes, memory-token settings, UNET input dimensions, tokenizer IDs, model family, and parameter counts.
+The code logs detected hidden sizes, embedding-table shapes, memory-token settings, UNET input dimensions, tokenizer IDs, model family, and parameter counts. Caduceus no longer uses lazy heads: PS hidden width is inferred as `2 * d_model`, PH hidden width as `d_model`, and the first forward pass verifies the emitted hidden-state shape explicitly.
 
 ### Dataset parameters
 
@@ -106,6 +106,8 @@ The repository supports both HF datasets and local mirrors. There is no source s
 | `chromosomes` | Optional list of chromosome/contig IDs. Empty list means no chromosome filter. |
 | `statuses` | Optional list of representative-transcript status values, for example `[1]`. If requested, the dataset must have a `status` column. |
 | `max_rows` | Optional row cap, useful for smoke tests. |
+| `streaming` | Optional HF streaming mode. When `true`, the loader scans remote rows, applies `genomes`/`chromosomes`/`statuses`, materializes only matching rows, and then trains normally on that small real-data subset. |
+| `streaming_max_scanned_rows` | Maximum number of streamed rows to scan while looking for rows that match filters. |
 | `max_windows` | Optional window cap after dataset windowing, useful for smoke tests. |
 | `max_nucleotides` | Nucleotide context length used for nucleotide models and UNET output. |
 | `max_tokens` | Token context length used for BPE models. |
@@ -255,7 +257,7 @@ The script writes a TSV with transcript IDs, reference type, predicted type, and
 
 ## Smoke tests on real HF data
 
-Smoke tests do **not** generate dummy data and do **not** use a dummy GFF. They use the real HF datasets and require a user-provided human T2T chromosome 20 reference GFF/GFF3.
+Smoke tests do **not** generate dummy data and do **not** use a dummy GFF. They use the real HF datasets and require a user-provided human T2T chromosome 20 reference GFF/GFF3. Generated smoke configs set `streaming=true`, so only a few real rows matching the configured genome/chromosome/status filters are materialized before training.
 
 Run:
 
@@ -285,7 +287,7 @@ The smoke runner:
 6. computes final metrics with the configured metric packages;
 7. writes `summary.md` with job durations, logs, and metric previews.
 
-Each smoke job uses one GPU. Jobs are launched concurrently up to the number of available GPUs while respecting train→inference dependencies. If any job fails, the runner terminates active jobs and raises an error with the failed job name, command, GPU, and log file.
+Each smoke job uses one GPU. Jobs are launched concurrently up to the number of available GPUs while respecting train→inference dependencies. If any job fails, the runner terminates active jobs and raises an error with the failed job name, command, GPU, log file, and the last log lines.
 
 ## Repository hygiene
 

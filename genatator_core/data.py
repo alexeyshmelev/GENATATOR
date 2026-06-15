@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 from datasets import Dataset as HFDataset
-from datasets import DatasetDict, load_dataset, load_from_disk
+from datasets import DatasetDict, IterableDataset as HFIterableDataset, load_dataset, load_from_disk
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from .config import is_local, local_or_remote
@@ -66,13 +66,54 @@ def parse_metadata(value: Any) -> ParsedMetadata:
     return ParsedMetadata()
 
 
+def _row_matches_cfg(row: Dict[str, Any], cfg: Dict[str, Any]) -> bool:
+    genomes = set(cfg.get("genomes") or [])
+    chromosomes = set(cfg.get("chromosomes") or [])
+    statuses = cfg.get("statuses")
+    statuses = set(int(x) for x in statuses) if statuses is not None else None
+    meta = parse_metadata(row.get("metadata", {}))
+    if genomes and meta.genome not in genomes:
+        return False
+    if chromosomes and meta.chrom not in chromosomes:
+        return False
+    if statuses is not None:
+        if "status" not in row:
+            raise RuntimeError("statuses filter was requested but streamed row has no status column")
+        if int(row["status"]) not in statuses:
+            return False
+    return True
+
+
+def _materialize_streaming_dataset(iterable, cfg: Dict[str, Any]) -> HFDataset:
+    max_rows = int(cfg.get("max_rows") or cfg.get("streaming_max_rows") or 32)
+    max_scanned = int(cfg.get("streaming_max_scanned_rows") or 100000)
+    rows = []
+    scanned = 0
+    for row in iterable:
+        scanned += 1
+        if _row_matches_cfg(row, cfg):
+            rows.append(row)
+            if len(rows) >= max_rows:
+                break
+        if scanned >= max_scanned:
+            break
+    if not rows:
+        raise RuntimeError(
+            f"Streaming dataset materialization selected zero rows after scanning {scanned}. "
+            f"cfg filters: genomes={cfg.get('genomes')} chromosomes={cfg.get('chromosomes')} statuses={cfg.get('statuses')}"
+        )
+    logger.info("[dataset.streaming] materialized_rows=%d scanned_rows=%d max_rows=%d", len(rows), scanned, max_rows)
+    return HFDataset.from_list(rows)
+
+
 def load_dataset_auto(cfg: Dict[str, Any]) -> HFDataset:
     path = cfg["path"]
     split = cfg.get("split", "train")
     name = cfg.get("config_name")
     data_files = cfg.get("data_files")
     ref = local_or_remote(path)
-    logger.info("[dataset.load] ref=%s split=%s config_name=%s data_files=%s local=%s", ref, split, name, data_files, is_local(path))
+    streaming = bool(cfg.get("streaming", False))
+    logger.info("[dataset.load] ref=%s split=%s config_name=%s data_files=%s local=%s streaming=%s", ref, split, name, data_files, is_local(path), streaming)
     if is_local(path):
         p = Path(ref)
         if p.is_dir() and ((p / "dataset_info.json").exists() or (p / "dataset_dict.json").exists()):
@@ -99,6 +140,9 @@ def load_dataset_auto(cfg: Dict[str, Any]) -> HFDataset:
         kwargs["name"] = name
     if data_files:
         kwargs["data_files"] = data_files
+    if streaming:
+        iterable = load_dataset(**kwargs, streaming=True)
+        return _materialize_streaming_dataset(iterable, cfg)
     return load_dataset(**kwargs)
 
 
@@ -329,22 +373,49 @@ class GenatatorDataset(torch.utils.data.Dataset):
             item["transcript_type"] = torch.tensor([is_lnc], dtype=torch.float32)
         return item
 
-    def _tokenize_basic(self, dna: str, max_len: int) -> Dict[str, Any]:
-        return self.tokenizer(
-            dna,
+    def _tokenize_basic(self, dna: str, max_len: int, return_offsets: bool) -> Dict[str, Any]:
+        kwargs = dict(
+            text=dna,
             add_special_tokens=True,
             padding="max_length",
             truncation=True,
             max_length=max_len,
             return_attention_mask=True,
             return_token_type_ids=True,
-            return_offsets_mapping=True,
+            return_special_tokens_mask=True,
         )
+        if return_offsets:
+            if not getattr(self.tokenizer, "is_fast", False):
+                raise RuntimeError(
+                    f"Tokenizer {type(self.tokenizer).__name__} is not a fast tokenizer and cannot return offsets. "
+                    "BPE-resolution models require a fast tokenizer. Use a fast GENA/ModernGENA tokenizer or a nucleotide model."
+                )
+            kwargs["return_offsets_mapping"] = True
+        enc = self.tokenizer(**kwargs)
+        if "token_type_ids" not in enc:
+            enc["token_type_ids"] = [0] * len(enc["input_ids"])
+        if "special_tokens_mask" not in enc:
+            enc["special_tokens_mask"] = [0] * len(enc["input_ids"])
+        return enc
+
+    @staticmethod
+    def _synthetic_offsets_from_content_mask(mask: np.ndarray) -> List[Tuple[int, int]]:
+        offsets: List[Tuple[int, int]] = []
+        cursor = 0
+        for use in mask:
+            if bool(use):
+                offsets.append((cursor, cursor + 1))
+                cursor += 1
+            else:
+                offsets.append((0, 0))
+        return offsets
 
     def _tokenize_token_task(self, dna: str, labels: np.ndarray, meta: ParsedMetadata, local_start: int) -> Dict[str, Any]:
         if self.model_family == "nucleotide":
-            enc = self._tokenize_basic(dna, self.max_nucleotides)
-            mask = offset_content_mask(enc["offset_mapping"], enc["attention_mask"])
+            enc = self._tokenize_basic(dna, self.max_nucleotides, return_offsets=False)
+            attn = np.asarray(enc["attention_mask"], dtype=np.int64)
+            special = np.asarray(enc.get("special_tokens_mask", [0] * len(attn)), dtype=np.int64)
+            mask = (attn == 1) & (special == 0)
             y = np.zeros((len(enc["input_ids"]), labels.shape[1]), dtype=np.float32)
             cursor = 0
             for i, use in enumerate(mask):
@@ -359,8 +430,9 @@ class GenatatorDataset(torch.utils.data.Dataset):
                 "letter_level_labels_mask": torch.tensor(mask, dtype=torch.bool),
                 "pos_weight": torch.ones((len(enc["input_ids"]), labels.shape[1]), dtype=torch.float32),
             }
+            inference_offsets = self._synthetic_offsets_from_content_mask(mask)
         else:
-            enc = self._tokenize_basic(dna, self.max_tokens)
+            enc = self._tokenize_basic(dna, self.max_tokens, return_offsets=True)
             token_y, token_mask = max_labels_by_offsets(labels, enc["offset_mapping"], enc["attention_mask"], labels.shape[1])
             item = {
                 "input_ids": torch.tensor(enc["input_ids"], dtype=torch.long),
@@ -369,6 +441,7 @@ class GenatatorDataset(torch.utils.data.Dataset):
                 "labels": torch.tensor(token_y, dtype=torch.float32),
                 "labels_mask": torch.tensor(token_mask, dtype=torch.bool),
             }
+            inference_offsets = enc["offset_mapping"]
             if self.model_family in {"bpe_unet", "rmt_unet", "amt_unet"}:
                 letter_len = self.max_nucleotides
                 n = min(len(labels), letter_len)
@@ -392,7 +465,7 @@ class GenatatorDataset(torch.utils.data.Dataset):
             item["metadata"] = meta
             item["local_start"] = local_start
             item["dna_sequence"] = dna
-            item["offset_mapping"] = enc["offset_mapping"]
+            item["offset_mapping"] = inference_offsets
             item["reverse_complement"] = self.reverse_complement
         return item
 

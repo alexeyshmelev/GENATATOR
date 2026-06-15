@@ -11,7 +11,7 @@ from transformers import AutoConfig, AutoModel
 from .amt_models import AMTTokenClassifier
 from .backbones import HiddenStateBackbone
 from .config import local_or_remote
-from .legacy_caduceus import CaduceusMiddleLossTokenClassifier, CaduceusTranscriptTypeMiddleLossClassifier
+from .legacy_caduceus import CaduceusMiddleLossTokenClassifier, CaduceusTranscriptTypeMiddleLossClassifier, infer_caduceus_hidden_size
 from .legacy_rmt import RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater
 from .token_models import PlainTokenClassifier, TokenClassifierWithUNet, TranscriptTypeClassifier
 
@@ -33,8 +33,11 @@ def build_model(cfg: Dict[str, Any], task: str):
         config = AutoConfig.from_pretrained(backbone_path, trust_remote_code=trust_remote_code)
         config.bidirectional_weight_tie = bool(model_cfg.get("bidirectional_weight_tie", False))
         logger.info("[caduceus] loading AutoModel path=%s bidirectional_weight_tie=%s", backbone_path, config.bidirectional_weight_tie)
+        hidden_size = int(model_cfg.get("hidden_size") or infer_caduceus_hidden_size(config, backbone_path))
+        if "hidden_size" in model_cfg:
+            logger.info("[caduceus.shape] using explicit model.hidden_size=%d from config", hidden_size)
         backbone = AutoModel.from_pretrained(backbone_path, config=config, trust_remote_code=trust_remote_code)
-        model = CaduceusTranscriptTypeMiddleLossClassifier(backbone) if task == "transcript_type" else CaduceusMiddleLossTokenClassifier(backbone, num_labels=num_labels)
+        model = CaduceusTranscriptTypeMiddleLossClassifier(backbone, hidden_size=hidden_size) if task == "transcript_type" else CaduceusMiddleLossTokenClassifier(backbone, num_labels=num_labels, hidden_size=hidden_size)
 
     elif family == "plain":
         if backbone_kind not in {"gena", "moderngena"}:

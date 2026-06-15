@@ -24,6 +24,9 @@ def prepare_tokenizers(model_cfg: Dict[str, Any]):
     tokenizer = make_tokenizer(model_cfg["tokenizer_path"], trust_remote_code=bool(model_cfg.get("trust_remote_code", True)))
     if model_cfg.get("padding_side"):
         tokenizer.padding_side = model_cfg["padding_side"]
+    elif model_cfg.get("backbone_kind") == "caduceus":
+        tokenizer.padding_side = "left"
+        logger.info("[infer.tokenizer] using Caduceus default padding_side=left")
     nucleotide_tokenizer = None
     if model_cfg.get("nucleotide_tokenizer_path"):
         nucleotide_tokenizer = make_tokenizer(model_cfg["nucleotide_tokenizer_path"], trust_remote_code=bool(model_cfg.get("trust_remote_code", True)))

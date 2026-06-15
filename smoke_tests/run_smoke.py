@@ -68,6 +68,7 @@ def model_cfg(model_name: str, family: str, extra: dict | None = None) -> dict:
     }
     if info["kind"] == "caduceus":
         cfg["bidirectional_weight_tie"] = False
+        cfg["padding_side"] = "left"
     if family in {"unet", "rmt"} or (family == "amt" and (extra or {}).get("use_unet", False)):
         cfg.update({"nucleotide_tokenizer_path": NUC_TOKENIZER, "nucleotide_vocab_size": 1000})
     if extra:
@@ -76,27 +77,35 @@ def model_cfg(model_name: str, family: str, extra: dict | None = None) -> dict:
 
 
 def finding_data(split: str, max_nt: int, max_tok: int, test: bool = False) -> dict:
+    # Smoke tests intentionally materialize only a few real rows through HF streaming.
+    # For finding, all smoke jobs use the T2T human chr20 test split so inference and
+    # metric GFFs are consistent with the supplied chr20 reference.
     cfg = {
         "path": "AIRI-Institute/genatator-gene-finding-dataset",
-        "split": split,
-        "genomes": ["GCF_009914755.1"] if test else [],
-        "chromosomes": ["NC_060944.1"] if test else [],
+        "split": "test",
+        "genomes": ["GCF_009914755.1"],
+        "chromosomes": ["NC_060944.1"],
         "max_nucleotides": max_nt,
         "max_tokens": max_tok,
         "overlap": 0.5,
         "target_group": "primary",
+        "max_rows": 1,
         "max_windows": 1 if test else 2,
+        "streaming": True,
+        "streaming_max_scanned_rows": 5000,
     }
     return cfg
 
 
 def seg_data(config_name: str, split: str, max_nt: int, max_tok: int, test: bool = False) -> dict:
+    # Real HF data only. For smoke, use chr20 rows from val-human with streaming so
+    # the runner does not download full transcript datasets.
     return {
         "path": "AIRI-Institute/genatator-gene-segmentation-dataset",
-        "config_name": config_name,
-        "split": split,
-        "genomes": ["GCF_009914755.1"] if test else [],
-        "chromosomes": ["NC_060944.1"] if test else [],
+        "config_name": "val-human",
+        "split": "validation",
+        "genomes": ["GCF_009914755.1"],
+        "chromosomes": ["NC_060944.1"],
         "max_nucleotides": max_nt,
         "max_tokens": max_tok,
         "overlap": 0.5,
@@ -104,6 +113,8 @@ def seg_data(config_name: str, split: str, max_nt: int, max_tok: int, test: bool
         "random_crop": split == "train",
         "statuses": [1],
         "max_rows": 2,
+        "streaming": True,
+        "streaming_max_scanned_rows": 5000,
     }
 
 
@@ -251,7 +262,16 @@ def run_scheduler(jobs: List[dict], gpus: List[str], work: Path) -> dict:
                 state["fh"].close()
                 duration = time.time() - state["start"]
                 if ret != 0:
-                    raise RuntimeError(f"Smoke job failed: {name} exit_code={ret} gpu={state['gpu']} log={state['log']} cmd={' '.join(state['cmd'])}")
+                    tail = ""
+                    try:
+                        tail = state["log"].read_text(encoding="utf-8", errors="replace").splitlines()[-80:]
+                        tail = "\n".join(tail)
+                    except Exception as e:
+                        tail = f"<could not read log tail: {e}>"
+                    raise RuntimeError(
+                        f"Smoke job failed: {name} exit_code={ret} gpu={state['gpu']} log={state['log']} "
+                        f"cmd={' '.join(state['cmd'])}\n--- log tail ---\n{tail}"
+                    )
                 done[name] = {"duration_s": duration, "log": str(state["log"])}
                 free_gpus.append(state["gpu"])
                 del running[name]

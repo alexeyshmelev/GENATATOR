@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Dict
+import inspect
 
 from transformers import Trainer, TrainingArguments
 
@@ -75,6 +76,9 @@ def train_from_config(config_path: str, task: str) -> None:
     tokenizer = make_tokenizer(model_cfg["tokenizer_path"], trust_remote_code=bool(model_cfg.get("trust_remote_code", True)))
     if model_cfg.get("padding_side"):
         tokenizer.padding_side = model_cfg["padding_side"]
+    elif model_cfg.get("backbone_kind") == "caduceus":
+        tokenizer.padding_side = "left"
+        logger.info("[tokenizer.main] using Caduceus default padding_side=left")
     nucleotide_tokenizer = None
     if model_cfg.get("nucleotide_tokenizer_path"):
         nucleotide_tokenizer = make_tokenizer(model_cfg["nucleotide_tokenizer_path"], trust_remote_code=bool(model_cfg.get("trust_remote_code", True)))
@@ -96,7 +100,7 @@ def train_from_config(config_path: str, task: str) -> None:
 
     model = build_model(cfg, task=task)
     tr = cfg["training"]
-    args = TrainingArguments(
+    ta_kwargs = dict(
         output_dir=str(output_dir),
         overwrite_output_dir=bool(tr.get("overwrite_output_dir", False)),
         max_steps=int(tr.get("max_steps", -1)),
@@ -110,7 +114,6 @@ def train_from_config(config_path: str, task: str) -> None:
         lr_scheduler_type=tr.get("lr_scheduler_type", "constant_with_warmup"),
         logging_strategy="steps",
         logging_steps=int(tr.get("logging_steps", 100)),
-        eval_strategy="steps",
         eval_steps=int(tr.get("eval_steps", 1000)),
         save_strategy="steps",
         save_steps=int(tr.get("save_steps", 1000)),
@@ -129,6 +132,14 @@ def train_from_config(config_path: str, task: str) -> None:
         label_names=label_names_for(task, dataset_family),
         seed=int(cfg.get("seed", 42)),
     )
+    ta_params = inspect.signature(TrainingArguments.__init__).parameters
+    if "eval_strategy" in ta_params:
+        ta_kwargs["eval_strategy"] = "steps"
+    elif "evaluation_strategy" in ta_params:
+        ta_kwargs["evaluation_strategy"] = "steps"
+    else:
+        raise RuntimeError("Installed transformers.TrainingArguments supports neither eval_strategy nor evaluation_strategy")
+    args = TrainingArguments(**ta_kwargs)
     trainer = Trainer(
         model=model,
         args=args,
