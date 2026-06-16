@@ -91,15 +91,60 @@ def model_cfg(model_name: str, family: str, extra: dict | None = None) -> dict:
     return cfg
 
 
-def finding_data(max_nt: int, max_tok: int, inference_subset: bool = False) -> dict:
-    # Gene-finding smoke tests MUST use only the HF `test` split.
-    # The training, validation, and inference smoke configs all point to this same split
-    # to avoid touching the huge train split on CPU-only preprocessing machines.
-    # `streaming_trim_rows=true` keeps only the real nucleotide/target span needed by
-    # the tiny smoke windows, so a 10 Mb genomic block is not kept in memory.
+def prepare_gene_finding_smoke_cache(work: Path, row_slice: str, keep_len: int) -> Path:
+    """Create a tiny local JSONL cache from a real HF chr20 test row.
+
+    This avoids streaming through hundreds of 10 Mb genomic blocks every time a
+    smoke train/eval/infer job starts. The cache still contains real HF data; it
+    only trims the selected row to the nucleotide span needed by smoke windows.
+    """
+    cache_dir = work / "real_data_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    safe_slice = row_slice.replace("[", "_").replace(":", "_").replace("]", "")
+    out = cache_dir / f"gene_finding_{safe_slice}_first_{keep_len}.jsonl"
+    if out.exists() and out.stat().st_size > 0:
+        print(f"Using existing real gene-finding smoke cache: {out}")
+        return out
+
+    print(
+        "Preparing real gene-finding smoke cache from "
+        f"AIRI-Institute/genatator-gene-finding-dataset split={row_slice}."
+    )
+    from datasets import load_dataset
+
+    ds = load_dataset("AIRI-Institute/genatator-gene-finding-dataset", split=row_slice)
+    if len(ds) != 1:
+        raise RuntimeError(f"Expected exactly one row from split slice {row_slice}, got {len(ds)}")
+    row = ds[0]
+    dna = str(row["dna_sequence"])
+    n = min(len(dna), keep_len)
+    row["dna_sequence"] = dna[:n]
+    row["targets"] = row["targets"][:n]
+
+    meta = row.get("metadata", {})
+    if isinstance(meta, str) and meta.strip().startswith("{"):
+        meta = json.loads(meta)
+    elif not isinstance(meta, dict):
+        raise RuntimeError(f"Unsupported gene-finding metadata type in smoke cache row: {type(meta)}")
+    meta["start"] = int(meta.get("start", 0))
+    meta["end"] = int(meta["start"] + n)
+    row["metadata"] = meta
+
+    chrom = str(meta.get("chrom", meta.get("chromosome", "")))
+    if CHR20_ALIASES and chrom and chrom not in CHR20_ALIASES:
+        print(f"Warning: cached row chrom={chrom!r} is not in current chr20 aliases {CHR20_ALIASES}")
+    with out.open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps(row) + "\n")
+    print(f"Saved trimmed real gene-finding smoke cache: {out} kept_len={n} chrom={chrom}")
+    return out
+
+
+def finding_data(cache_path: Path, max_nt: int, max_tok: int, inference_subset: bool = False) -> dict:
+    # Gene-finding smoke tests use a tiny local cache produced from the real HF
+    # `test` split. This avoids slow streamed scanning and repeated remote reads.
     return {
-        "path": "AIRI-Institute/genatator-gene-finding-dataset",
-        "split": "test",
+        "path": str(cache_path),
+        "split": "train",
         "genomes": None,
         "chromosomes": CHR20_ALIASES,
         "max_nucleotides": max_nt,
@@ -108,9 +153,7 @@ def finding_data(max_nt: int, max_tok: int, inference_subset: bool = False) -> d
         "target_group": "primary",
         "max_rows": 1,
         "max_windows": 1 if inference_subset else 2,
-        "streaming": True,
-        "streaming_trim_rows": True,
-        "streaming_max_scanned_rows": 5000,
+        "streaming": False,
     }
 
 
@@ -135,7 +178,7 @@ def seg_data(config_name: str, split: str, max_nt: int, max_tok: int, test: bool
     }
 
 
-def make_finding_train_config(work: Path, model_name: str, task: str, variant: str) -> Path:
+def make_finding_train_config(work: Path, gf_cache: Path, model_name: str, task: str, variant: str) -> Path:
     max_tok = 64 if task == "edge" else 128
     max_nt = 512 if task == "edge" else 1024
     family = "caduceus" if MODELS[model_name]["kind"] == "caduceus" else variant
@@ -150,8 +193,8 @@ def make_finding_train_config(work: Path, model_name: str, task: str, variant: s
     cfg = {
         "seed": 42,
         "model": model_cfg(model_name, family, extra),
-        "train_dataset": finding_data(max_nt, max_tok, inference_subset=False),
-        "eval_dataset": finding_data(max_nt, max_tok, inference_subset=False),
+        "train_dataset": finding_data(gf_cache, max_nt, max_tok, inference_subset=False),
+        "eval_dataset": finding_data(gf_cache, max_nt, max_tok, inference_subset=False),
         "training": tiny_training(str(work / name), "auc_mean", bs=1 if family in {"unet", "rmt"} else 2),
     }
     return write_json(work / "configs" / f"{name}.json", cfg)
@@ -187,13 +230,13 @@ def make_tt_train_config(work: Path, model_name: str) -> Path:
     return write_json(work / "configs" / f"{name}.json", cfg)
 
 
-def make_finding_infer_config(work: Path, model_name: str, variant: str, true_gff: str) -> Path:
+def make_finding_infer_config(work: Path, gf_cache: Path, model_name: str, variant: str, true_gff: str) -> Path:
     edge_train = work / f"finding_edge_{model_name}_{variant}"
     region_train = work / f"finding_region_{model_name}_{variant}"
     edge_cfg = json.loads((work / "configs" / f"finding_edge_{model_name}_{variant}.json").read_text())
     region_cfg = json.loads((work / "configs" / f"finding_region_{model_name}_{variant}.json").read_text())
-    edge_cfg = {"model": edge_cfg["model"], "dataset": finding_data(512, 64, inference_subset=True), "inference": {"checkpoint_path": str(edge_train / "final_model"), "batch_size": 1}}
-    region_cfg = {"model": region_cfg["model"], "dataset": finding_data(1024, 128, inference_subset=True), "inference": {"checkpoint_path": str(region_train / "final_model"), "batch_size": 1}}
+    edge_cfg = {"model": edge_cfg["model"], "dataset": finding_data(gf_cache, 512, 64, inference_subset=True), "inference": {"checkpoint_path": str(edge_train / "final_model"), "batch_size": 1}}
+    region_cfg = {"model": region_cfg["model"], "dataset": finding_data(gf_cache, 1024, 128, inference_subset=True), "inference": {"checkpoint_path": str(region_train / "final_model"), "batch_size": 1}}
     cfg = {"edge": edge_cfg, "region": region_cfg, "postprocess": {"lp_frac": 0.05, "pk_prom": 0.1, "pk_dist": 50, "pk_height": None, "interval_window_size": 2000000, "max_pairs_per_seed": 2, "prob_threshold": 0.5, "zero_fraction_drop_threshold": 0.5}, "inference": {"device": "cuda", "use_reverse_complement": False, "output_gff": str(work / f"finding_{model_name}_{variant}.gff"), "true_gff": true_gff, "metrics_json": str(work / f"finding_{model_name}_{variant}.metrics.json"), "k_values": [0, 50, 100, 250, 500], "use_strand": True}}
     return write_json(work / "configs" / f"infer_finding_{model_name}_{variant}.json", cfg)
 
@@ -214,7 +257,7 @@ def make_tt_infer_config(work: Path, model_name: str) -> Path:
     return write_json(work / "configs" / f"infer_transcript_type_{model_name}_{family}.json", cfg)
 
 
-def build_jobs(work: Path, true_gff: str) -> List[dict]:
+def build_jobs(work: Path, true_gff: str, gf_cache: Path) -> List[dict]:
     jobs = []
     finding_variants_by_model = {}
     for model_name, info in MODELS.items():
@@ -224,9 +267,9 @@ def build_jobs(work: Path, true_gff: str) -> List[dict]:
         finding_variants_by_model[model_name] = variants
         for variant in variants:
             for task in ["edge", "region"]:
-                cfg = make_finding_train_config(work, model_name, task, variant)
+                cfg = make_finding_train_config(work, gf_cache, model_name, task, variant)
                 jobs.append({"name": f"train_finding_{task}_{model_name}_{variant}", "cmd": [sys.executable, "finding/train.py", "--task", task, "--config", str(cfg)], "deps": []})
-            infer_cfg = make_finding_infer_config(work, model_name, variant, true_gff)
+            infer_cfg = make_finding_infer_config(work, gf_cache, model_name, variant, true_gff)
             jobs.append({"name": f"infer_finding_{model_name}_{variant}", "cmd": [sys.executable, "finding/infer.py", "--config", str(infer_cfg)], "deps": [f"train_finding_edge_{model_name}_{variant}", f"train_finding_region_{model_name}_{variant}"]})
 
     for model_name, info in MODELS.items():
@@ -339,6 +382,8 @@ def main():
     ap.add_argument("--gpus", type=str, default=None, help="Comma-separated GPU IDs. Overrides --num-gpus list generation.")
     ap.add_argument("--reference-gff", type=str, required=True, help="Human T2T chr20 reference GFF/GFF3 supplied by the user.")
     ap.add_argument("--work-dir", type=str, default="smoke_tests/runs")
+    ap.add_argument("--gene-finding-row-slice", type=str, default="test[286:287]", help="HF split slice containing human T2T chr20 in the gene-finding test split. Default is based on dataset metadata observed in smoke logs.")
+    ap.add_argument("--gene-finding-cache-len", type=int, default=1536, help="Number of real nucleotides to keep from the selected gene-finding smoke row.")
     args = ap.parse_args()
     true_gff = Path(args.reference_gff).expanduser()
     if not true_gff.exists():
@@ -349,7 +394,8 @@ def main():
     if not gpus:
         raise RuntimeError("At least one GPU is required")
     work = (REPO / args.work_dir).resolve(); work.mkdir(parents=True, exist_ok=True)
-    jobs = build_jobs(work, str(true_gff))
+    gf_cache = prepare_gene_finding_smoke_cache(work, args.gene_finding_row_slice, args.gene_finding_cache_len)
+    jobs = build_jobs(work, str(true_gff), gf_cache)
     (work / "jobs.json").write_text(json.dumps(jobs, indent=2), encoding="utf-8")
     done = run_scheduler(jobs, gpus, work)
     summary = write_summary(work, done)

@@ -108,7 +108,7 @@ The repository supports both HF datasets and local mirrors. There is no source s
 | `max_rows` | Optional row cap, useful for smoke tests. |
 | `streaming` | Optional HF streaming mode. When `true`, the loader scans remote rows, applies `genomes`/`chromosomes`/`statuses`, materializes only matching rows, and then trains normally on that small real-data subset. |
 | `streaming_max_scanned_rows` | Maximum number of streamed rows to scan while looking for rows that match filters. |
-| `streaming_trim_rows` | Optional smoke/debug option. When `true`, a streamed row is trimmed to the real span required by `max_nucleotides`, `overlap`, and `max_windows` before it is kept in memory. This is used by gene-finding smoke jobs only. |
+| `streaming_trim_rows` | Optional debug option. When `true`, a streamed row is trimmed to the span required by `max_nucleotides`, `overlap`, and `max_windows` before it is kept in memory. Current smoke tests instead build a local real-data cache from a direct HF test slice. |
 | `max_windows` | Optional window cap after dataset windowing, useful for smoke tests. |
 | `max_nucleotides` | Nucleotide context length used for nucleotide models and UNET output. |
 | `max_tokens` | Token context length used for BPE models. |
@@ -258,7 +258,7 @@ The script writes a TSV with transcript IDs, reference type, predicted type, and
 
 ## Smoke tests on real HF data
 
-Smoke tests do **not** generate dummy data and do **not** use a dummy GFF. They use the real HF datasets and require a user-provided human T2T chromosome 20 reference GFF/GFF3. For the gene-finding dataset, smoke tests use **only** the HF `test` split for the tiny training, validation, and inference jobs; they never open the huge gene-finding `train` split or the `validation` split. Generated gene-finding smoke configs set `streaming=true` and `streaming_trim_rows=true`, so the loader streams real chr20 blocks from `test` and keeps only the real nucleotide/target span needed by the tiny smoke windows.
+Smoke tests do **not** generate dummy data and do **not** use a dummy GFF. They use the real HF datasets and require a user-provided human T2T chromosome 20 reference GFF/GFF3. For the gene-finding dataset, smoke tests use **only** the HF `test` split for tiny training, validation, and inference; they never open the huge gene-finding `train` split or the gene-finding `validation` split. To avoid the very slow streamed search through hundreds of 10 Mb test blocks, the runner first loads a direct HF split slice, by default `test[286:287]`, trims that real chr20 row to the needed smoke span, and writes a small local JSONL cache under the smoke work directory. All gene-finding smoke configs then point to this local real-data cache.
 
 Run:
 
@@ -267,6 +267,16 @@ python smoke_tests/run_smoke.py \
   --num-gpus 4 \
   --reference-gff /path/to/human_T2T_chr20_reference.gff3 \
   --work-dir smoke_tests/runs
+```
+
+Optional gene-finding cache controls:
+
+```bash
+python smoke_tests/run_smoke.py \
+  --num-gpus 4 \
+  --reference-gff /path/to/human_T2T_chr20_reference.gff3 \
+  --gene-finding-row-slice 'test[286:287]' \
+  --gene-finding-cache-len 1536
 ```
 
 Or choose GPU IDs explicitly:
@@ -308,4 +318,4 @@ The only memory-wrapper spelling used in configs and code is `amt` / `AMT`. Smok
 
 ### Smoke-test dataset filtering note
 
-The smoke runner uses only real Hugging Face data. For gene finding it uses the `test` split of `AIRI-Institute/genatator-gene-finding-dataset` for all three smoke phases: tiny training, tiny validation, and tiny inference. It never calls `load_dataset(...)` without a split and never uses the huge gene-finding `train` split in smoke mode. Because a real gene-finding row can be a very large genomic block, smoke configs also set `streaming_trim_rows=true`: after a matching chr20 row is streamed, the loader keeps only the first real span needed for the configured number of smoke windows and trims the row before storing it. The smoke runner filters by chr20 aliases only (`NC_060944.1`, `chr20`, `20`, plus the first seqid found in your supplied reference GFF) and does not force a brittle genome string. For transcript-level tasks it uses real chr20 rows from the segmentation dataset validation configuration with the same chromosome aliases. If filtering selects zero rows, the dataset loader stops with an observed metadata summary so the exact remote/local metadata values are visible immediately.
+The smoke runner uses only real Hugging Face data. For gene finding it uses the `test` split of `AIRI-Institute/genatator-gene-finding-dataset` for all three smoke phases: tiny training, tiny validation, and tiny inference. It never calls `load_dataset(...)` without a split and never uses the huge gene-finding `train` split in smoke mode. The first step creates a local real-data cache from a direct split slice, default `test[286:287]`, which is the chr20 test row observed in the dataset metadata. The cache is trimmed to the configured real nucleotide span, default 1536 bp, and reused by all gene-finding smoke jobs, so the dataset is not repeatedly streamed or scanned. You can override the row slice with `--gene-finding-row-slice` and the retained length with `--gene-finding-cache-len`. For transcript-level tasks it uses real chr20 rows from the segmentation dataset validation configuration with the same chromosome aliases. If filtering selects zero rows, the dataset loader stops with an observed metadata summary so the exact remote/local metadata values are visible immediately.
