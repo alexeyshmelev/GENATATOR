@@ -97,10 +97,30 @@ def default_smoke_cache_dir() -> Path:
 
 def _metadata_dict(row: dict) -> dict:
     meta = row.get("metadata", {})
-    if isinstance(meta, str) and meta.strip().startswith("{"):
-        return json.loads(meta)
     if isinstance(meta, dict):
         return dict(meta)
+    if isinstance(meta, str):
+        text = meta.strip()
+        if text.startswith("{"):
+            return json.loads(text)
+        # Segmentation dataset metadata is compact:
+        # <transcript_id>|<gene_id>|<transcript_type>|<strand>|<genome>|<chrom>|<start>:<end>
+        if "|" in text:
+            parts = text.split("|")
+            start, end = 0, 0
+            if len(parts) > 6 and ":" in parts[6]:
+                a, b = parts[6].split(":", 1)
+                start, end = int(a), int(b)
+            return {
+                "transcript_id": parts[0] if len(parts) > 0 else "",
+                "gene_id": parts[1] if len(parts) > 1 else "",
+                "transcript_type": parts[2] if len(parts) > 2 else "",
+                "strand": parts[3] if len(parts) > 3 else "+",
+                "genome": parts[4] if len(parts) > 4 else "",
+                "chrom": parts[5] if len(parts) > 5 else "",
+                "start": start,
+                "end": end,
+            }
     raise RuntimeError(f"Unsupported metadata type in smoke cache row: {type(meta)}")
 
 
@@ -123,6 +143,9 @@ DEFAULT_GF_REMOTE_PARQUET = (
     "data/test/part-00000/"
     "GCF_009914755.1_T2T-CHM13v2.0__NC_060944.1__000000000000_000010000000.parquet"
 )
+
+SEGMENTATION_REPO_ID = "AIRI-Institute/genatator-gene-segmentation-dataset"
+
 
 
 def _json_safe(value):
@@ -242,60 +265,168 @@ def prepare_gene_finding_smoke_cache(
     return out
 
 
-def prepare_segmentation_smoke_cache(cache_dir: Path, keep_len: int, max_rows: int) -> Path:
-    """Create or reuse tiny persistent JSONL cache from real segmentation val-human chr20 rows.
+def _list_segmentation_parquet_candidates(max_files: int) -> list[str]:
+    """List likely val-human parquet files without using datasets.load_dataset.
 
-    Segmentation and transcript-type smoke tests use the same transcript-level HF
-    dataset. Without this cache, every smoke job may touch the remote dataset again.
+    This is one Hub API call for filenames only. It does not download parquet data
+    and it avoids the resolver storm caused by load_dataset(streaming=True).
+    """
+    from huggingface_hub import HfApi
+
+    files = HfApi().list_repo_files(repo_id=SEGMENTATION_REPO_ID, repo_type="dataset")
+    parquet = [f for f in files if f.endswith(".parquet")]
+    if not parquet:
+        raise RuntimeError(f"No parquet files found in {SEGMENTATION_REPO_ID}")
+
+    def score(path: str) -> tuple[int, str]:
+        low = path.lower()
+        sc = 0
+        if "val-human" in low:
+            sc += 1000
+        if "validation" in low or "/val" in low:
+            sc += 300
+        if "nc_060944.1" in low or "chr20" in low:
+            sc += 500
+        if "train-multi" in low or "train-human" in low or "/train/" in low:
+            sc -= 2000
+        return (-sc, path)
+
+    candidates = sorted(parquet, key=score)
+    selected = candidates[:max_files]
+    print("Segmentation parquet candidates for smoke cache:")
+    for c in selected:
+        print(f"  {c}")
+    return selected
+
+
+def _read_segmentation_rows_from_parquet(parquet_path: Path, keep_len: int, max_rows: int) -> list[dict]:
+    """Scan one parquet file row-group by row-group and keep only tiny chr20 rows.
+
+    Only metadata/status are read first. dna_sequence/labels are read only for row
+    groups that contain matching chr20 rows. This avoids materializing a whole HF
+    Dataset or loading all columns into RAM.
+    """
+    import pyarrow.parquet as pq
+
+    pf = pq.ParquetFile(str(parquet_path))
+    rows: list[dict] = []
+    scanned = 0
+    for rg in range(pf.num_row_groups):
+        meta_tbl = pf.read_row_group(rg, columns=["metadata", "status"])
+        meta_rows = meta_tbl.to_pylist()
+        keep_indices = []
+        for i, small in enumerate(meta_rows):
+            scanned += 1
+            try:
+                meta = _metadata_dict({"metadata": small.get("metadata", {})})
+            except Exception:
+                continue
+            row_stub = {"metadata": meta, "status": small.get("status")}
+            if not _is_chr20_row(row_stub):
+                continue
+            if small.get("status") is not None and int(small.get("status")) != 1:
+                continue
+            keep_indices.append(i)
+            if len(rows) + len(keep_indices) >= max_rows:
+                break
+        if not keep_indices:
+            continue
+
+        full_tbl = pf.read_row_group(rg, columns=["dna_sequence", "labels", "metadata", "status"])
+        full_rows = full_tbl.to_pylist()
+        for i in keep_indices:
+            row = dict(full_rows[i])
+            dna = str(row["dna_sequence"])
+            n = min(len(dna), keep_len)
+            row["dna_sequence"] = dna[:n]
+            row["labels"] = row["labels"][:n]
+            meta = _metadata_dict(row)
+            meta["start"] = int(meta.get("start", 0))
+            meta["end"] = int(meta["start"] + n)
+            row["metadata"] = meta
+            rows.append(_json_safe(row))
+            if len(rows) >= max_rows:
+                print(f"Selected {len(rows)} segmentation smoke rows from {parquet_path} after scanning {scanned} metadata rows")
+                return rows
+    print(f"Selected {len(rows)} segmentation smoke rows from {parquet_path} after scanning {scanned} metadata rows")
+    return rows
+
+
+def prepare_segmentation_smoke_cache(
+    cache_dir: Path,
+    keep_len: int,
+    max_rows: int,
+    remote_parquet: str | None = None,
+    local_parquet: str | None = None,
+    hf_local_files_only: bool = False,
+    max_parquet_files: int = 8,
+) -> Path:
+    """Create/reuse tiny persistent JSONL cache from real val-human chr20 transcript rows.
+
+    This function deliberately does NOT call datasets.load_dataset. The datasets
+    loader can prepare/scan large shards and blow RAM even for streaming. Here we
+    resolve one parquet at a time, read metadata row-groups first, and copy only a
+    few trimmed chr20 rows to a local JSONL cache.
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
-    out = cache_dir / f"segmentation_val_human_chr20_rows_{max_rows}_first_{keep_len}.jsonl"
+    source_label = Path(local_parquet).stem if local_parquet else (remote_parquet or "auto_val_human_chr20")
+    source_label = source_label.replace("/", "__").replace(".parquet", "")
+    out = cache_dir / f"segmentation_{source_label}_rows_{max_rows}_first_{keep_len}.jsonl"
     if out.exists() and out.stat().st_size > 0:
         print(f"Using persistent real segmentation/transcript-type smoke cache: {out}")
         return out
 
     print(
-        "Preparing persistent real segmentation/transcript-type smoke cache from "
-        "AIRI-Institute/genatator-gene-segmentation-dataset config=val-human split=validation.\n"
-        "This should happen only once for this cache path. Subsequent smoke runs reuse the JSONL file."
+        "Preparing persistent real segmentation/transcript-type smoke cache without datasets.load_dataset.\n"
+        "The code will inspect parquet metadata row-groups and keep only tiny real chr20 rows."
     )
-    from datasets import load_dataset
 
-    ds = load_dataset(
-        "AIRI-Institute/genatator-gene-segmentation-dataset",
-        name="val-human",
-        split="validation",
-        streaming=True,
-    )
-    rows = []
-    scanned = 0
-    for row in ds:
-        scanned += 1
-        if not _is_chr20_row(row):
-            continue
-        if "status" in row and int(row["status"]) != 1:
-            continue
-        row = dict(row)
-        dna = str(row["dna_sequence"])
-        n = min(len(dna), keep_len)
-        row["dna_sequence"] = dna[:n]
-        row["labels"] = row["labels"][:n]
-        meta = _metadata_dict(row)
-        meta["start"] = int(meta.get("start", 0))
-        meta["end"] = int(meta["start"] + n)
-        row["metadata"] = meta
-        rows.append(row)
+    parquet_paths: list[Path] = []
+    if local_parquet:
+        p = Path(local_parquet).expanduser().resolve()
+        if not p.exists():
+            raise FileNotFoundError(f"--segmentation-local-parquet does not exist: {p}")
+        parquet_paths = [p]
+    elif remote_parquet:
+        parquet_paths = [Path(_download_or_reuse_hf_file(
+            repo_id=SEGMENTATION_REPO_ID,
+            filename=remote_parquet,
+            repo_type="dataset",
+            local_files_only=hf_local_files_only,
+        ))]
+    else:
+        if hf_local_files_only:
+            raise RuntimeError(
+                "--hf-local-files-only was set, but no --segmentation-local-parquet or "
+                "--segmentation-remote-parquet was provided. The runner cannot list remote files offline."
+            )
+        candidates = _list_segmentation_parquet_candidates(max_files=max_parquet_files)
+        parquet_paths = [Path(_download_or_reuse_hf_file(
+            repo_id=SEGMENTATION_REPO_ID,
+            filename=c,
+            repo_type="dataset",
+            local_files_only=False,
+        )) for c in candidates]
+
+    rows: list[dict] = []
+    used_files = []
+    for parquet_path in parquet_paths:
+        used_files.append(str(parquet_path))
+        rows.extend(_read_segmentation_rows_from_parquet(parquet_path, keep_len, max_rows - len(rows)))
         if len(rows) >= max_rows:
             break
+
     if not rows:
         raise RuntimeError(
-            "Could not build segmentation smoke cache: selected zero chr20 rows from val-human validation "
-            f"after scanning {scanned} rows. chr20 aliases={CHR20_ALIASES}"
+            "Could not build segmentation smoke cache: selected zero chr20 rows. "
+            f"chr20 aliases={CHR20_ALIASES}; inspected parquet files={used_files}. "
+            "Pass --segmentation-local-parquet or --segmentation-remote-parquet pointing to a val-human chr20 shard."
         )
+
     with out.open("w", encoding="utf-8") as fh:
         for row in rows:
             fh.write(json.dumps(row) + "\n")
-    print(f"Saved persistent real segmentation/transcript-type smoke cache: {out} rows={len(rows)} scanned={scanned}")
+    print(f"Saved persistent real segmentation/transcript-type smoke cache: {out} rows={len(rows)} files={used_files}")
     return out
 
 def finding_data(cache_path: Path, max_nt: int, max_tok: int, inference_subset: bool = False) -> dict:
@@ -452,7 +583,7 @@ def assert_smoke_configs_use_local_data(work: Path) -> None:
     bad = []
     for cfg_path in sorted((work / "configs").glob("*.json")):
         text = cfg_path.read_text(encoding="utf-8")
-        if "AIRI-Institute/genatator-gene-finding-dataset" in text:
+        if "AIRI-Institute/genatator-gene-" in text:
             bad.append(str(cfg_path))
     if bad:
         raise RuntimeError(
@@ -560,6 +691,9 @@ def main():
     ap.add_argument("--gene-finding-cache-len", type=int, default=1536, help="Number of real nucleotides to keep from the selected gene-finding smoke row.")
     ap.add_argument("--segmentation-cache-len", type=int, default=768, help="Number of real nucleotides to keep from each selected transcript-level smoke row.")
     ap.add_argument("--segmentation-cache-rows", type=int, default=2, help="Number of real transcript-level chr20 rows to keep for segmentation/transcript-type smoke tests.")
+    ap.add_argument("--segmentation-remote-parquet", type=str, default=None, help="Exact parquet file inside the HF segmentation dataset repo to use for smoke tests. Optional; auto-discovery is used if omitted.")
+    ap.add_argument("--segmentation-local-parquet", type=str, default=None, help="Optional local parquet file for segmentation/transcript-type smoke cache creation. Use this to avoid any HF request.")
+    ap.add_argument("--segmentation-max-parquet-files", type=int, default=8, help="Maximum number of val-human parquet files to inspect when auto-discovering segmentation smoke rows.")
     ap.add_argument("--smoke-cache-dir", type=str, default=None, help="Persistent real-data smoke cache directory. Defaults to $GENATATOR_SMOKE_CACHE_DIR or ~/.cache/genatator_smoke.")
     args = ap.parse_args()
     true_gff = Path(args.reference_gff).expanduser()
@@ -581,7 +715,15 @@ def main():
         local_parquet=args.gene_finding_local_parquet,
         hf_local_files_only=args.hf_local_files_only,
     )
-    seg_cache = prepare_segmentation_smoke_cache(cache_dir, args.segmentation_cache_len, args.segmentation_cache_rows)
+    seg_cache = prepare_segmentation_smoke_cache(
+        cache_dir=cache_dir,
+        keep_len=args.segmentation_cache_len,
+        max_rows=args.segmentation_cache_rows,
+        remote_parquet=args.segmentation_remote_parquet,
+        local_parquet=args.segmentation_local_parquet,
+        hf_local_files_only=args.hf_local_files_only,
+        max_parquet_files=args.segmentation_max_parquet_files,
+    )
     jobs = build_jobs(work, str(true_gff), gf_cache, seg_cache)
     assert_smoke_configs_use_local_data(work)
     (work / "jobs.json").write_text(json.dumps(jobs, indent=2), encoding="utf-8")

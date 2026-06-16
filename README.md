@@ -108,7 +108,7 @@ The repository supports both HF datasets and local mirrors. There is no source s
 | `max_rows` | Optional row cap, useful for smoke tests. |
 | `streaming` | Optional HF streaming mode. When `true`, the loader scans remote rows, applies `genomes`/`chromosomes`/`statuses`, materializes only matching rows, and then trains normally on that small real-data subset. |
 | `streaming_max_scanned_rows` | Maximum number of streamed rows to scan while looking for rows that match filters. |
-| `streaming_trim_rows` | Optional debug option. When `true`, a streamed row is trimmed to the span required by `max_nucleotides`, `overlap`, and `max_windows` before it is kept in memory. Current smoke tests instead build a local real-data cache from one exact chr20 HF parquet file, avoiding split-slice resolver scans. |
+| `streaming_trim_rows` | Optional debug option. When `true`, a streamed row is trimmed to the span required by `max_nucleotides`, `overlap`, and `max_windows` before it is kept in memory. Current smoke tests instead build a local real-data cache from a direct HF test slice. |
 | `max_windows` | Optional window cap after dataset windowing, useful for smoke tests. |
 | `max_nucleotides` | Nucleotide context length used for nucleotide models and UNET output. |
 | `max_tokens` | Token context length used for BPE models. |
@@ -258,7 +258,7 @@ The script writes a TSV with transcript IDs, reference type, predicted type, and
 
 ## Smoke tests on real HF data
 
-Smoke tests do **not** generate dummy data and do **not** use a dummy GFF. They use real HF data and require a user-provided human T2T chromosome 20 reference GFF/GFF3. For the gene-finding dataset, smoke tests use **only** the HF `test` data for tiny training, validation, and inference; they never open the huge gene-finding `train` split or the gene-finding `validation` split. To avoid the very slow streamed search through hundreds of 10 Mb test blocks, the runner now resolves exactly one known chr20 parquet file, by default `data/test/part-00000/GCF_009914755.1_T2T-CHM13v2.0__NC_060944.1__000000000000_000010000000.parquet`, trims that real chr20 row to the needed smoke span, and writes a persistent local JSONL cache. All gene-finding smoke configs then point to this local real-data cache.
+Smoke tests do **not** generate dummy data and do **not** use a dummy GFF. They use real data from the HF repositories and require a user-provided human T2T chromosome 20 reference GFF/GFF3. For gene finding, smoke tests use **only** a real HF `test` parquet shard from `NC_060944.1`; they never open the huge gene-finding `train` split or the gene-finding `validation` split. For segmentation and transcript type, the runner uses real `val-human` chromosome-20 transcript rows. Before launching any per-model job, the runner creates tiny persistent JSONL caches. The per-model train/validation/inference jobs then read only these local JSONL caches and never call the remote HF datasets.
 
 Run:
 
@@ -269,14 +269,25 @@ python smoke_tests/run_smoke.py \
   --work-dir smoke_tests/runs
 ```
 
-Optional gene-finding cache controls:
+Optional real-data cache controls:
 
 ```bash
 python smoke_tests/run_smoke.py \
   --num-gpus 4 \
   --reference-gff /path/to/human_T2T_chr20_reference.gff3 \
-  --gene-finding-row-slice 'test[286:287]' \
-  --gene-finding-cache-len 1536
+  --gene-finding-cache-len 1536 \
+  --segmentation-cache-len 768 \
+  --segmentation-cache-rows 2
+```
+
+To bypass HF completely, pass local parquet files:
+
+```bash
+python smoke_tests/run_smoke.py \
+  --num-gpus 4 \
+  --reference-gff /path/to/human_T2T_chr20_reference.gff3 \
+  --gene-finding-local-parquet /path/to/gene_finding_chr20.parquet \
+  --segmentation-local-parquet /path/to/segmentation_val_human.parquet
 ```
 
 Or choose GPU IDs explicitly:
@@ -318,7 +329,7 @@ The only memory-wrapper spelling used in configs and code is `amt` / `AMT`. Smok
 
 ### Smoke-test dataset filtering note
 
-The smoke runner uses only real Hugging Face data. For gene finding it uses one exact parquet file from the `test` area of `AIRI-Institute/genatator-gene-finding-dataset` for all three smoke phases: tiny training, tiny validation, and tiny inference. It never calls `load_dataset(...)` for gene-finding smoke-cache creation, because even split slices may trigger thousands of Hub resolver requests on this sharded dataset. The default exact file is `data/test/part-00000/GCF_009914755.1_T2T-CHM13v2.0__NC_060944.1__000000000000_000010000000.parquet`. The file is first resolved from the local HF cache with `local_files_only=True`; only if it is absent does the runner download exactly that one file. The cache is trimmed to the configured real nucleotide span, default 1536 bp, and reused by all gene-finding smoke jobs. You can override the exact HF file with `--gene-finding-remote-parquet`, provide a local parquet with `--gene-finding-local-parquet`, or forbid network access with `--hf-local-files-only`. For transcript-level tasks it uses real chr20 rows from the segmentation dataset validation configuration with the same chromosome aliases. If filtering selects zero rows, the dataset loader stops with an observed metadata summary so the exact remote/local metadata values are visible immediately.
+The smoke runner uses only real Hugging Face data, but it does **not** call `datasets.load_dataset(...)` while preparing smoke caches. For gene finding it downloads or reuses exactly one known T2T chr20 test parquet shard. For transcript-level tasks it lists likely `val-human` parquet files, reads metadata/status row-groups first, and only then reads `dna_sequence`/`labels` from row-groups that contain matching `NC_060944.1` rows. The resulting local JSONL files are tiny and reused by every model. If filtering selects zero rows, the runner stops and tells you which parquet files were inspected; pass `--segmentation-local-parquet` or `--segmentation-remote-parquet` to make the source explicit.
 
 ## Smoke-test real-data cache behavior
 
@@ -346,15 +357,9 @@ python smoke_tests/run_smoke.py \
   --smoke-cache-dir /disk/10tb/home/shmelev/GENATATOR/.smoke_real_data_cache
 ```
 
-To avoid any Hugging Face request while creating the gene-finding cache, either make sure the exact parquet is already in the HF cache and add `--hf-local-files-only`, or pass a local parquet directly:
-
-```bash
-python smoke_tests/run_smoke.py   --num-gpus 2   --reference-gff /path/to/chr20.gff   --work-dir smoke_tests/runs   --gene-finding-local-parquet /path/to/GCF_009914755.1_T2T-CHM13v2.0__NC_060944.1__000000000000_000010000000.parquet
-```
-
 The smoke runner creates two persistent caches:
 
-- a gene-finding cache from one real `AIRI-Institute/genatator-gene-finding-dataset` chr20 test parquet, default `data/test/part-00000/GCF_009914755.1_T2T-CHM13v2.0__NC_060944.1__000000000000_000010000000.parquet`;
-- a segmentation/transcript-type cache from real `AIRI-Institute/genatator-gene-segmentation-dataset`, config `val-human`, split `validation`, filtered to human T2T chr20.
+- a gene-finding cache from a real `AIRI-Institute/genatator-gene-finding-dataset` chr20 test parquet shard;
+- a segmentation/transcript-type cache from real `AIRI-Institute/genatator-gene-segmentation-dataset` `val-human` parquet files, filtered to human T2T chr20 without materializing the full HF dataset.
 
 After these files exist, deleting `smoke_tests/runs` will not trigger dataset preparation again. All train, validation, and inference jobs read the tiny local JSONL caches instead of touching the remote HF datasets.
