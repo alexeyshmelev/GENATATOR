@@ -91,53 +91,139 @@ def model_cfg(model_name: str, family: str, extra: dict | None = None) -> dict:
     return cfg
 
 
-def prepare_gene_finding_smoke_cache(work: Path, row_slice: str, keep_len: int) -> Path:
-    """Create a tiny local JSONL cache from a real HF chr20 test row.
+def default_smoke_cache_dir() -> Path:
+    return Path(os.environ.get("GENATATOR_SMOKE_CACHE_DIR", str(Path.home() / ".cache" / "genatator_smoke"))).expanduser().resolve()
 
-    This avoids streaming through hundreds of 10 Mb genomic blocks every time a
-    smoke train/eval/infer job starts. The cache still contains real HF data; it
-    only trims the selected row to the nucleotide span needed by smoke windows.
+
+def _metadata_dict(row: dict) -> dict:
+    meta = row.get("metadata", {})
+    if isinstance(meta, str) and meta.strip().startswith("{"):
+        return json.loads(meta)
+    if isinstance(meta, dict):
+        return dict(meta)
+    raise RuntimeError(f"Unsupported metadata type in smoke cache row: {type(meta)}")
+
+
+def _row_chrom(row: dict) -> str:
+    meta = _metadata_dict(row)
+    return str(meta.get("chrom", meta.get("chromosome", meta.get("seqid", ""))))
+
+
+def _is_chr20_row(row: dict) -> bool:
+    chrom = _row_chrom(row)
+    aliases = {chrom}
+    if chrom.lower().startswith("chr"):
+        aliases.add(chrom[3:])
+    elif chrom.isdigit():
+        aliases.add(f"chr{chrom}")
+    return bool(set(CHR20_ALIASES) & aliases)
+
+
+def prepare_gene_finding_smoke_cache(cache_dir: Path, row_slice: str, keep_len: int) -> Path:
+    """Create or reuse a tiny persistent JSONL cache from a real HF chr20 test row.
+
+    This cache is independent of --work-dir. Deleting smoke_tests/runs should not
+    make the script download/prepare the HF dataset again. The file still contains
+    real HF data; it is only trimmed to the nucleotide span required by smoke tests.
     """
-    cache_dir = work / "real_data_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     safe_slice = row_slice.replace("[", "_").replace(":", "_").replace("]", "")
     out = cache_dir / f"gene_finding_{safe_slice}_first_{keep_len}.jsonl"
     if out.exists() and out.stat().st_size > 0:
-        print(f"Using existing real gene-finding smoke cache: {out}")
+        print(f"Using persistent real gene-finding smoke cache: {out}")
         return out
 
     print(
-        "Preparing real gene-finding smoke cache from "
-        f"AIRI-Institute/genatator-gene-finding-dataset split={row_slice}."
+        "Preparing persistent real gene-finding smoke cache from "
+        f"AIRI-Institute/genatator-gene-finding-dataset split={row_slice}.\n"
+        "This should happen only once for this cache path. Subsequent smoke runs reuse the JSONL file."
     )
     from datasets import load_dataset
 
-    ds = load_dataset("AIRI-Institute/genatator-gene-finding-dataset", split=row_slice)
+    # Important: never call load_dataset(...) without split here. We still prefer a
+    # split slice, but write the result immediately to a tiny persistent JSONL cache.
+    ds = load_dataset(
+        "AIRI-Institute/genatator-gene-finding-dataset",
+        split=row_slice,
+        download_mode="reuse_cache_if_exists",
+    )
     if len(ds) != 1:
         raise RuntimeError(f"Expected exactly one row from split slice {row_slice}, got {len(ds)}")
-    row = ds[0]
+    row = dict(ds[0])
     dna = str(row["dna_sequence"])
     n = min(len(dna), keep_len)
     row["dna_sequence"] = dna[:n]
     row["targets"] = row["targets"][:n]
 
-    meta = row.get("metadata", {})
-    if isinstance(meta, str) and meta.strip().startswith("{"):
-        meta = json.loads(meta)
-    elif not isinstance(meta, dict):
-        raise RuntimeError(f"Unsupported gene-finding metadata type in smoke cache row: {type(meta)}")
+    meta = _metadata_dict(row)
     meta["start"] = int(meta.get("start", 0))
     meta["end"] = int(meta["start"] + n)
     row["metadata"] = meta
 
     chrom = str(meta.get("chrom", meta.get("chromosome", "")))
     if CHR20_ALIASES and chrom and chrom not in CHR20_ALIASES:
-        print(f"Warning: cached row chrom={chrom!r} is not in current chr20 aliases {CHR20_ALIASES}")
+        print(f"Warning: cached gene-finding row chrom={chrom!r} is not in current chr20 aliases {CHR20_ALIASES}")
     with out.open("w", encoding="utf-8") as fh:
         fh.write(json.dumps(row) + "\n")
-    print(f"Saved trimmed real gene-finding smoke cache: {out} kept_len={n} chrom={chrom}")
+    print(f"Saved persistent real gene-finding smoke cache: {out} kept_len={n} chrom={chrom}")
     return out
 
+
+def prepare_segmentation_smoke_cache(cache_dir: Path, keep_len: int, max_rows: int) -> Path:
+    """Create or reuse tiny persistent JSONL cache from real segmentation val-human chr20 rows.
+
+    Segmentation and transcript-type smoke tests use the same transcript-level HF
+    dataset. Without this cache, every smoke job may touch the remote dataset again.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    out = cache_dir / f"segmentation_val_human_chr20_rows_{max_rows}_first_{keep_len}.jsonl"
+    if out.exists() and out.stat().st_size > 0:
+        print(f"Using persistent real segmentation/transcript-type smoke cache: {out}")
+        return out
+
+    print(
+        "Preparing persistent real segmentation/transcript-type smoke cache from "
+        "AIRI-Institute/genatator-gene-segmentation-dataset config=val-human split=validation.\n"
+        "This should happen only once for this cache path. Subsequent smoke runs reuse the JSONL file."
+    )
+    from datasets import load_dataset
+
+    ds = load_dataset(
+        "AIRI-Institute/genatator-gene-segmentation-dataset",
+        name="val-human",
+        split="validation",
+        streaming=True,
+    )
+    rows = []
+    scanned = 0
+    for row in ds:
+        scanned += 1
+        if not _is_chr20_row(row):
+            continue
+        if "status" in row and int(row["status"]) != 1:
+            continue
+        row = dict(row)
+        dna = str(row["dna_sequence"])
+        n = min(len(dna), keep_len)
+        row["dna_sequence"] = dna[:n]
+        row["labels"] = row["labels"][:n]
+        meta = _metadata_dict(row)
+        meta["start"] = int(meta.get("start", 0))
+        meta["end"] = int(meta["start"] + n)
+        row["metadata"] = meta
+        rows.append(row)
+        if len(rows) >= max_rows:
+            break
+    if not rows:
+        raise RuntimeError(
+            "Could not build segmentation smoke cache: selected zero chr20 rows from val-human validation "
+            f"after scanning {scanned} rows. chr20 aliases={CHR20_ALIASES}"
+        )
+    with out.open("w", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write(json.dumps(row) + "\n")
+    print(f"Saved persistent real segmentation/transcript-type smoke cache: {out} rows={len(rows)} scanned={scanned}")
+    return out
 
 def finding_data(cache_path: Path, max_nt: int, max_tok: int, inference_subset: bool = False) -> dict:
     # Gene-finding smoke tests use a tiny local cache produced from the real HF
@@ -157,13 +243,13 @@ def finding_data(cache_path: Path, max_nt: int, max_tok: int, inference_subset: 
     }
 
 
-def seg_data(config_name: str, split: str, max_nt: int, max_tok: int, test: bool = False) -> dict:
-    # Real HF data only. For smoke, use chr20 rows from val-human with streaming so
-    # the runner does not download full transcript datasets.
+def seg_data(cache_path: Path, max_nt: int, max_tok: int, split: str = "train") -> dict:
+    # Smoke segmentation/transcript-type uses a tiny persistent cache produced
+    # from real HF val-human chr20 rows. It never touches the remote HF dataset
+    # during per-model train/eval/infer jobs.
     return {
-        "path": "AIRI-Institute/genatator-gene-segmentation-dataset",
-        "config_name": "val-human",
-        "split": "validation",
+        "path": str(cache_path),
+        "split": "train",
         "genomes": None,
         "chromosomes": CHR20_ALIASES,
         "max_nucleotides": max_nt,
@@ -173,10 +259,8 @@ def seg_data(config_name: str, split: str, max_nt: int, max_tok: int, test: bool
         "random_crop": split == "train",
         "statuses": [1],
         "max_rows": 2,
-        "streaming": True,
-        "streaming_max_scanned_rows": 5000,
+        "streaming": False,
     }
-
 
 def make_finding_train_config(work: Path, gf_cache: Path, model_name: str, task: str, variant: str) -> Path:
     max_tok = 64 if task == "edge" else 128
@@ -200,7 +284,7 @@ def make_finding_train_config(work: Path, gf_cache: Path, model_name: str, task:
     return write_json(work / "configs" / f"{name}.json", cfg)
 
 
-def make_seg_train_config(work: Path, model_name: str, variant: str) -> Path:
+def make_seg_train_config(work: Path, seg_cache: Path, model_name: str, variant: str) -> Path:
     kind = MODELS[model_name]["kind"]
     if kind == "caduceus":
         family = "caduceus"; extra = None; max_nt = max_tok = 512; bs = 1
@@ -215,18 +299,18 @@ def make_seg_train_config(work: Path, model_name: str, variant: str) -> Path:
         else:
             raise RuntimeError(f"Segmentation variant must be unet/rmt/amt for {model_name}, got {variant}")
     name = f"segmentation_{model_name}_{family}"
-    cfg = {"seed": 42, "model": model_cfg(model_name, family, extra), "train_dataset": seg_data("train-human", "train", max_nt, max_tok, False), "eval_dataset": seg_data("val-human", "validation", max_nt, max_tok, True), "training": tiny_training(str(work / name), "interval_f1_mean", bs=bs)}
+    cfg = {"seed": 42, "model": model_cfg(model_name, family, extra), "train_dataset": seg_data(seg_cache, max_nt, max_tok, "train"), "eval_dataset": seg_data(seg_cache, max_nt, max_tok, "validation"), "training": tiny_training(str(work / name), "interval_f1_mean", bs=bs)}
     return write_json(work / "configs" / f"{name}.json", cfg)
 
 
-def make_tt_train_config(work: Path, model_name: str) -> Path:
+def make_tt_train_config(work: Path, seg_cache: Path, model_name: str) -> Path:
     kind = MODELS[model_name]["kind"]
     family = "caduceus" if kind == "caduceus" else "plain"
     max_nt = max_tok = 512 if kind == "caduceus" else 512
     if kind != "caduceus":
         max_tok = 64
     name = f"transcript_type_{model_name}_{family}"
-    cfg = {"seed": 42, "model": model_cfg(model_name, family), "train_dataset": seg_data("train-human", "train", max_nt, max_tok, False), "eval_dataset": seg_data("val-human", "validation", max_nt, max_tok, True), "training": tiny_training(str(work / name), "accuracy", bs=1 if kind == "caduceus" else 2)}
+    cfg = {"seed": 42, "model": model_cfg(model_name, family), "train_dataset": seg_data(seg_cache, max_nt, max_tok, "train"), "eval_dataset": seg_data(seg_cache, max_nt, max_tok, "validation"), "training": tiny_training(str(work / name), "accuracy", bs=1 if kind == "caduceus" else 2)}
     return write_json(work / "configs" / f"{name}.json", cfg)
 
 
@@ -241,23 +325,23 @@ def make_finding_infer_config(work: Path, gf_cache: Path, model_name: str, varia
     return write_json(work / "configs" / f"infer_finding_{model_name}_{variant}.json", cfg)
 
 
-def make_seg_infer_config(work: Path, model_name: str, variant: str, true_gff: str) -> Path:
+def make_seg_infer_config(work: Path, seg_cache: Path, model_name: str, variant: str, true_gff: str) -> Path:
     family = "caduceus" if MODELS[model_name]["kind"] == "caduceus" else variant
     train_dir = work / f"segmentation_{model_name}_{family}"
     train_cfg = json.loads((work / "configs" / f"segmentation_{model_name}_{family}.json").read_text())
-    cfg = {"model": train_cfg["model"], "dataset": seg_data("val-human", "validation", 512, 64 if family != "caduceus" else 512, True), "inference": {"device": "cuda", "checkpoint_path": str(train_dir / "final_model"), "batch_size": 1, "use_reverse_complement": False, "threshold": 0.5, "output_gff": str(work / f"segmentation_{model_name}_{family}.gff"), "true_gff": true_gff, "metrics_json": str(work / f"segmentation_{model_name}_{family}.metrics.json")}}
+    cfg = {"model": train_cfg["model"], "dataset": seg_data(seg_cache, 512, 64 if family != "caduceus" else 512, "validation"), "inference": {"device": "cuda", "checkpoint_path": str(train_dir / "final_model"), "batch_size": 1, "use_reverse_complement": False, "threshold": 0.5, "output_gff": str(work / f"segmentation_{model_name}_{family}.gff"), "true_gff": true_gff, "metrics_json": str(work / f"segmentation_{model_name}_{family}.metrics.json")}}
     return write_json(work / "configs" / f"infer_segmentation_{model_name}_{family}.json", cfg)
 
 
-def make_tt_infer_config(work: Path, model_name: str) -> Path:
+def make_tt_infer_config(work: Path, seg_cache: Path, model_name: str) -> Path:
     family = "caduceus" if MODELS[model_name]["kind"] == "caduceus" else "plain"
     train_dir = work / f"transcript_type_{model_name}_{family}"
     train_cfg = json.loads((work / "configs" / f"transcript_type_{model_name}_{family}.json").read_text())
-    cfg = {"model": train_cfg["model"], "dataset": seg_data("val-human", "validation", 512, 64 if family != "caduceus" else 512, True), "inference": {"device": "cuda", "checkpoint_path": str(train_dir / "final_model"), "batch_size": 1, "use_reverse_complement": False, "threshold": 0.5, "output_tsv": str(work / f"transcript_type_{model_name}_{family}.tsv"), "metrics_json": str(work / f"transcript_type_{model_name}_{family}.metrics.json")}}
+    cfg = {"model": train_cfg["model"], "dataset": seg_data(seg_cache, 512, 64 if family != "caduceus" else 512, "validation"), "inference": {"device": "cuda", "checkpoint_path": str(train_dir / "final_model"), "batch_size": 1, "use_reverse_complement": False, "threshold": 0.5, "output_tsv": str(work / f"transcript_type_{model_name}_{family}.tsv"), "metrics_json": str(work / f"transcript_type_{model_name}_{family}.metrics.json")}}
     return write_json(work / "configs" / f"infer_transcript_type_{model_name}_{family}.json", cfg)
 
 
-def build_jobs(work: Path, true_gff: str, gf_cache: Path) -> List[dict]:
+def build_jobs(work: Path, true_gff: str, gf_cache: Path, seg_cache: Path) -> List[dict]:
     jobs = []
     finding_variants_by_model = {}
     for model_name, info in MODELS.items():
@@ -277,16 +361,16 @@ def build_jobs(work: Path, true_gff: str, gf_cache: Path) -> List[dict]:
         if model_name == "moderngena_base":
             seg_variants += ["rmt", "amt"]
         for variant in seg_variants:
-            cfg = make_seg_train_config(work, model_name, variant)
+            cfg = make_seg_train_config(work, seg_cache, model_name, variant)
             family = "caduceus" if info["kind"] == "caduceus" else variant
             jobs.append({"name": f"train_segmentation_{model_name}_{family}", "cmd": [sys.executable, "segmentation/train.py", "--config", str(cfg)], "deps": []})
-            infer_cfg = make_seg_infer_config(work, model_name, variant, true_gff)
+            infer_cfg = make_seg_infer_config(work, seg_cache, model_name, variant, true_gff)
             jobs.append({"name": f"infer_segmentation_{model_name}_{family}", "cmd": [sys.executable, "segmentation/infer.py", "--config", str(infer_cfg)], "deps": [f"train_segmentation_{model_name}_{family}"]})
 
-        cfg = make_tt_train_config(work, model_name)
+        cfg = make_tt_train_config(work, seg_cache, model_name)
         family = "caduceus" if info["kind"] == "caduceus" else "plain"
         jobs.append({"name": f"train_transcript_type_{model_name}_{family}", "cmd": [sys.executable, "transcript_type/train.py", "--config", str(cfg)], "deps": []})
-        infer_cfg = make_tt_infer_config(work, model_name)
+        infer_cfg = make_tt_infer_config(work, seg_cache, model_name)
         jobs.append({"name": f"infer_transcript_type_{model_name}_{family}", "cmd": [sys.executable, "transcript_type/infer.py", "--config", str(infer_cfg)], "deps": [f"train_transcript_type_{model_name}_{family}"]})
     return jobs
 
@@ -305,7 +389,7 @@ def run_scheduler(jobs: List[dict], gpus: List[str], work: Path) -> dict:
                 for name, job in list(pending.items()):
                     if all(dep in done for dep in job["deps"]):
                         gpu = free_gpus.pop(0)
-                        env = os.environ.copy(); env["CUDA_VISIBLE_DEVICES"] = gpu; env["PYTHONPATH"] = str(REPO) + os.pathsep + env.get("PYTHONPATH", "")
+                        env = os.environ.copy(); env["CUDA_VISIBLE_DEVICES"] = gpu; env["PYTHONPATH"] = str(REPO) + os.pathsep + env.get("PYTHONPATH", ""); env.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
                         log_path = logs / f"{name}.log"
                         fh = open(log_path, "w", encoding="utf-8")
                         start = time.time()
@@ -384,6 +468,9 @@ def main():
     ap.add_argument("--work-dir", type=str, default="smoke_tests/runs")
     ap.add_argument("--gene-finding-row-slice", type=str, default="test[286:287]", help="HF split slice containing human T2T chr20 in the gene-finding test split. Default is based on dataset metadata observed in smoke logs.")
     ap.add_argument("--gene-finding-cache-len", type=int, default=1536, help="Number of real nucleotides to keep from the selected gene-finding smoke row.")
+    ap.add_argument("--segmentation-cache-len", type=int, default=768, help="Number of real nucleotides to keep from each selected transcript-level smoke row.")
+    ap.add_argument("--segmentation-cache-rows", type=int, default=2, help="Number of real transcript-level chr20 rows to keep for segmentation/transcript-type smoke tests.")
+    ap.add_argument("--smoke-cache-dir", type=str, default=None, help="Persistent real-data smoke cache directory. Defaults to $GENATATOR_SMOKE_CACHE_DIR or ~/.cache/genatator_smoke.")
     args = ap.parse_args()
     true_gff = Path(args.reference_gff).expanduser()
     if not true_gff.exists():
@@ -394,8 +481,11 @@ def main():
     if not gpus:
         raise RuntimeError("At least one GPU is required")
     work = (REPO / args.work_dir).resolve(); work.mkdir(parents=True, exist_ok=True)
-    gf_cache = prepare_gene_finding_smoke_cache(work, args.gene_finding_row_slice, args.gene_finding_cache_len)
-    jobs = build_jobs(work, str(true_gff), gf_cache)
+    cache_dir = Path(args.smoke_cache_dir).expanduser().resolve() if args.smoke_cache_dir else default_smoke_cache_dir()
+    print(f"Persistent smoke real-data cache directory: {cache_dir}")
+    gf_cache = prepare_gene_finding_smoke_cache(cache_dir, args.gene_finding_row_slice, args.gene_finding_cache_len)
+    seg_cache = prepare_segmentation_smoke_cache(cache_dir, args.segmentation_cache_len, args.segmentation_cache_rows)
+    jobs = build_jobs(work, str(true_gff), gf_cache, seg_cache)
     (work / "jobs.json").write_text(json.dumps(jobs, indent=2), encoding="utf-8")
     done = run_scheduler(jobs, gpus, work)
     summary = write_summary(work, done)

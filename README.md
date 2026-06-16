@@ -319,3 +319,36 @@ The only memory-wrapper spelling used in configs and code is `amt` / `AMT`. Smok
 ### Smoke-test dataset filtering note
 
 The smoke runner uses only real Hugging Face data. For gene finding it uses the `test` split of `AIRI-Institute/genatator-gene-finding-dataset` for all three smoke phases: tiny training, tiny validation, and tiny inference. It never calls `load_dataset(...)` without a split and never uses the huge gene-finding `train` split in smoke mode. The first step creates a local real-data cache from a direct split slice, default `test[286:287]`, which is the chr20 test row observed in the dataset metadata. The cache is trimmed to the configured real nucleotide span, default 1536 bp, and reused by all gene-finding smoke jobs, so the dataset is not repeatedly streamed or scanned. You can override the row slice with `--gene-finding-row-slice` and the retained length with `--gene-finding-cache-len`. For transcript-level tasks it uses real chr20 rows from the segmentation dataset validation configuration with the same chromosome aliases. If filtering selects zero rows, the dataset loader stops with an observed metadata summary so the exact remote/local metadata values are visible immediately.
+
+## Smoke-test real-data cache behavior
+
+Smoke tests use real Hugging Face data only, but they now write tiny persistent JSONL caches before launching per-model jobs. This is necessary because the raw HF datasets are huge and repeated `load_dataset(...)` calls may re-check or re-prepare remote files even when each model only needs a few real rows.
+
+By default the cache directory is:
+
+```bash
+~/.cache/genatator_smoke
+```
+
+or the value of:
+
+```bash
+GENATATOR_SMOKE_CACHE_DIR
+```
+
+You can also set it explicitly:
+
+```bash
+python smoke_tests/run_smoke.py \
+  --num-gpus 2 \
+  --reference-gff /path/to/chr20.gff \
+  --work-dir smoke_tests/runs \
+  --smoke-cache-dir /disk/10tb/home/shmelev/GENATATOR/.smoke_real_data_cache
+```
+
+The smoke runner creates two persistent caches:
+
+- a gene-finding cache from a real `AIRI-Institute/genatator-gene-finding-dataset` test-row slice, default `test[286:287]`;
+- a segmentation/transcript-type cache from real `AIRI-Institute/genatator-gene-segmentation-dataset`, config `val-human`, split `validation`, filtered to human T2T chr20.
+
+After these files exist, deleting `smoke_tests/runs` will not trigger dataset preparation again. All train, validation, and inference jobs read the tiny local JSONL caches instead of touching the remote HF datasets.
