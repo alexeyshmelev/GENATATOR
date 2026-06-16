@@ -119,37 +119,109 @@ def _is_chr20_row(row: dict) -> bool:
     return bool(set(CHR20_ALIASES) & aliases)
 
 
-def prepare_gene_finding_smoke_cache(cache_dir: Path, row_slice: str, keep_len: int) -> Path:
-    """Create or reuse a tiny persistent JSONL cache from a real HF chr20 test row.
+DEFAULT_GF_REMOTE_PARQUET = (
+    "data/test/part-00000/"
+    "GCF_009914755.1_T2T-CHM13v2.0__NC_060944.1__000000000000_000010000000.parquet"
+)
 
-    This cache is independent of --work-dir. Deleting smoke_tests/runs should not
-    make the script download/prepare the HF dataset again. The file still contains
-    real HF data; it is only trimmed to the nucleotide span required by smoke tests.
+
+def _json_safe(value):
+    # pyarrow usually returns Python scalars/lists, but this makes the cache writer
+    # robust to numpy scalars if the local parquet backend changes.
+    try:
+        import numpy as np
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+    except Exception:
+        pass
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+def _download_or_reuse_hf_file(repo_id: str, filename: str, repo_type: str = "dataset", local_files_only: bool = False) -> str:
+    """Resolve one exact HF file, preferring the local HF cache without network.
+
+    This avoids the `datasets.load_dataset(...)` resolver storm. We first try
+    local_files_only=True, which is a pure cache lookup. Only if the exact file is
+    not already cached do we make one remote request for that exact parquet file.
+    """
+    from huggingface_hub import hf_hub_download
+
+    try:
+        path = hf_hub_download(repo_id=repo_id, filename=filename, repo_type=repo_type, local_files_only=True)
+        print(f"Using already cached HF file: {path}")
+        return path
+    except Exception as cache_error:
+        if local_files_only:
+            raise RuntimeError(
+                f"Required HF file is not present in the local cache and --hf-local-files-only was set: {repo_id}/{filename}. "
+                "Either run once with network access after the HF rate limit resets, or pass --gene-finding-local-parquet."
+            ) from cache_error
+        print(
+            "HF file is not in the local cache yet; downloading exactly one parquet file, not the whole dataset:\n"
+            f"  repo={repo_id}\n  file={filename}"
+        )
+        return hf_hub_download(repo_id=repo_id, filename=filename, repo_type=repo_type, local_files_only=False)
+
+
+def _read_one_parquet_row(parquet_path: Path) -> dict:
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(str(parquet_path), columns=["dna_sequence", "targets", "metadata"])
+    rows = table.to_pylist()
+    if len(rows) == 0:
+        raise RuntimeError(f"Parquet file contains zero rows: {parquet_path}")
+    if len(rows) > 1:
+        print(f"Warning: parquet file contains {len(rows)} rows; using the first row for smoke cache: {parquet_path}")
+    return dict(rows[0])
+
+
+def prepare_gene_finding_smoke_cache(
+    cache_dir: Path,
+    row_slice: str,
+    keep_len: int,
+    remote_parquet: str,
+    local_parquet: str | None = None,
+    hf_local_files_only: bool = False,
+) -> Path:
+    """Create or reuse a tiny persistent JSONL cache from one real HF chr20 test parquet.
+
+    Important: this function deliberately does NOT call datasets.load_dataset. Even
+    split slices can trigger thousands of resolver requests for this sharded dataset.
+    Instead, we resolve/download exactly one known chr20 parquet file, trim it, and
+    reuse the resulting JSONL forever unless the cache file is removed.
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
-    safe_slice = row_slice.replace("[", "_").replace(":", "_").replace("]", "")
-    out = cache_dir / f"gene_finding_{safe_slice}_first_{keep_len}.jsonl"
+    source_tag = Path(local_parquet).stem if local_parquet else remote_parquet.replace("/", "__").replace(".parquet", "")
+    source_tag = source_tag.replace("[", "_").replace(":", "_").replace("]", "_")
+    out = cache_dir / f"gene_finding_{source_tag}_first_{keep_len}.jsonl"
     if out.exists() and out.stat().st_size > 0:
         print(f"Using persistent real gene-finding smoke cache: {out}")
         return out
 
-    print(
-        "Preparing persistent real gene-finding smoke cache from "
-        f"AIRI-Institute/genatator-gene-finding-dataset split={row_slice}.\n"
-        "This should happen only once for this cache path. Subsequent smoke runs reuse the JSONL file."
-    )
-    from datasets import load_dataset
+    if local_parquet:
+        parquet_path = Path(local_parquet).expanduser().resolve()
+        if not parquet_path.exists():
+            raise FileNotFoundError(f"--gene-finding-local-parquet does not exist: {parquet_path}")
+        print(f"Preparing persistent real gene-finding smoke cache from local parquet: {parquet_path}")
+    else:
+        print(
+            "Preparing persistent real gene-finding smoke cache from one exact HF parquet file.\n"
+            f"Legacy row-slice argument is kept for compatibility but is not used for loading: {row_slice}."
+        )
+        parquet_path = Path(_download_or_reuse_hf_file(
+            repo_id="AIRI-Institute/genatator-gene-finding-dataset",
+            filename=remote_parquet,
+            repo_type="dataset",
+            local_files_only=hf_local_files_only,
+        ))
 
-    # Important: never call load_dataset(...) without split here. We still prefer a
-    # split slice, but write the result immediately to a tiny persistent JSONL cache.
-    ds = load_dataset(
-        "AIRI-Institute/genatator-gene-finding-dataset",
-        split=row_slice,
-        download_mode="reuse_cache_if_exists",
-    )
-    if len(ds) != 1:
-        raise RuntimeError(f"Expected exactly one row from split slice {row_slice}, got {len(ds)}")
-    row = dict(ds[0])
+    row = _read_one_parquet_row(parquet_path)
     dna = str(row["dna_sequence"])
     n = min(len(dna), keep_len)
     row["dna_sequence"] = dna[:n]
@@ -159,13 +231,14 @@ def prepare_gene_finding_smoke_cache(cache_dir: Path, row_slice: str, keep_len: 
     meta["start"] = int(meta.get("start", 0))
     meta["end"] = int(meta["start"] + n)
     row["metadata"] = meta
+    row = _json_safe(row)
 
     chrom = str(meta.get("chrom", meta.get("chromosome", "")))
     if CHR20_ALIASES and chrom and chrom not in CHR20_ALIASES:
         print(f"Warning: cached gene-finding row chrom={chrom!r} is not in current chr20 aliases {CHR20_ALIASES}")
     with out.open("w", encoding="utf-8") as fh:
         fh.write(json.dumps(row) + "\n")
-    print(f"Saved persistent real gene-finding smoke cache: {out} kept_len={n} chrom={chrom}")
+    print(f"Saved persistent real gene-finding smoke cache: {out} kept_len={n} chrom={chrom} source_parquet={parquet_path}")
     return out
 
 
@@ -375,6 +448,20 @@ def build_jobs(work: Path, true_gff: str, gf_cache: Path, seg_cache: Path) -> Li
     return jobs
 
 
+def assert_smoke_configs_use_local_data(work: Path) -> None:
+    bad = []
+    for cfg_path in sorted((work / "configs").glob("*.json")):
+        text = cfg_path.read_text(encoding="utf-8")
+        if "AIRI-Institute/genatator-gene-finding-dataset" in text:
+            bad.append(str(cfg_path))
+    if bad:
+        raise RuntimeError(
+            "Smoke configs still reference the remote gene-finding HF dataset. "
+            "This would trigger slow downloads/rate limits. Delete stale configs or use the updated smoke runner. "
+            f"Bad configs: {bad[:10]}"
+        )
+
+
 def run_scheduler(jobs: List[dict], gpus: List[str], work: Path) -> dict:
     pending = {j["name"]: j for j in jobs}
     done: dict = {}
@@ -389,7 +476,7 @@ def run_scheduler(jobs: List[dict], gpus: List[str], work: Path) -> dict:
                 for name, job in list(pending.items()):
                     if all(dep in done for dep in job["deps"]):
                         gpu = free_gpus.pop(0)
-                        env = os.environ.copy(); env["CUDA_VISIBLE_DEVICES"] = gpu; env["PYTHONPATH"] = str(REPO) + os.pathsep + env.get("PYTHONPATH", ""); env.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+                        env = os.environ.copy(); env["CUDA_VISIBLE_DEVICES"] = gpu; env["PYTHONPATH"] = str(REPO) + os.pathsep + env.get("PYTHONPATH", ""); env.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1"); env["GENATATOR_SMOKE_ENFORCE_LOCAL_DATA"] = "1"
                         log_path = logs / f"{name}.log"
                         fh = open(log_path, "w", encoding="utf-8")
                         start = time.time()
@@ -466,7 +553,10 @@ def main():
     ap.add_argument("--gpus", type=str, default=None, help="Comma-separated GPU IDs. Overrides --num-gpus list generation.")
     ap.add_argument("--reference-gff", type=str, required=True, help="Human T2T chr20 reference GFF/GFF3 supplied by the user.")
     ap.add_argument("--work-dir", type=str, default="smoke_tests/runs")
-    ap.add_argument("--gene-finding-row-slice", type=str, default="test[286:287]", help="HF split slice containing human T2T chr20 in the gene-finding test split. Default is based on dataset metadata observed in smoke logs.")
+    ap.add_argument("--gene-finding-row-slice", type=str, default="test[286:287]", help="Backward-compatible label only. Smoke loading now uses --gene-finding-remote-parquet or --gene-finding-local-parquet instead of load_dataset split slices.")
+    ap.add_argument("--gene-finding-remote-parquet", type=str, default=DEFAULT_GF_REMOTE_PARQUET, help="Exact parquet file inside the HF gene-finding dataset repo to use for smoke tests. This avoids load_dataset resolver storms.")
+    ap.add_argument("--gene-finding-local-parquet", type=str, default=None, help="Optional local parquet file for gene-finding smoke cache creation. Use this to avoid any HF request.")
+    ap.add_argument("--hf-local-files-only", action="store_true", help="Do not contact Hugging Face while preparing smoke caches. Requires the exact parquet to be present in the local HF cache, or --gene-finding-local-parquet.")
     ap.add_argument("--gene-finding-cache-len", type=int, default=1536, help="Number of real nucleotides to keep from the selected gene-finding smoke row.")
     ap.add_argument("--segmentation-cache-len", type=int, default=768, help="Number of real nucleotides to keep from each selected transcript-level smoke row.")
     ap.add_argument("--segmentation-cache-rows", type=int, default=2, help="Number of real transcript-level chr20 rows to keep for segmentation/transcript-type smoke tests.")
@@ -483,9 +573,17 @@ def main():
     work = (REPO / args.work_dir).resolve(); work.mkdir(parents=True, exist_ok=True)
     cache_dir = Path(args.smoke_cache_dir).expanduser().resolve() if args.smoke_cache_dir else default_smoke_cache_dir()
     print(f"Persistent smoke real-data cache directory: {cache_dir}")
-    gf_cache = prepare_gene_finding_smoke_cache(cache_dir, args.gene_finding_row_slice, args.gene_finding_cache_len)
+    gf_cache = prepare_gene_finding_smoke_cache(
+        cache_dir=cache_dir,
+        row_slice=args.gene_finding_row_slice,
+        keep_len=args.gene_finding_cache_len,
+        remote_parquet=args.gene_finding_remote_parquet,
+        local_parquet=args.gene_finding_local_parquet,
+        hf_local_files_only=args.hf_local_files_only,
+    )
     seg_cache = prepare_segmentation_smoke_cache(cache_dir, args.segmentation_cache_len, args.segmentation_cache_rows)
     jobs = build_jobs(work, str(true_gff), gf_cache, seg_cache)
+    assert_smoke_configs_use_local_data(work)
     (work / "jobs.json").write_text(json.dumps(jobs, indent=2), encoding="utf-8")
     done = run_scheduler(jobs, gpus, work)
     summary = write_summary(work, done)

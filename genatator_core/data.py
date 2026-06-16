@@ -4,6 +4,7 @@ import copy
 import json
 import logging
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -231,6 +232,12 @@ def load_dataset_auto(cfg: Dict[str, Any]) -> HFDataset:
     ref = local_or_remote(path)
     streaming = bool(cfg.get("streaming", False))
     logger.info("[dataset.load] ref=%s split=%s config_name=%s data_files=%s local=%s streaming=%s", ref, split, name, data_files, is_local(path), streaming)
+    if os.environ.get("GENATATOR_SMOKE_ENFORCE_LOCAL_DATA") == "1" and str(ref).startswith("AIRI-Institute/genatator-"):
+        raise RuntimeError(
+            "Smoke job received a remote GENATATOR dataset path. This is blocked to avoid HF resolver storms/rate limits. "
+            f"path={ref!r}, split={split!r}. Regenerate smoke configs with the updated smoke_tests/run_smoke.py, "
+            "or point the dataset path to the persistent local JSONL smoke cache."
+        )
     if is_local(path):
         p = Path(ref)
         if p.is_dir() and ((p / "dataset_info.json").exists() or (p / "dataset_dict.json").exists()):

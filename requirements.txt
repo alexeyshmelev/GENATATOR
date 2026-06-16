@@ -9,3 +9,5 @@ scikit-learn
 tensorboard
 tqdm
 numpy
+pyarrow
+huggingface_hub
