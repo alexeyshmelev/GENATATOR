@@ -63,6 +63,8 @@ class MaterializedRows:
 
 
 def parse_metadata(value: Any) -> ParsedMetadata:
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8", errors="replace")
     if isinstance(value, dict):
         return ParsedMetadata(
             transcript_id=str(value.get("transcript_id", value.get("id", ""))),

@@ -97,6 +97,8 @@ def default_smoke_cache_dir() -> Path:
 
 def _metadata_dict(row: dict) -> dict:
     meta = row.get("metadata", {})
+    if isinstance(meta, (bytes, bytearray)):
+        meta = meta.decode("utf-8", errors="replace")
     if isinstance(meta, dict):
         return dict(meta)
     if isinstance(meta, str):
@@ -145,6 +147,7 @@ DEFAULT_GF_REMOTE_PARQUET = (
 )
 
 SEGMENTATION_REPO_ID = "AIRI-Institute/genatator-gene-segmentation-dataset"
+DEFAULT_SEGMENTATION_REMOTE_PARQUET = "val-human/data.parquet"
 
 
 
@@ -265,79 +268,45 @@ def prepare_gene_finding_smoke_cache(
     return out
 
 
-def _list_segmentation_parquet_candidates(max_files: int) -> list[str]:
-    """List likely val-human parquet files without using datasets.load_dataset.
+def _read_segmentation_rows_from_parquet(parquet_path: Path, keep_len: int, max_rows: int, batch_size: int = 16) -> list[dict]:
+    """Read only a few real chr20 transcript rows from one parquet file.
 
-    This is one Hub API call for filenames only. It does not download parquet data
-    and it avoids the resolver storm caused by load_dataset(streaming=True).
-    """
-    from huggingface_hub import HfApi
-
-    files = HfApi().list_repo_files(repo_id=SEGMENTATION_REPO_ID, repo_type="dataset")
-    parquet = [f for f in files if f.endswith(".parquet")]
-    if not parquet:
-        raise RuntimeError(f"No parquet files found in {SEGMENTATION_REPO_ID}")
-
-    def score(path: str) -> tuple[int, str]:
-        low = path.lower()
-        sc = 0
-        if "val-human" in low:
-            sc += 1000
-        if "validation" in low or "/val" in low:
-            sc += 300
-        if "nc_060944.1" in low or "chr20" in low:
-            sc += 500
-        if "train-multi" in low or "train-human" in low or "/train/" in low:
-            sc -= 2000
-        return (-sc, path)
-
-    candidates = sorted(parquet, key=score)
-    selected = candidates[:max_files]
-    print("Segmentation parquet candidates for smoke cache:")
-    for c in selected:
-        print(f"  {c}")
-    return selected
-
-
-def _read_segmentation_rows_from_parquet(parquet_path: Path, keep_len: int, max_rows: int) -> list[dict]:
-    """Scan one parquet file row-group by row-group and keep only tiny chr20 rows.
-
-    Only metadata/status are read first. dna_sequence/labels are read only for row
-    groups that contain matching chr20 rows. This avoids materializing a whole HF
-    Dataset or loading all columns into RAM.
+    This function intentionally iterates over small record batches instead of
+    materializing a Hugging Face Dataset or a whole Parquet row group. The smoke
+    cache is tiny, but the released Parquet files can be hundreds of megabytes,
+    so each matching row is trimmed immediately before it is appended to the
+    JSONL cache.
     """
     import pyarrow.parquet as pq
 
     pf = pq.ParquetFile(str(parquet_path))
     rows: list[dict] = []
     scanned = 0
-    for rg in range(pf.num_row_groups):
-        meta_tbl = pf.read_row_group(rg, columns=["metadata", "status"])
-        meta_rows = meta_tbl.to_pylist()
-        keep_indices = []
-        for i, small in enumerate(meta_rows):
+    observed: dict[str, int] = {}
+    columns = ["dna_sequence", "labels", "metadata", "status"]
+
+    for batch in pf.iter_batches(batch_size=max(1, int(batch_size)), columns=columns):
+        batch_rows = batch.to_pylist()
+        for raw in batch_rows:
             scanned += 1
             try:
-                meta = _metadata_dict({"metadata": small.get("metadata", {})})
+                meta = _metadata_dict(raw)
             except Exception:
                 continue
-            row_stub = {"metadata": meta, "status": small.get("status")}
+            chrom = str(meta.get("chrom", meta.get("chromosome", meta.get("seqid", ""))))
+            if chrom:
+                observed[chrom] = observed.get(chrom, 0) + 1
+            row_stub = {"metadata": meta, "status": raw.get("status")}
             if not _is_chr20_row(row_stub):
                 continue
-            if small.get("status") is not None and int(small.get("status")) != 1:
-                continue
-            keep_indices.append(i)
-            if len(rows) + len(keep_indices) >= max_rows:
-                break
-        if not keep_indices:
-            continue
 
-        full_tbl = pf.read_row_group(rg, columns=["dna_sequence", "labels", "metadata", "status"])
-        full_rows = full_tbl.to_pylist()
-        for i in keep_indices:
-            row = dict(full_rows[i])
+            # For smoke tests we only need real chr20 examples. Do not require
+            # status == 1 here: val-human keeps all isoforms, and the goal is to
+            # verify training/inference code paths without scanning/downloading
+            # additional shards if the first chr20 rows are not representative.
+            row = dict(raw)
             dna = str(row["dna_sequence"])
-            n = min(len(dna), keep_len)
+            n = min(len(dna), int(keep_len))
             row["dna_sequence"] = dna[:n]
             row["labels"] = row["labels"][:n]
             meta = _metadata_dict(row)
@@ -345,10 +314,17 @@ def _read_segmentation_rows_from_parquet(parquet_path: Path, keep_len: int, max_
             meta["end"] = int(meta["start"] + n)
             row["metadata"] = meta
             rows.append(_json_safe(row))
-            if len(rows) >= max_rows:
-                print(f"Selected {len(rows)} segmentation smoke rows from {parquet_path} after scanning {scanned} metadata rows")
+            if len(rows) >= int(max_rows):
+                print(
+                    f"Selected {len(rows)} segmentation smoke rows from {parquet_path} "
+                    f"after scanning {scanned} rows; observed_chroms={dict(list(observed.items())[:20])}"
+                )
                 return rows
-    print(f"Selected {len(rows)} segmentation smoke rows from {parquet_path} after scanning {scanned} metadata rows")
+
+    print(
+        f"Selected {len(rows)} segmentation smoke rows from {parquet_path} "
+        f"after scanning {scanned} rows; observed_chroms={dict(list(observed.items())[:20])}"
+    )
     return rows
 
 
@@ -360,6 +336,7 @@ def prepare_segmentation_smoke_cache(
     local_parquet: str | None = None,
     hf_local_files_only: bool = False,
     max_parquet_files: int = 8,
+    parquet_batch_size: int = 16,
 ) -> Path:
     """Create/reuse tiny persistent JSONL cache from real val-human chr20 transcript rows.
 
@@ -369,6 +346,8 @@ def prepare_segmentation_smoke_cache(
     few trimmed chr20 rows to a local JSONL cache.
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
+    if remote_parquet is None and local_parquet is None:
+        remote_parquet = DEFAULT_SEGMENTATION_REMOTE_PARQUET
     source_label = Path(local_parquet).stem if local_parquet else (remote_parquet or "auto_val_human_chr20")
     source_label = source_label.replace("/", "__").replace(".parquet", "")
     out = cache_dir / f"segmentation_{source_label}_rows_{max_rows}_first_{keep_len}.jsonl"
@@ -378,7 +357,8 @@ def prepare_segmentation_smoke_cache(
 
     print(
         "Preparing persistent real segmentation/transcript-type smoke cache without datasets.load_dataset.\n"
-        "The code will inspect parquet metadata row-groups and keep only tiny real chr20 rows."
+        "The code will use only val-human/data.parquet by default, iterate small Parquet batches, "
+        "and keep only tiny real chr20 rows."
     )
 
     parquet_paths: list[Path] = []
@@ -395,24 +375,22 @@ def prepare_segmentation_smoke_cache(
             local_files_only=hf_local_files_only,
         ))]
     else:
-        if hf_local_files_only:
-            raise RuntimeError(
-                "--hf-local-files-only was set, but no --segmentation-local-parquet or "
-                "--segmentation-remote-parquet was provided. The runner cannot list remote files offline."
-            )
-        candidates = _list_segmentation_parquet_candidates(max_files=max_parquet_files)
+        # Default smoke behavior: use only the human held-out validation parquet.
+        # Do not auto-discover train-human or train-multi-specie shards here; the
+        # smoke test is meant to stay on T2T chr20 and must not download species
+        # or human-training data.
         parquet_paths = [Path(_download_or_reuse_hf_file(
             repo_id=SEGMENTATION_REPO_ID,
-            filename=c,
+            filename=remote_parquet,
             repo_type="dataset",
-            local_files_only=False,
-        )) for c in candidates]
+            local_files_only=hf_local_files_only,
+        ))]
 
     rows: list[dict] = []
     used_files = []
     for parquet_path in parquet_paths:
         used_files.append(str(parquet_path))
-        rows.extend(_read_segmentation_rows_from_parquet(parquet_path, keep_len, max_rows - len(rows)))
+        rows.extend(_read_segmentation_rows_from_parquet(parquet_path, keep_len, max_rows - len(rows), batch_size=parquet_batch_size))
         if len(rows) >= max_rows:
             break
 
@@ -461,7 +439,7 @@ def seg_data(cache_path: Path, max_nt: int, max_tok: int, split: str = "train") 
         "overlap": 0.5,
         "crop_margin": 500,
         "random_crop": split == "train",
-        "statuses": [1],
+        "statuses": None,
         "max_rows": 2,
         "streaming": False,
     }
@@ -691,9 +669,10 @@ def main():
     ap.add_argument("--gene-finding-cache-len", type=int, default=1536, help="Number of real nucleotides to keep from the selected gene-finding smoke row.")
     ap.add_argument("--segmentation-cache-len", type=int, default=768, help="Number of real nucleotides to keep from each selected transcript-level smoke row.")
     ap.add_argument("--segmentation-cache-rows", type=int, default=2, help="Number of real transcript-level chr20 rows to keep for segmentation/transcript-type smoke tests.")
-    ap.add_argument("--segmentation-remote-parquet", type=str, default=None, help="Exact parquet file inside the HF segmentation dataset repo to use for smoke tests. Optional; auto-discovery is used if omitted.")
+    ap.add_argument("--segmentation-remote-parquet", type=str, default=DEFAULT_SEGMENTATION_REMOTE_PARQUET, help="Exact parquet file inside the HF segmentation dataset repo to use for smoke tests. Defaults to val-human/data.parquet. The smoke runner never auto-downloads train-human or train-multi-specie shards.")
     ap.add_argument("--segmentation-local-parquet", type=str, default=None, help="Optional local parquet file for segmentation/transcript-type smoke cache creation. Use this to avoid any HF request.")
-    ap.add_argument("--segmentation-max-parquet-files", type=int, default=8, help="Maximum number of val-human parquet files to inspect when auto-discovering segmentation smoke rows.")
+    ap.add_argument("--segmentation-max-parquet-files", type=int, default=1, help="Deprecated compatibility option. Smoke tests now use exactly --segmentation-remote-parquet by default.")
+    ap.add_argument("--segmentation-parquet-batch-size", type=int, default=16, help="Small Parquet record-batch size used while extracting chr20 transcript smoke rows.")
     ap.add_argument("--smoke-cache-dir", type=str, default=None, help="Persistent real-data smoke cache directory. Defaults to $GENATATOR_SMOKE_CACHE_DIR or ~/.cache/genatator_smoke.")
     args = ap.parse_args()
     true_gff = Path(args.reference_gff).expanduser()
@@ -723,6 +702,7 @@ def main():
         local_parquet=args.segmentation_local_parquet,
         hf_local_files_only=args.hf_local_files_only,
         max_parquet_files=args.segmentation_max_parquet_files,
+        parquet_batch_size=args.segmentation_parquet_batch_size,
     )
     jobs = build_jobs(work, str(true_gff), gf_cache, seg_cache)
     assert_smoke_configs_use_local_data(work)

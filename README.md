@@ -269,7 +269,7 @@ python smoke_tests/run_smoke.py \
   --work-dir smoke_tests/runs
 ```
 
-Optional real-data cache controls:
+Optional real-data cache controls. The segmentation cache uses `val-human/data.parquet` by default and reads it in small batches:
 
 ```bash
 python smoke_tests/run_smoke.py \
@@ -277,7 +277,8 @@ python smoke_tests/run_smoke.py \
   --reference-gff /path/to/human_T2T_chr20_reference.gff3 \
   --gene-finding-cache-len 1536 \
   --segmentation-cache-len 768 \
-  --segmentation-cache-rows 2
+  --segmentation-cache-rows 2 \
+  --segmentation-parquet-batch-size 16
 ```
 
 To bypass HF completely, pass local parquet files:
@@ -329,7 +330,7 @@ The only memory-wrapper spelling used in configs and code is `amt` / `AMT`. Smok
 
 ### Smoke-test dataset filtering note
 
-The smoke runner uses only real Hugging Face data, but it does **not** call `datasets.load_dataset(...)` while preparing smoke caches. For gene finding it downloads or reuses exactly one known T2T chr20 test parquet shard. For transcript-level tasks it lists likely `val-human` parquet files, reads metadata/status row-groups first, and only then reads `dna_sequence`/`labels` from row-groups that contain matching `NC_060944.1` rows. The resulting local JSONL files are tiny and reused by every model. If filtering selects zero rows, the runner stops and tells you which parquet files were inspected; pass `--segmentation-local-parquet` or `--segmentation-remote-parquet` to make the source explicit.
+The smoke runner uses only real Hugging Face data, but it does **not** call `datasets.load_dataset(...)` while preparing smoke caches. For gene finding it downloads or reuses exactly one known T2T chr20 test parquet shard. For transcript-level tasks it downloads or reuses **only** `val-human/data.parquet` by default, then iterates over small Parquet record batches and keeps only real rows whose metadata points to `NC_060944.1` / chr20. It never auto-downloads `train-human` or `train-multi-specie` shards during smoke-cache preparation. The resulting local JSONL files are tiny and reused by every model. If filtering selects zero rows, the runner stops and tells you which parquet file was inspected; pass `--segmentation-local-parquet` or `--segmentation-remote-parquet val-human/data.parquet` to make the source explicit.
 
 ## Smoke-test real-data cache behavior
 
@@ -360,6 +361,6 @@ python smoke_tests/run_smoke.py \
 The smoke runner creates two persistent caches:
 
 - a gene-finding cache from a real `AIRI-Institute/genatator-gene-finding-dataset` chr20 test parquet shard;
-- a segmentation/transcript-type cache from real `AIRI-Institute/genatator-gene-segmentation-dataset` `val-human` parquet files, filtered to human T2T chr20 without materializing the full HF dataset.
+- a segmentation/transcript-type cache from real `AIRI-Institute/genatator-gene-segmentation-dataset` `val-human/data.parquet` only, filtered to human T2T chr20 without materializing the full HF dataset and without downloading multispecies data.
 
 After these files exist, deleting `smoke_tests/runs` will not trigger dataset preparation again. All train, validation, and inference jobs read the tiny local JSONL caches instead of touching the remote HF datasets.
