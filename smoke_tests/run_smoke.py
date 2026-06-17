@@ -11,6 +11,8 @@ import time
 from pathlib import Path
 from typing import Dict, List
 
+from tqdm.auto import tqdm
+
 REPO = Path(__file__).resolve().parents[1]
 
 MODELS = {
@@ -247,8 +249,11 @@ def prepare_gene_finding_smoke_cache(
             local_files_only=hf_local_files_only,
         ))
 
+    if "NC_060944.1" not in str(parquet_path) and local_parquet is None:
+        raise RuntimeError(f"Gene-finding smoke parquet must be the exact NC_060944.1 shard, got: {parquet_path}")
     row = _read_one_parquet_row(parquet_path)
     dna = str(row["dna_sequence"])
+    print(f"Gene-finding source parquet confirmed for NC_060944.1: source_len={len(dna)} requested_cache_len={keep_len} file={parquet_path}")
     n = min(len(dna), keep_len)
     row["dna_sequence"] = dna[:n]
     row["targets"] = row["targets"][:n]
@@ -269,64 +274,101 @@ def prepare_gene_finding_smoke_cache(
 
 
 def _read_segmentation_rows_from_parquet(parquet_path: Path, keep_len: int, max_rows: int, batch_size: int = 16) -> list[dict]:
-    """Read only a few real chr20 transcript rows from one parquet file.
+    """Read only a few real chr20 transcript rows from one human val parquet.
 
-    This function intentionally iterates over small record batches instead of
-    materializing a Hugging Face Dataset or a whole Parquet row group. The smoke
-    cache is tiny, but the released Parquet files can be hundreds of megabytes,
-    so each matching row is trimmed immediately before it is appended to the
-    JSONL cache.
+    This is deliberately two-pass and memory-light:
+      1. scan only metadata/status columns to identify chr20 transcript rows and
+         count how many chr20 transcripts are present in this parquet;
+      2. read dna_sequence/labels only for the selected row indices.
+
+    This avoids loading all transcript labels into RAM while making it obvious
+    which chromosome was selected from metadata.
     """
     import pyarrow.parquet as pq
 
     pf = pq.ParquetFile(str(parquet_path))
-    rows: list[dict] = []
-    scanned = 0
-    observed: dict[str, int] = {}
-    columns = ["dna_sequence", "labels", "metadata", "status"]
+    total_rows = int(pf.metadata.num_rows)
+    batch_size = max(1, int(batch_size))
+    total_batches = (total_rows + batch_size - 1) // batch_size
+    selected_indices: list[int] = []
+    chr_counts: dict[str, int] = {}
+    chr20_count = 0
+    chr20_total_metadata_span = 0
+    global_i = 0
 
-    for batch in pf.iter_batches(batch_size=max(1, int(batch_size)), columns=columns):
-        batch_rows = batch.to_pylist()
-        for raw in batch_rows:
-            scanned += 1
-            try:
-                meta = _metadata_dict(raw)
-            except Exception:
-                continue
+    print(
+        f"Inspecting segmentation parquet metadata only: file={parquet_path} rows={total_rows} "
+        f"target_chrom_aliases={CHR20_ALIASES}"
+    )
+    for batch in tqdm(
+        pf.iter_batches(batch_size=batch_size, columns=["metadata", "status"]),
+        total=total_batches,
+        desc=f"scan metadata {parquet_path.name}",
+        unit="batch",
+    ):
+        for raw in batch.to_pylist():
+            meta = _metadata_dict(raw)
             chrom = str(meta.get("chrom", meta.get("chromosome", meta.get("seqid", ""))))
             if chrom:
-                observed[chrom] = observed.get(chrom, 0) + 1
+                chr_counts[chrom] = chr_counts.get(chrom, 0) + 1
             row_stub = {"metadata": meta, "status": raw.get("status")}
-            if not _is_chr20_row(row_stub):
-                continue
+            if _is_chr20_row(row_stub):
+                chr20_count += 1
+                try:
+                    chr20_total_metadata_span += max(0, int(meta.get("end", 0)) - int(meta.get("start", 0)))
+                except Exception:
+                    pass
+                if len(selected_indices) < int(max_rows):
+                    selected_indices.append(global_i)
+            global_i += 1
 
-            # For smoke tests we only need real chr20 examples. Do not require
-            # status == 1 here: val-human keeps all isoforms, and the goal is to
-            # verify training/inference code paths without scanning/downloading
-            # additional shards if the first chr20 rows are not representative.
+    top_chroms = sorted(chr_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:20]
+    print(
+        "Segmentation/transcript-type metadata scan complete: "
+        f"chr20_transcripts_found={chr20_count}, selected_for_smoke={len(selected_indices)}, "
+        f"chr20_total_metadata_span={chr20_total_metadata_span}, top_chroms={top_chroms}"
+    )
+    if not selected_indices:
+        return []
+
+    selected_set = set(selected_indices)
+    rows: list[dict] = []
+    global_i = 0
+    columns = ["dna_sequence", "labels", "metadata", "status"]
+    for batch in tqdm(
+        pf.iter_batches(batch_size=batch_size, columns=columns),
+        total=total_batches,
+        desc=f"read selected rows {parquet_path.name}",
+        unit="batch",
+    ):
+        for raw in batch.to_pylist():
+            if global_i not in selected_set:
+                global_i += 1
+                continue
             row = dict(raw)
+            meta = _metadata_dict(row)
+            chrom = str(meta.get("chrom", meta.get("chromosome", meta.get("seqid", ""))))
             dna = str(row["dna_sequence"])
             n = min(len(dna), int(keep_len))
             row["dna_sequence"] = dna[:n]
             row["labels"] = row["labels"][:n]
-            meta = _metadata_dict(row)
             meta["start"] = int(meta.get("start", 0))
             meta["end"] = int(meta["start"] + n)
             row["metadata"] = meta
             rows.append(_json_safe(row))
+            print(
+                f"Selected real transcript row index={global_i} chrom={chrom} "
+                f"transcript_id={meta.get('transcript_id','')} type={meta.get('transcript_type','')} "
+                f"kept_nt={n} original_nt={len(dna)}"
+            )
+            global_i += 1
             if len(rows) >= int(max_rows):
-                print(
-                    f"Selected {len(rows)} segmentation smoke rows from {parquet_path} "
-                    f"after scanning {scanned} rows; observed_chroms={dict(list(observed.items())[:20])}"
-                )
+                print(f"Finished reading selected chr20 transcript rows: rows={len(rows)} from {parquet_path}")
                 return rows
-
-    print(
-        f"Selected {len(rows)} segmentation smoke rows from {parquet_path} "
-        f"after scanning {scanned} rows; observed_chroms={dict(list(observed.items())[:20])}"
-    )
+        # If we skipped the whole batch, account for rows not touched above.
+        # The loop above increments global_i for every row, so no extra update is needed.
+    print(f"Finished reading selected chr20 transcript rows: rows={len(rows)} from {parquet_path}")
     return rows
-
 
 def prepare_segmentation_smoke_cache(
     cache_dir: Path,
@@ -357,8 +399,9 @@ def prepare_segmentation_smoke_cache(
 
     print(
         "Preparing persistent real segmentation/transcript-type smoke cache without datasets.load_dataset.\n"
-        "The code will use only val-human/data.parquet by default, iterate small Parquet batches, "
-        "and keep only tiny real chr20 rows."
+        "The code uses only the human held-out parquet selected by --segmentation-remote-parquet "
+        "(default: val-human/data.parquet), scans metadata for NC_060944.1/chr20/20, "
+        "and keeps only tiny real chr20 transcript rows. It never downloads train-human or train-multi-specie shards."
     )
 
     parquet_paths: list[Path] = []
@@ -565,7 +608,7 @@ def assert_smoke_configs_use_local_data(work: Path) -> None:
             bad.append(str(cfg_path))
     if bad:
         raise RuntimeError(
-            "Smoke configs still reference the remote gene-finding HF dataset. "
+            "Smoke configs still reference remote GENATATOR HF datasets. "
             "This would trigger slow downloads/rate limits. Delete stale configs or use the updated smoke runner. "
             f"Bad configs: {bad[:10]}"
         )

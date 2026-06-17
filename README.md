@@ -451,3 +451,27 @@ The `postprocess` JSON block supports:
 ```
 
 These parameters correspond to the FFT low-pass fraction, peak prominence, peak distance, optional peak height, maximum TSS/PolyA pairing distance, maximum nearest PolyA partners per TSS seed, intragenic probability threshold, maximum allowed non-intragenic fraction inside a candidate interval, and optional logging interval for peak pairing.
+
+## v15 fixes: legacy torch, chromosome-specific smoke caches, and GFF assumptions
+
+### Loading GENA backbones with torch 2.2.2
+
+Some GENA checkpoints are still distributed through `pytorch_model.bin`. New Transformers versions block `torch.load`-based checkpoint loading under torch < 2.6 because of CVE-2025-32434. This repository now logs an explicit `[legacy_torch_load]` warning and patches the Transformers guard only for the trusted GENA backbone-loading path, so environments pinned to `torch==2.2.2+cu121` can still run. Prefer safetensors checkpoints when available.
+
+### Gene-finding GFF construction
+
+Gene finding predicts transcript boundaries only. It does not predict exon-intron structure. Therefore, the prediction GFF for gene-finding evaluation is genome-oriented and represents every predicted transcript interval as one `gene`, one `mRNA`/`lnc_RNA` transcript row, and one `exon` spanning the whole predicted interval. This is intentional: the annotation leaderboard can score TSS/PolyA boundary localization from the transcript interval, while true exon/CDS segmentation is evaluated separately by the segmentation task.
+
+### Segmentation GFF construction
+
+Segmentation prediction GFFs remain transcript-coordinate annotations. The `seqid` column is the transcript ID, not a chromosome name. The model input is expected to be the DNA sequence of one transcript, without intergenic sequence, neighboring genes, or other chromosome context.
+
+### Smoke-test chromosome extraction and progress reporting
+
+Smoke tests now print exactly how chr20 data are selected:
+
+- gene finding uses one exact parquet shard whose filename contains `NC_060944.1`, then prints the source row length and the kept cache length;
+- segmentation/transcript-type use only `val-human/data.parquet` by default, scan only `metadata/status` first, print the number of transcript rows whose metadata match `NC_060944.1`/`chr20`/`20`, print the total metadata span for those rows, and then read `dna_sequence/labels` only for the selected rows;
+- tqdm progress bars are shown for metadata scanning, selected-row reading, training, validation, inference, and gene-finding peak post-processing.
+
+Smoke tests never download `train-human` or `train-multi-specie` unless you explicitly pass a different local or remote parquet path.

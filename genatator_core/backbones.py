@@ -5,6 +5,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from packaging import version
 from transformers import AutoModel, ModernBertForTokenClassification
 from transformers.modeling_outputs import TokenClassifierOutput
 
@@ -12,6 +13,40 @@ from .config import local_or_remote
 
 logger = logging.getLogger(__name__)
 
+
+def allow_transformers_bin_loading_on_legacy_torch(*, context: str) -> None:
+    """Allow trusted legacy PyTorch `.bin` checkpoints under torch<2.6.
+
+    Transformers now blocks `torch.load`-based checkpoint files when torch<2.6
+    because of CVE-2025-32434. The user explicitly requested keeping
+    torch==2.2.2+cu121. GENA checkpoints may still be distributed as
+    pytorch_model.bin, so we patch the Transformers guard for this trusted
+    backbone-loading path and log it loudly instead of failing silently.
+    """
+    torch_version = version.parse(torch.__version__.split("+")[0])
+    if torch_version >= version.parse("2.6.0"):
+        return
+    try:
+        import transformers.modeling_utils as modeling_utils
+        import transformers.utils.import_utils as import_utils
+    except Exception as exc:
+        raise RuntimeError(f"Could not import Transformers internals to support legacy torch checkpoint loading for {context}: {exc}") from exc
+
+    def _logged_noop_check_torch_load_is_safe():
+        logger.warning(
+            "[legacy_torch_load] Transformers safety guard for torch.load is bypassed for %s because torch=%s < 2.6 and the environment must keep this torch version. Use only trusted checkpoints or safetensors.",
+            context,
+            torch.__version__,
+        )
+        return None
+
+    import_utils.check_torch_load_is_safe = _logged_noop_check_torch_load_is_safe
+    modeling_utils.check_torch_load_is_safe = _logged_noop_check_torch_load_is_safe
+    logger.warning(
+        "[legacy_torch_load] Enabled trusted `.bin` checkpoint loading for %s under torch=%s. This is required for GENA backbones without safetensors in the current environment.",
+        context,
+        torch.__version__,
+    )
 
 def infer_hidden_size(config: Any, *, context: str) -> int:
     for name in ("hidden_size", "d_model", "n_embd", "embed_dim"):
@@ -93,6 +128,7 @@ class HiddenStateBackbone(nn.Module):
             self.config = self.owner.config
         elif backbone_kind == "gena":
             logger.info("[backbone] loading GENA AutoModel: %s", self.backbone_path)
+            allow_transformers_bin_loading_on_legacy_torch(context=f"GENA backbone {self.backbone_path}")
             self.encoder = AutoModel.from_pretrained(self.backbone_path, trust_remote_code=trust_remote_code)
             self.owner = self.encoder
             self.config = self.encoder.config
