@@ -63,7 +63,8 @@
     "interval_window_size": 2000000,
     "max_pairs_per_seed": 10,
     "prob_threshold": 0.5,
-    "zero_fraction_drop_threshold": 0.01
+    "zero_fraction_drop_threshold": 0.01,
+    "pairing_progress_every": null
   },
   "inference": {
     "device": "cuda",

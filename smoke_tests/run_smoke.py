@@ -503,7 +503,7 @@ def make_finding_infer_config(work: Path, gf_cache: Path, model_name: str, varia
     region_cfg = json.loads((work / "configs" / f"finding_region_{model_name}_{variant}.json").read_text())
     edge_cfg = {"model": edge_cfg["model"], "dataset": finding_data(gf_cache, 512, 64, inference_subset=True), "inference": {"checkpoint_path": str(edge_train / "final_model"), "batch_size": 1}}
     region_cfg = {"model": region_cfg["model"], "dataset": finding_data(gf_cache, 1024, 128, inference_subset=True), "inference": {"checkpoint_path": str(region_train / "final_model"), "batch_size": 1}}
-    cfg = {"edge": edge_cfg, "region": region_cfg, "postprocess": {"lp_frac": 0.05, "pk_prom": 0.1, "pk_dist": 50, "pk_height": None, "interval_window_size": 2000000, "max_pairs_per_seed": 2, "prob_threshold": 0.5, "zero_fraction_drop_threshold": 0.5}, "inference": {"device": "cuda", "use_reverse_complement": False, "output_gff": str(work / f"finding_{model_name}_{variant}.gff"), "true_gff": true_gff, "metrics_json": str(work / f"finding_{model_name}_{variant}.metrics.json"), "k_values": [0, 50, 100, 250, 500], "use_strand": True}}
+    cfg = {"edge": edge_cfg, "region": region_cfg, "postprocess": {"lp_frac": 0.05, "pk_prom": 0.1, "pk_dist": 50, "pk_height": None, "interval_window_size": 2000000, "max_pairs_per_seed": 2, "prob_threshold": 0.5, "zero_fraction_drop_threshold": 0.5, "pairing_progress_every": None}, "inference": {"device": "cuda", "use_reverse_complement": False, "output_gff": str(work / f"finding_{model_name}_{variant}.gff"), "true_gff": true_gff, "metrics_json": str(work / f"finding_{model_name}_{variant}.metrics.json"), "k_values": [0, 50, 100, 250, 500], "use_strand": True, "empty_gff_policy": "best_interval", "empty_gff_min_interval_len": 64, "empty_gff_max_records": 1}}
     return write_json(work / "configs" / f"infer_finding_{model_name}_{variant}.json", cfg)
 
 
@@ -511,7 +511,7 @@ def make_seg_infer_config(work: Path, seg_cache: Path, model_name: str, variant:
     family = "caduceus" if MODELS[model_name]["kind"] == "caduceus" else variant
     train_dir = work / f"segmentation_{model_name}_{family}"
     train_cfg = json.loads((work / "configs" / f"segmentation_{model_name}_{family}.json").read_text())
-    cfg = {"model": train_cfg["model"], "dataset": seg_data(seg_cache, 512, 64 if family != "caduceus" else 512, "validation"), "inference": {"device": "cuda", "checkpoint_path": str(train_dir / "final_model"), "batch_size": 1, "use_reverse_complement": False, "threshold": 0.5, "output_gff": str(work / f"segmentation_{model_name}_{family}.gff"), "true_gff": true_gff, "metrics_json": str(work / f"segmentation_{model_name}_{family}.metrics.json")}}
+    cfg = {"model": train_cfg["model"], "dataset": seg_data(seg_cache, 512, 64 if family != "caduceus" else 512, "validation"), "inference": {"device": "cuda", "checkpoint_path": str(train_dir / "final_model"), "batch_size": 1, "use_reverse_complement": False, "threshold": 0.5, "empty_segment_policy": "best_interval", "coordinate_mode": "transcript", "output_gff": str(work / f"segmentation_{model_name}_{family}.gff"), "true_gff": true_gff, "metrics_json": str(work / f"segmentation_{model_name}_{family}.metrics.json")}}
     return write_json(work / "configs" / f"infer_segmentation_{model_name}_{family}.json", cfg)
 
 

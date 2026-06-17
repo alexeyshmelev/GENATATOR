@@ -364,3 +364,90 @@ The smoke runner creates two persistent caches:
 - a segmentation/transcript-type cache from real `AIRI-Institute/genatator-gene-segmentation-dataset` `val-human/data.parquet` only, filtered to human T2T chr20 without materializing the full HF dataset and without downloading multispecies data.
 
 After these files exist, deleting `smoke_tests/runs` will not trigger dataset preparation again. All train, validation, and inference jobs read the tiny local JSONL caches instead of touching the remote HF datasets.
+
+## v13 inference GFF behavior
+
+The inference writers now follow the two official evaluate interfaces used by the repository.
+
+### Gene finding GFF
+
+`finding/infer.py` writes a genome-oriented GFF3 file. Each predicted interval becomes:
+
+- one `gene` row on the chromosome coordinate system;
+- one transcript row of type `mRNA` by default;
+- one `exon` row spanning the full predicted transcript interval.
+
+The official annotation metric rejects empty prediction GFF files. Normal inference keeps the strict default behavior and raises an error if no intervals pass post-processing. Smoke-test inference explicitly sets:
+
+```json
+"empty_gff_policy": "best_interval"
+```
+
+With this setting, if a two-step smoke model produces no intervals, the code writes one best-scoring interval derived from the edge and region tracks. This is only to verify the full train-infer-evaluate path under tiny smoke training.
+
+### Segmentation GFF
+
+`segmentation/infer.py` writes prediction GFFs in the format expected by `AIRI-Institute/genatator-ab-initio-segmentation-leaderboard`:
+
+- prediction `seqid` is the reference `transcript_id`;
+- coordinates are transcript-relative by default;
+- rows include `gene`, transcript (`mRNA` or `lnc_RNA`), `exon`, and, for mRNA, `CDS` features.
+
+This differs from standard genome-oriented GFF used by the reference annotation. Use:
+
+```json
+"coordinate_mode": "transcript"
+```
+
+for the official segmentation metric. Smoke-test segmentation also sets:
+
+```json
+"empty_segment_policy": "best_interval"
+```
+
+so that a tiny randomly initialized or barely trained model still produces at least one exon/CDS feature and the evaluator can run.
+
+## Gene-finding inference metrics and post-processing
+
+`finding/infer.py` now performs two independent evaluations during inference.
+
+First, it gathers the edge and region probability tracks for the selected chromosome(s) and computes nucleotide-level PR-AUC on the whole chromosome at once. The reported blocks are:
+
+```json
+{
+  "pr_auc": {
+    "edge": {
+      "pooled": {"TSS+": ..., "TSS-": ..., "PolyA+": ..., "PolyA-": ...},
+      "per_chromosome": {"NC_060944.1": {...}},
+      "mean": ...
+    },
+    "region": {
+      "pooled": {"Intragenic+": ..., "Intragenic-": ...},
+      "per_chromosome": {"NC_060944.1": {...}},
+      "mean": ...
+    }
+  }
+}
+```
+
+Second, when `inference.true_gff` is provided, the script writes a genome-oriented prediction GFF and evaluates it through `AIRI-Institute/genatator-ab-initio-annotation-leaderboard`. The JSON output then contains both `pr_auc` and `annotation`.
+
+Gene-finding GFF construction uses the same FFT peak-calling and TSS/PolyA pairing logic as the public GENATATOR pipeline. The model edge-channel order is `TSS+, TSS-, PolyA+, PolyA-`; internally the post-processing code reorders this to the pipeline peak-calling order `TSS+, PolyA+, TSS-, PolyA-`.
+
+The `postprocess` JSON block supports:
+
+```json
+{
+  "lp_frac": 0.05,
+  "pk_prom": 0.1,
+  "pk_dist": 50,
+  "pk_height": null,
+  "interval_window_size": 2000000,
+  "max_pairs_per_seed": 10,
+  "prob_threshold": 0.5,
+  "zero_fraction_drop_threshold": 0.01,
+  "pairing_progress_every": null
+}
+```
+
+These parameters correspond to the FFT low-pass fraction, peak prominence, peak distance, optional peak height, maximum TSS/PolyA pairing distance, maximum nearest PolyA partners per TSS seed, intragenic probability threshold, maximum allowed non-intragenic fraction inside a candidate interval, and optional logging interval for peak pairing.

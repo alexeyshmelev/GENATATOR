@@ -606,6 +606,11 @@ class GenatatorDataset(torch.utils.data.Dataset):
             item["dna_sequence"] = dna
             item["offset_mapping"] = inference_offsets
             item["reverse_complement"] = self.reverse_complement
+            # Keep nucleotide-resolution truth labels as a plain NumPy array/list.
+            # The collator leaves non-tensor values as lists, so these labels are
+            # not passed into model.forward. They are used only by inference scripts
+            # to compute whole-chromosome PR-AUC for gene-finding tasks.
+            item["truth_labels"] = labels.astype(np.float32, copy=False)
         return item
 
 
