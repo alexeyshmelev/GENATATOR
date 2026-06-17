@@ -64,11 +64,14 @@ class HiddenStateBackbone(nn.Module):
     """GENA/ModernGENA hidden-state adapter.
 
     Active class choices:
-    - ModernGENA uses `transformers.ModernBertForTokenClassification.from_pretrained` as requested.
-      The token-classification head is not used; the encoder hidden states become the local fine-tuning features.
-    - GENA uses `transformers.AutoModel.from_pretrained` with `trust_remote_code=True`.
+    - ModernGENA loads through `transformers.ModernBertForTokenClassification.from_pretrained`.
+      Only one registered module reference is kept, so Trainer/safetensors does not see
+      duplicated shared tensors.
+    - GENA loads through `AutoModel.from_pretrained`. If the checkpoint is exposed as
+      `BertForMaskedLM`, we keep only its internal `.bert` encoder as the trainable module;
+      the LM head is intentionally dropped because the fine-tuning head is defined here.
 
-    All backbone parameters stay trainable. This class never freezes anything.
+    All retained parameters stay trainable. This class never freezes anything.
     """
 
     def __init__(self, backbone_path: str, backbone_kind: str, trust_remote_code: bool = True, modernbert_num_labels: int = 2, allow_unsafe_torch_load: bool = True):
@@ -76,54 +79,77 @@ class HiddenStateBackbone(nn.Module):
         self.backbone_kind = backbone_kind
         self.backbone_path = local_or_remote(backbone_path)
         self.trust_remote_code = trust_remote_code
+        self.uses_owner = False
+        self.encoder_attr = None
         allow_transformers_torch_load_on_legacy_torch(allow_unsafe_torch_load, context=f"HiddenStateBackbone:{backbone_kind}:{self.backbone_path}")
+
         if backbone_kind == "moderngena":
             logger.info("[backbone] loading ModernGENA through ModernBertForTokenClassification: %s", self.backbone_path)
-            self.owner = ModernBertForTokenClassification.from_pretrained(
+            owner = ModernBertForTokenClassification.from_pretrained(
                 self.backbone_path,
                 num_labels=int(modernbert_num_labels),
                 trust_remote_code=trust_remote_code,
             )
-            if hasattr(self.owner, "model"):
-                self.encoder = self.owner.model
-            elif hasattr(self.owner, "modernbert"):
-                self.encoder = self.owner.modernbert
-            elif hasattr(self.owner, "bert"):
-                self.encoder = self.owner.bert
-            else:
-                raise RuntimeError(f"ModernBertForTokenClassification has no known encoder attribute: children={list(dict(self.owner.named_children()).keys())}")
-            self.config = self.owner.config
+            # Keep exactly one registered module. Do not additionally assign
+            # `self.encoder = owner.model`, because that creates duplicated named
+            # parameters and safetensors refuses to save them.
+            self.owner = owner
+            self.uses_owner = True
+            for attr in ("model", "modernbert", "bert"):
+                if hasattr(owner, attr):
+                    self.encoder_attr = attr
+                    break
+            if self.encoder_attr is None:
+                raise RuntimeError(f"ModernBertForTokenClassification has no known encoder attribute: children={list(dict(owner.named_children()).keys())}")
+            self.config = owner.config
+            encoder_for_shape = getattr(owner, self.encoder_attr)
+            logger.info("[backbone] ModernGENA owner class=%s encoder_attr=%s encoder_class=%s", type(owner).__name__, self.encoder_attr, type(encoder_for_shape).__name__)
+
         elif backbone_kind == "gena":
             logger.info("[backbone] loading GENA AutoModel: %s", self.backbone_path)
             raw = AutoModel.from_pretrained(self.backbone_path, trust_remote_code=trust_remote_code)
-            self.owner = raw
             self.config = raw.config
             # Some released GENA checkpoints expose a masked-language-model class through
             # AutoModel. Its first output is vocabulary logits [B, T, vocab_size], not
-            # hidden states. For fine-tuning we must use the internal encoder hidden
-            # states. If a `.bert` encoder exists, use it directly and log this choice.
+            # hidden states. For fine-tuning we keep only the internal encoder as a
+            # registered module. This also avoids duplicate shared tensors during save.
             if hasattr(raw, "bert"):
                 self.encoder = raw.bert
-                logger.info("[backbone] GENA AutoModel class=%s contains `.bert`; using internal BertModel encoder for hidden states", type(raw).__name__)
+                logger.info("[backbone] GENA AutoModel class=%s contains `.bert`; registering only internal BertModel encoder for hidden states", type(raw).__name__)
+                del raw
             else:
                 self.encoder = raw
-                logger.info("[backbone] GENA AutoModel class=%s used directly as hidden-state encoder", type(raw).__name__)
+                logger.info("[backbone] GENA AutoModel class=%s registered directly as hidden-state encoder", type(raw).__name__)
         else:
             raise RuntimeError(f"HiddenStateBackbone supports only backbone_kind='gena' or 'moderngena', got {backbone_kind}")
+
         self.hidden_size = infer_hidden_size(self.config, context=f"HiddenStateBackbone:{backbone_kind}")
-        self.embeddings = get_word_embeddings(self.owner, context=f"HiddenStateBackbone:{backbone_kind}")
+        self.embeddings = get_word_embeddings(self._embedding_source(), context=f"HiddenStateBackbone:{backbone_kind}")
         _, emb_hidden = infer_vocab_size_from_embeddings(self.embeddings, context=f"HiddenStateBackbone:{backbone_kind}")
         if emb_hidden != self.hidden_size:
             raise RuntimeError(f"Backbone hidden mismatch: config hidden_size={self.hidden_size}, embedding dim={emb_hidden}")
-        logger.info("[backbone] loaded kind=%s hidden_size=%d class=%s", backbone_kind, self.hidden_size, type(self.encoder).__name__)
+        logger.info("[backbone] loaded kind=%s hidden_size=%d class=%s", backbone_kind, self.hidden_size, type(self._encoder()).__name__)
+
+    def _encoder(self) -> nn.Module:
+        if self.uses_owner:
+            return getattr(self.owner, self.encoder_attr)
+        return self.encoder
+
+    def _embedding_source(self) -> nn.Module:
+        # For ModernBERT token-classification wrapper, input embeddings are on the owner.
+        # For GENA we registered only the encoder.
+        return self.owner if self.uses_owner else self.encoder
 
     def get_input_embeddings(self):
-        return get_word_embeddings(self.owner, context="HiddenStateBackbone.get_input_embeddings")
+        return get_word_embeddings(self._embedding_source(), context="HiddenStateBackbone.get_input_embeddings")
 
     def resize_token_embeddings(self, new_num_tokens: int):
         logger.info("[backbone] resize token embeddings to %d", new_num_tokens)
-        resized = self.owner.resize_token_embeddings(new_num_tokens)
-        self.embeddings = get_word_embeddings(self.owner, context="HiddenStateBackbone.after_resize")
+        source = self._embedding_source()
+        if not hasattr(source, "resize_token_embeddings"):
+            raise RuntimeError(f"Registered backbone source {type(source).__name__} does not support resize_token_embeddings")
+        resized = source.resize_token_embeddings(new_num_tokens)
+        self.embeddings = get_word_embeddings(source, context="HiddenStateBackbone.after_resize")
         return resized
 
     def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, inputs_embeds=None, output_hidden_states=True, return_dict=True, **kwargs):
@@ -136,7 +162,7 @@ class HiddenStateBackbone(nn.Module):
         )
         if self.backbone_kind == "gena":
             common["token_type_ids"] = token_type_ids
-        out = self.encoder(**common)
+        out = self._encoder()(**common)
         hidden_states = getattr(out, "hidden_states", None)
         hidden = getattr(out, "last_hidden_state", None)
         if hidden is None:

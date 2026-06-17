@@ -21,6 +21,24 @@ from .utils import reverse_complement
 logger = logging.getLogger(__name__)
 
 
+def _load_jsonl_rows(path: Path) -> MaterializedRows:
+    rows = []
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            if line.strip():
+                rows.append(json.loads(line))
+    return MaterializedRows(rows)
+
+
+def _read_parquet_block_row(parquet_path: str) -> Dict[str, Any]:
+    import pyarrow.parquet as pq
+    table = pq.read_table(str(parquet_path), columns=["dna_sequence", "targets"])
+    rows = table.to_pylist()
+    if len(rows) != 1:
+        raise RuntimeError(f"Expected exactly one row in gene-finding parquet block {parquet_path}, got {len(rows)}")
+    return rows[0]
+
+
 @dataclass(frozen=True)
 class ParsedMetadata:
     transcript_id: str = ""
@@ -259,7 +277,10 @@ def load_dataset_auto(cfg: Dict[str, Any]) -> HFDataset:
         if p.suffix.lower() == ".parquet":
             return load_dataset("parquet", data_files={split: str(p)}, split=split)
         if p.suffix.lower() in {".json", ".jsonl"}:
-            return load_dataset("json", data_files={split: str(p)}, split=split)
+            # For smoke caches and parquet index files we avoid Arrow conversion: even
+            # tiny indices can point to very large genomic blocks, and keeping plain
+            # Python rows makes memory behavior explicit.
+            return _load_jsonl_rows(p)
         raise RuntimeError(f"Unsupported local dataset path: {p}")
     kwargs = {"path": ref, "split": split}
     if name:
@@ -402,6 +423,8 @@ class ChromosomeAssembly:
         self.length = self.end - self.start
         self.chrom_length = max(m.chrom_length for _, m in self.rows)
         logger.info("[finding.assembly] genome=%s chrom=%s blocks=%d start=%d end=%d assembled_total_length=%d chrom_length_metadata=%d", key[0], key[1], len(self.rows), self.start, self.end, self.length, self.chrom_length)
+        self._parquet_cache_row_i = None
+        self._parquet_cache = None
 
     def get_slice(self, rel_start: int, rel_end: int, target_indices: List[int]) -> Tuple[str, np.ndarray, ParsedMetadata, int]:
         abs_start = self.start + rel_start
@@ -416,8 +439,19 @@ class ChromosomeAssembly:
             row = self.raw[row_i]
             local_s = s - meta.start
             local_e = e - meta.start
-            seq_parts.append(str(row["dna_sequence"])[local_s:local_e].upper())
-            lab_parts.append(np.asarray(row["targets"][local_s:local_e], dtype=np.float32)[:, target_indices])
+            if isinstance(row, dict) and row.get("parquet_path"):
+                # Lazy smoke/full-chromosome index row: only the path and metadata
+                # are kept in memory. Load the current 10 Mb block on demand.
+                if self._parquet_cache_row_i != row_i:
+                    logger.info("[finding.parquet_block.load] chrom=%s start=%d end=%d path=%s", meta.chrom, meta.start, meta.end, row["parquet_path"])
+                    self._parquet_cache = _read_parquet_block_row(row["parquet_path"])
+                    self._parquet_cache_row_i = row_i
+                block = self._parquet_cache
+                seq_parts.append(str(block["dna_sequence"])[local_s:local_e].upper())
+                lab_parts.append(np.asarray(block["targets"][local_s:local_e], dtype=np.float32)[:, target_indices])
+            else:
+                seq_parts.append(str(row["dna_sequence"])[local_s:local_e].upper())
+                lab_parts.append(np.asarray(row["targets"][local_s:local_e], dtype=np.float32)[:, target_indices])
         seq = "".join(seq_parts)
         labels = np.concatenate(lab_parts, axis=0) if lab_parts else np.zeros((0, len(target_indices)), dtype=np.float32)
         if len(seq) != labels.shape[0] or len(seq) != (rel_end - rel_start):

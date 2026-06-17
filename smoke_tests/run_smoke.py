@@ -148,6 +148,10 @@ DEFAULT_GF_REMOTE_PARQUET = (
     "data/test/part-00000/"
     "GCF_009914755.1_T2T-CHM13v2.0__NC_060944.1__000000000000_000010000000.parquet"
 )
+DEFAULT_GF_ASSEMBLY = "GCF_009914755.1_T2T-CHM13v2.0"
+DEFAULT_GF_CHROM = "NC_060944.1"
+DEFAULT_GF_CHROM_LENGTH = 66210255
+DEFAULT_GF_CHUNK_SIZE = 10_000_000
 
 SEGMENTATION_REPO_ID = "AIRI-Institute/genatator-gene-segmentation-dataset"
 DEFAULT_SEGMENTATION_REMOTE_PARQUET = "val-human/data.parquet"
@@ -210,6 +214,26 @@ def _read_one_parquet_row(parquet_path: Path) -> dict:
     return dict(rows[0])
 
 
+def _gene_finding_chr20_remote_parquets(chrom_length: int = DEFAULT_GF_CHROM_LENGTH, chunk_size: int = DEFAULT_GF_CHUNK_SIZE) -> list[str]:
+    files = []
+    for start in range(0, int(chrom_length), int(chunk_size)):
+        end = start + int(chunk_size)
+        files.append(
+            "data/test/part-00000/"
+            f"{DEFAULT_GF_ASSEMBLY}__{DEFAULT_GF_CHROM}__{start:012d}_{end:012d}.parquet"
+        )
+    return files
+
+
+def _read_gene_finding_parquet_metadata(parquet_path: Path) -> dict:
+    import pyarrow.parquet as pq
+    table = pq.read_table(str(parquet_path), columns=["metadata"])
+    rows = table.to_pylist()
+    if len(rows) != 1:
+        raise RuntimeError(f"Expected one metadata row in {parquet_path}, got {len(rows)}")
+    return _metadata_dict(rows[0])
+
+
 def prepare_gene_finding_smoke_cache(
     cache_dir: Path,
     row_slice: str,
@@ -218,71 +242,87 @@ def prepare_gene_finding_smoke_cache(
     local_parquet: str | None = None,
     hf_local_files_only: bool = False,
 ) -> Path:
-    """Create or reuse a tiny persistent JSONL cache from one real HF chr20 test parquet.
+    """Create/reuse a persistent full-chr20 gene-finding parquet index.
 
-    Important: this function deliberately does NOT call datasets.load_dataset. Even
-    split slices can trigger thousands of resolver requests for this sharded dataset.
-    Instead, we resolve/download exactly one known chr20 parquet file, trim it, and
-    reuse the resulting JSONL forever unless the cache file is removed.
+    The cache intentionally stores only metadata and local parquet paths, not the
+    66 Mb DNA sequence and target matrix. The training/inference dataset assembles
+    the full chromosome coordinate system from this index and reads only the
+    currently requested window from the relevant 10 Mb parquet block.
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
-    source_tag = Path(local_parquet).stem if local_parquet else remote_parquet.replace("/", "__").replace(".parquet", "")
-    source_tag = source_tag.replace("[", "_").replace(":", "_").replace("]", "_")
-    out = cache_dir / f"gene_finding_{source_tag}_first_{keep_len}.jsonl"
+    out = cache_dir / "gene_finding_chr20_full_parquet_index.jsonl"
     if out.exists() and out.stat().st_size > 0:
-        n_cached = 0
-        chrom_counts = {}
+        rows = []
         with out.open("r", encoding="utf-8") as fh:
             for line in fh:
-                if not line.strip():
-                    continue
-                n_cached += 1
-                try:
-                    row = json.loads(line)
-                    chrom = _row_chrom(row)
-                    chrom_counts[chrom] = chrom_counts.get(chrom, 0) + 1
-                except Exception:
-                    chrom_counts["<unparsed>"] = chrom_counts.get("<unparsed>", 0) + 1
-        print(f"Using persistent real gene-finding smoke cache: {out} rows={n_cached} chrom_counts={chrom_counts}")
+                if line.strip():
+                    rows.append(json.loads(line))
+        starts = [int(_metadata_dict(r).get("start", 0)) for r in rows]
+        ends = [int(_metadata_dict(r).get("end", 0)) for r in rows]
+        chroms = sorted({str(_metadata_dict(r).get("chrom", "")) for r in rows})
+        print(
+            f"Using persistent real gene-finding full-chromosome parquet index: {out} "
+            f"blocks={len(rows)} chroms={chroms} assembled_total_length={max(ends)-min(starts) if rows else 0}"
+        )
         return out
 
+    print(
+        "Preparing persistent real gene-finding smoke cache as a full-chromosome parquet index.\n"
+        "No DNA/target matrix is stored in JSONL; only exact local parquet paths and metadata are stored.\n"
+        f"Legacy row-slice argument is kept for compatibility but is not used for loading: {row_slice}."
+    )
+
+    parquet_paths: list[Path] = []
     if local_parquet:
-        parquet_path = Path(local_parquet).expanduser().resolve()
-        if not parquet_path.exists():
-            raise FileNotFoundError(f"--gene-finding-local-parquet does not exist: {parquet_path}")
-        print(f"Preparing persistent real gene-finding smoke cache from local parquet: {parquet_path}")
+        p = Path(local_parquet).expanduser().resolve()
+        if not p.exists():
+            raise FileNotFoundError(f"--gene-finding-local-parquet does not exist: {p}")
+        if p.is_dir():
+            parquet_paths = sorted(p.glob(f"*{DEFAULT_GF_CHROM}*.parquet"))
+            if not parquet_paths:
+                raise RuntimeError(f"No {DEFAULT_GF_CHROM} parquet files found in local directory: {p}")
+        else:
+            parquet_paths = [p]
+        print(f"Using local gene-finding parquet source(s): {[str(x) for x in parquet_paths]}")
     else:
-        print(
-            "Preparing persistent real gene-finding smoke cache from one exact HF parquet file.\n"
-            f"Legacy row-slice argument is kept for compatibility but is not used for loading: {row_slice}."
-        )
-        parquet_path = Path(_download_or_reuse_hf_file(
-            repo_id="AIRI-Institute/genatator-gene-finding-dataset",
-            filename=remote_parquet,
-            repo_type="dataset",
-            local_files_only=hf_local_files_only,
-        ))
+        files = _gene_finding_chr20_remote_parquets()
+        print("Resolving exact T2T chr20 gene-finding parquet blocks only:")
+        for f in files:
+            print(f"  {f}")
+        for filename in tqdm(files, desc="download/reuse gene-finding chr20 parquet blocks"):
+            parquet_paths.append(Path(_download_or_reuse_hf_file(
+                repo_id="AIRI-Institute/genatator-gene-finding-dataset",
+                filename=filename,
+                repo_type="dataset",
+                local_files_only=hf_local_files_only,
+            )))
 
-    row = _read_one_parquet_row(parquet_path)
-    dna = str(row["dna_sequence"])
-    n = min(len(dna), keep_len)
-    row["dna_sequence"] = dna[:n]
-    row["targets"] = row["targets"][:n]
+    index_rows = []
+    for parquet_path in tqdm(parquet_paths, desc="inspect gene-finding parquet metadata"):
+        meta = _read_gene_finding_parquet_metadata(parquet_path)
+        chrom = str(meta.get("chrom", meta.get("chromosome", "")))
+        if chrom != DEFAULT_GF_CHROM:
+            raise RuntimeError(f"Gene-finding parquet is not {DEFAULT_GF_CHROM}: path={parquet_path} metadata_chrom={chrom}")
+        index_rows.append({"parquet_path": str(parquet_path), "metadata": _json_safe(meta)})
 
-    meta = _metadata_dict(row)
-    meta["start"] = int(meta.get("start", 0))
-    meta["end"] = int(meta["start"] + n)
-    row["metadata"] = meta
-    row = _json_safe(row)
-
-    chrom = str(meta.get("chrom", meta.get("chromosome", "")))
-    if CHR20_ALIASES and chrom and chrom not in CHR20_ALIASES:
-        print(f"Warning: cached gene-finding row chrom={chrom!r} is not in current chr20 aliases {CHR20_ALIASES}")
+    index_rows.sort(key=lambda r: int(_metadata_dict(r).get("start", 0)))
+    starts = [int(_metadata_dict(r).get("start", 0)) for r in index_rows]
+    ends = [int(_metadata_dict(r).get("end", 0)) for r in index_rows]
+    assembled_len = max(ends) - min(starts)
+    chrom_len = max(int(_metadata_dict(r).get("chrom_length", 0) or 0) for r in index_rows)
     with out.open("w", encoding="utf-8") as fh:
-        fh.write(json.dumps(row) + "\n")
-    print(f"Saved persistent real gene-finding smoke cache: {out} kept_len={n} chrom={chrom} source_parquet={parquet_path}")
+        for row in index_rows:
+            fh.write(json.dumps(row) + "\n")
+    print(
+        f"Saved persistent real gene-finding full-chromosome parquet index: {out} "
+        f"blocks={len(index_rows)} assembled_total_length={assembled_len} chrom_length_metadata={chrom_len}"
+    )
+    if assembled_len < 60_000_000:
+        raise RuntimeError(
+            f"Gene-finding smoke index assembled length is unexpectedly short: {assembled_len}. "
+            f"Expected full chr20 around {DEFAULT_GF_CHROM_LENGTH}."
+        )
     return out
-
 
 def _read_segmentation_rows_from_parquet(parquet_path: Path, keep_len: int, max_rows: int, batch_size: int = 16) -> list[dict]:
     """Read only a few real chr20 transcript rows from one parquet file.
@@ -452,7 +492,7 @@ def finding_data(cache_path: Path, max_nt: int, max_tok: int, inference_subset: 
         "max_tokens": max_tok,
         "overlap": 0.5,
         "target_group": "primary",
-        "max_rows": 1,
+        "max_rows": None,
         "max_windows": 1 if inference_subset else 2,
         "streaming": False,
     }
