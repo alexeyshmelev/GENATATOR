@@ -401,7 +401,7 @@ class ChromosomeAssembly:
         self.end = max(m.end for _, m in self.rows)
         self.length = self.end - self.start
         self.chrom_length = max(m.chrom_length for _, m in self.rows)
-        logger.info("[finding.assembly] genome=%s chrom=%s blocks=%d start=%d end=%d assembled_length=%d reported_chrom_length=%d", key[0], key[1], len(self.rows), self.start, self.end, self.length, self.chrom_length)
+        logger.info("[finding.assembly] genome=%s chrom=%s blocks=%d start=%d end=%d assembled_total_length=%d chrom_length_metadata=%d", key[0], key[1], len(self.rows), self.start, self.end, self.length, self.chrom_length)
 
     def get_slice(self, rel_start: int, rel_end: int, target_indices: List[int]) -> Tuple[str, np.ndarray, ParsedMetadata, int]:
         abs_start = self.start + rel_start
@@ -450,7 +450,6 @@ class GenatatorDataset(torch.utils.data.Dataset):
             self._build_finding_windows()
         else:
             self._build_transcript_indices()
-            self._log_transcript_selection()
         max_windows = cfg.get("max_windows")
         if max_windows:
             self.windows = self.windows[: int(max_windows)]
@@ -469,24 +468,17 @@ class GenatatorDataset(torch.utils.data.Dataset):
 
     def _build_transcript_indices(self) -> None:
         self.windows = list(self.row_indices)
-
-    def _log_transcript_selection(self) -> None:
-        counts: Dict[str, int] = {}
-        total_bp: Dict[str, int] = {}
-        types: Dict[str, int] = {}
+        by_chrom: Dict[str, Dict[str, int]] = {}
         for row_i in self.row_indices:
             meta = parse_metadata(self.raw["metadata"][row_i])
             chrom = meta.chrom or "<empty>"
-            counts[chrom] = counts.get(chrom, 0) + 1
-            types[meta.transcript_type or "<empty>"] = types.get(meta.transcript_type or "<empty>", 0) + 1
-            try:
-                seq_len = len(str(self.raw["dna_sequence"][row_i]))
-            except Exception:
-                seq_len = max(0, int(meta.end) - int(meta.start))
-            total_bp[chrom] = total_bp.get(chrom, 0) + int(seq_len)
-        top_counts = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:20]
-        top_bp = sorted(total_bp.items(), key=lambda kv: (-kv[1], kv[0]))[:20]
-        logger.info("[transcript.selection] task=%s selected_transcripts=%d by_chrom=%s total_transcript_nt_by_chrom=%s transcript_types=%s", self.task, len(self.row_indices), top_counts, top_bp, sorted(types.items(), key=lambda kv: (-kv[1], kv[0]))[:20])
+            d = by_chrom.setdefault(chrom, {"count": 0, "min_start": None, "max_end": None})
+            d["count"] += 1
+            d["min_start"] = meta.start if d["min_start"] is None else min(d["min_start"], meta.start)
+            d["max_end"] = meta.end if d["max_end"] is None else max(d["max_end"], meta.end)
+        for chrom, d in sorted(by_chrom.items()):
+            span = int(d["max_end"] - d["min_start"]) if d["min_start"] is not None and d["max_end"] is not None else 0
+            logger.info("[transcript.selection] task=%s chrom=%s transcripts_found=%d metadata_min_start=%s metadata_max_end=%s metadata_span=%d", self.task, chrom, d["count"], d["min_start"], d["max_end"], span)
 
     def __len__(self) -> int:
         return len(self.windows)

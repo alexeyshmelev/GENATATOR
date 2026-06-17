@@ -14,6 +14,7 @@ from .config import local_or_remote
 from .legacy_caduceus import CaduceusMiddleLossTokenClassifier, CaduceusTranscriptTypeMiddleLossClassifier, infer_caduceus_hidden_size
 from .legacy_rmt import RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater
 from .token_models import PlainTokenClassifier, TokenClassifierWithUNet, TranscriptTypeClassifier
+from .torch_compat import allow_transformers_torch_load_on_legacy_torch
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,8 @@ def build_model(cfg: Dict[str, Any], task: str):
     backbone_kind = model_cfg.get("backbone_kind", family)
     backbone_path = local_or_remote(model_cfg["backbone_path"])
     trust_remote_code = bool(model_cfg.get("trust_remote_code", True))
+    allow_unsafe_torch_load = bool(model_cfg.get("allow_unsafe_torch_load_with_torch_lt_2_6", True))
+    allow_transformers_torch_load_on_legacy_torch(allow_unsafe_torch_load, context=f"build_model:{family}:{backbone_path}")
     num_labels = _num_labels_for_task(task)
     logger.info("[build_model] task=%s family=%s backbone_kind=%s backbone_path=%s num_labels=%d", task, family, backbone_kind, backbone_path, num_labels)
 
@@ -43,9 +46,9 @@ def build_model(cfg: Dict[str, Any], task: str):
         if backbone_kind not in {"gena", "moderngena"}:
             raise RuntimeError(f"plain family is for GENA/ModernGENA only, got backbone_kind={backbone_kind}")
         if task == "transcript_type":
-            model = TranscriptTypeClassifier(backbone_path, backbone_kind, trust_remote_code=trust_remote_code)
+            model = TranscriptTypeClassifier(backbone_path, backbone_kind, trust_remote_code=trust_remote_code, allow_unsafe_torch_load=allow_unsafe_torch_load)
         else:
-            model = PlainTokenClassifier(backbone_path, backbone_kind, num_labels=num_labels, trust_remote_code=trust_remote_code)
+            model = PlainTokenClassifier(backbone_path, backbone_kind, num_labels=num_labels, trust_remote_code=trust_remote_code, allow_unsafe_torch_load=allow_unsafe_torch_load)
 
     elif family == "unet":
         if backbone_kind not in {"gena", "moderngena"}:
@@ -58,6 +61,7 @@ def build_model(cfg: Dict[str, Any], task: str):
             nucleotide_vocab_size=int(model_cfg.get("nucleotide_vocab_size", 1000)),
             unet_cycles=int(model_cfg.get("unet_cycles", 1)),
             unet_channels=model_cfg.get("unet_channels"),
+            allow_unsafe_torch_load=allow_unsafe_torch_load,
         )
 
     elif family == "rmt":
@@ -65,7 +69,7 @@ def build_model(cfg: Dict[str, Any], task: str):
             raise RuntimeError(f"RMT is allowed only for GENA/ModernGENA, got backbone_kind={backbone_kind}")
         if "_tokenizer" not in cfg:
             raise RuntimeError("RMT build requires cfg['_tokenizer'] set by train/infer entrypoint")
-        base_model = HiddenStateBackbone(backbone_path, backbone_kind, trust_remote_code=trust_remote_code, modernbert_num_labels=num_labels)
+        base_model = HiddenStateBackbone(backbone_path, backbone_kind, trust_remote_code=trust_remote_code, modernbert_num_labels=num_labels, allow_unsafe_torch_load=allow_unsafe_torch_load)
         rmt_kwargs = dict(model_cfg.get("rmt", {}))
         rmt_kwargs.update({
             "tokenizer": cfg["_tokenizer"],
@@ -88,6 +92,7 @@ def build_model(cfg: Dict[str, Any], task: str):
             nucleotide_vocab_size=int(model_cfg.get("nucleotide_vocab_size", 1000)),
             unet_cycles=int(model_cfg.get("unet_cycles", 1)),
             unet_channels=model_cfg.get("unet_channels"),
+            allow_unsafe_torch_load=allow_unsafe_torch_load,
             **model_cfg.get("amt", {}),
         )
     else:

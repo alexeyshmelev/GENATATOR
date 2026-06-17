@@ -193,7 +193,7 @@ logger.info(
     post.get("interval_window_size", 2_000_000), post.get("max_pairs_per_seed", 10), post.get("prob_threshold", 0.5),
     post.get("zero_fraction_drop_threshold", 0.01), post.get("pairing_progress_every"),
 )
-for chrom in tqdm(sorted(edge_tracks), desc="postprocess:gene_finding"):
+for chrom in sorted(edge_tracks):
     if chrom not in region_tracks:
         raise RuntimeError(f"Region tracks missing chromosome {chrom}")
     edge = edge_tracks[chrom]
@@ -258,6 +258,7 @@ for chrom in tqdm(sorted(edge_tracks), desc="postprocess:gene_finding"):
     records.extend(chrom_records)
 
 out_gff = cfg["inference"]["output_gff"]
+logger.info("Writing gene-finding prediction GFF with %d transcript intervals; each interval is represented as one full-length exon for boundary evaluation.", len(records))
 write_finding_gff(records, out_gff)
 
 if cfg["inference"].get("true_gff"):

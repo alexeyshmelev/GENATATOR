@@ -452,26 +452,74 @@ The `postprocess` JSON block supports:
 
 These parameters correspond to the FFT low-pass fraction, peak prominence, peak distance, optional peak height, maximum TSS/PolyA pairing distance, maximum nearest PolyA partners per TSS seed, intragenic probability threshold, maximum allowed non-intragenic fraction inside a candidate interval, and optional logging interval for peak pairing.
 
-## v15 fixes: legacy torch, chromosome-specific smoke caches, and GFF assumptions
+## v15 notes: torch 2.2.2, chromosome-only smoke data, and GFF conventions
 
-### Loading GENA backbones with torch 2.2.2
+### Loading GENA checkpoints with torch 2.2.2
 
-Some GENA checkpoints are still distributed through `pytorch_model.bin`. New Transformers versions block `torch.load`-based checkpoint loading under torch < 2.6 because of CVE-2025-32434. This repository now logs an explicit `[legacy_torch_load]` warning and patches the Transformers guard only for the trusted GENA backbone-loading path, so environments pinned to `torch==2.2.2+cu121` can still run. Prefer safetensors checkpoints when available.
+Several GENA checkpoints are distributed as legacy PyTorch `.bin` weights. Newer
+`transformers` releases block those files when `torch < 2.6` is installed. This
+repository keeps compatibility with `torch==2.2.2+cu121` by explicitly patching
+Transformers' safety gate before `from_pretrained(...)` when the model config has:
 
-### Gene-finding GFF construction
+```json
+"allow_unsafe_torch_load_with_torch_lt_2_6": true
+```
 
-Gene finding predicts transcript boundaries only. It does not predict exon-intron structure. Therefore, the prediction GFF for gene-finding evaluation is genome-oriented and represents every predicted transcript interval as one `gene`, one `mRNA`/`lnc_RNA` transcript row, and one `exon` spanning the whole predicted interval. This is intentional: the annotation leaderboard can score TSS/PolyA boundary localization from the transcript interval, while true exon/CDS segmentation is evaluated separately by the segmentation task.
+This is enabled in the shipped configs because the requested runtime is pinned to
+torch 2.2.2. The code logs a warning every time this compatibility path is active.
+Use only trusted backbone repositories when this option is enabled.
 
-### Segmentation GFF construction
 
-Segmentation prediction GFFs remain transcript-coordinate annotations. The `seqid` column is the transcript ID, not a chromosome name. The model input is expected to be the DNA sequence of one transcript, without intergenic sequence, neighboring genes, or other chromosome context.
+### GENA hidden-state extraction
 
-### Smoke-test chromosome extraction and progress reporting
+Some GENA checkpoints load as `BertForMaskedLM` through the remote-code `AutoModel` mapping.
+For those checkpoints, `out.logits` has shape `(batch, tokens, vocab_size)` and must not be
+used as the downstream hidden representation. The backbone adapter now explicitly uses
+`last_hidden_state` when available, otherwise `hidden_states[-1]`, and logs a detailed shape
+error if neither matches the configured hidden size.
 
-Smoke tests now print exactly how chr20 data are selected:
+### Gene-finding GFF output
 
-- gene finding uses one exact parquet shard whose filename contains `NC_060944.1`, then prints the source row length and the kept cache length;
-- segmentation/transcript-type use only `val-human/data.parquet` by default, scan only `metadata/status` first, print the number of transcript rows whose metadata match `NC_060944.1`/`chr20`/`20`, print the total metadata span for those rows, and then read `dna_sequence/labels` only for the selected rows;
-- tqdm progress bars are shown for metadata scanning, selected-row reading, training, validation, inference, and gene-finding peak post-processing.
+Gene-finding edge/region models predict transcript boundaries and intragenic
+coverage, not exon-intron structure. For GFF-based boundary evaluation, every
+predicted TSS/PolyA interval is therefore written as:
 
-Smoke tests never download `train-human` or `train-multi-specie` unless you explicitly pass a different local or remote parquet path.
+```text
+gene
+mRNA or lnc_RNA
+one exon spanning the full predicted transcript interval
+```
+
+This is intentional. The gene-finding leaderboard can then assess TSS/PolyA
+boundary localization through the transcript interval, while true exon/CDS
+segmentation is evaluated separately by the segmentation task.
+
+Gene-finding inference also computes whole-chromosome PR-AUC at nucleotide
+resolution before GFF post-processing. Edge PR-AUC is reported for TSS+, TSS-,
+PolyA+, and PolyA-. Region PR-AUC is reported for Intragenic+ and Intragenic-.
+
+### Segmentation GFF output
+
+Segmentation prediction GFFs are transcript-coordinate files. The `seqid` column
+is the transcript ID, not a chromosome. This follows the official segmentation
+metric assumption: each model receives only the DNA sequence of an individual
+transcript, without intergenic sequence or neighboring genes.
+
+### Smoke-test data extraction
+
+Smoke tests must stay on T2T human chromosome 20 only. The smoke runner now:
+
+1. downloads or reuses exactly one gene-finding chr20 parquet file whose filename
+   contains `NC_060944.1`;
+2. downloads or reuses only `val-human/data.parquet` for segmentation/transcript
+   smoke rows;
+3. scans the segmentation parquet in small PyArrow batches with a tqdm progress
+   bar;
+4. selects only rows whose metadata chromosome matches `NC_060944.1`, `chr20`, or
+   `20`;
+5. immediately trims each selected row before writing the persistent JSONL smoke
+   cache;
+6. prints the number of selected chr20 transcripts and, during dataset loading,
+   prints transcript metadata spans and finding assembled chromosome lengths.
+
+The smoke path never auto-downloads `train-human` or `train-multi-specie`.

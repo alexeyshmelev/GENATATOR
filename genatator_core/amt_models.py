@@ -13,6 +13,7 @@ from transformers.modeling_outputs import TokenClassifierOutput
 from .backbones import HiddenStateBackbone
 from .config import local_or_remote
 from .unet import UNET1DSegmentationHead
+from .torch_compat import allow_transformers_torch_load_on_legacy_torch
 
 logger = logging.getLogger(__name__)
 
@@ -37,15 +38,16 @@ class AMTTokenClassifier(nn.Module):
     named `amt_repo_id` throughout this repository. No parameters are frozen.
     """
 
-    def __init__(self, backbone_path: str, backbone_kind: str, num_labels: int, trust_remote_code: bool = True, amt_repo_id: str = "irodkin/armt-neox-tiny", use_unet: bool = False, nucleotide_vocab_size: int = 1000, unet_cycles: int = 1, unet_channels=None, **amt_kwargs):
+    def __init__(self, backbone_path: str, backbone_kind: str, num_labels: int, trust_remote_code: bool = True, amt_repo_id: str = "irodkin/armt-neox-tiny", use_unet: bool = False, nucleotide_vocab_size: int = 1000, unet_cycles: int = 1, unet_channels=None, allow_unsafe_torch_load: bool = True, **amt_kwargs):
         super().__init__()
         if backbone_kind not in {"gena", "moderngena"}:
             raise RuntimeError(f"AMT is allowed only for GENA/ModernGENA, got backbone_kind={backbone_kind}")
-        self.hidden_backbone = HiddenStateBackbone(backbone_path, backbone_kind=backbone_kind, trust_remote_code=trust_remote_code, modernbert_num_labels=num_labels)
+        self.hidden_backbone = HiddenStateBackbone(backbone_path, backbone_kind=backbone_kind, trust_remote_code=trust_remote_code, modernbert_num_labels=num_labels, allow_unsafe_torch_load=allow_unsafe_torch_load)
         self.hidden_size = self.hidden_backbone.hidden_size
         self.num_labels = int(num_labels)
         self.use_unet = bool(use_unet)
 
+        allow_transformers_torch_load_on_legacy_torch(allow_unsafe_torch_load, context=f"AMT:{amt_repo_id}")
         loaded = AutoModelForCausalLM.from_pretrained(local_or_remote(amt_repo_id), trust_remote_code=True)
         amt_mod = importlib.import_module(loaded.__class__.__module__)
         AssociativeMemoryCell = getattr(amt_mod, "AssociativeMemoryCell")

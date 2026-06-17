@@ -5,7 +5,8 @@
     "backbone_path": "AIRI-Institute/moderngena-base",
     "tokenizer_path": "AIRI-Institute/moderngena-base",
     "trust_remote_code": true,
-    "checkpoint_path": null
+    "checkpoint_path": null,
+    "allow_unsafe_torch_load_with_torch_lt_2_6": true
   },
   "dataset": {
     "path": "AIRI-Institute/genatator-gene-segmentation-dataset",

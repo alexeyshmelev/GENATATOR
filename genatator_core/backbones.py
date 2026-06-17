@@ -5,48 +5,14 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from packaging import version
 from transformers import AutoModel, ModernBertForTokenClassification
 from transformers.modeling_outputs import TokenClassifierOutput
 
 from .config import local_or_remote
+from .torch_compat import allow_transformers_torch_load_on_legacy_torch
 
 logger = logging.getLogger(__name__)
 
-
-def allow_transformers_bin_loading_on_legacy_torch(*, context: str) -> None:
-    """Allow trusted legacy PyTorch `.bin` checkpoints under torch<2.6.
-
-    Transformers now blocks `torch.load`-based checkpoint files when torch<2.6
-    because of CVE-2025-32434. The user explicitly requested keeping
-    torch==2.2.2+cu121. GENA checkpoints may still be distributed as
-    pytorch_model.bin, so we patch the Transformers guard for this trusted
-    backbone-loading path and log it loudly instead of failing silently.
-    """
-    torch_version = version.parse(torch.__version__.split("+")[0])
-    if torch_version >= version.parse("2.6.0"):
-        return
-    try:
-        import transformers.modeling_utils as modeling_utils
-        import transformers.utils.import_utils as import_utils
-    except Exception as exc:
-        raise RuntimeError(f"Could not import Transformers internals to support legacy torch checkpoint loading for {context}: {exc}") from exc
-
-    def _logged_noop_check_torch_load_is_safe():
-        logger.warning(
-            "[legacy_torch_load] Transformers safety guard for torch.load is bypassed for %s because torch=%s < 2.6 and the environment must keep this torch version. Use only trusted checkpoints or safetensors.",
-            context,
-            torch.__version__,
-        )
-        return None
-
-    import_utils.check_torch_load_is_safe = _logged_noop_check_torch_load_is_safe
-    modeling_utils.check_torch_load_is_safe = _logged_noop_check_torch_load_is_safe
-    logger.warning(
-        "[legacy_torch_load] Enabled trusted `.bin` checkpoint loading for %s under torch=%s. This is required for GENA backbones without safetensors in the current environment.",
-        context,
-        torch.__version__,
-    )
 
 def infer_hidden_size(config: Any, *, context: str) -> int:
     for name in ("hidden_size", "d_model", "n_embd", "embed_dim"):
@@ -105,11 +71,12 @@ class HiddenStateBackbone(nn.Module):
     All backbone parameters stay trainable. This class never freezes anything.
     """
 
-    def __init__(self, backbone_path: str, backbone_kind: str, trust_remote_code: bool = True, modernbert_num_labels: int = 2):
+    def __init__(self, backbone_path: str, backbone_kind: str, trust_remote_code: bool = True, modernbert_num_labels: int = 2, allow_unsafe_torch_load: bool = True):
         super().__init__()
         self.backbone_kind = backbone_kind
         self.backbone_path = local_or_remote(backbone_path)
         self.trust_remote_code = trust_remote_code
+        allow_transformers_torch_load_on_legacy_torch(allow_unsafe_torch_load, context=f"HiddenStateBackbone:{backbone_kind}:{self.backbone_path}")
         if backbone_kind == "moderngena":
             logger.info("[backbone] loading ModernGENA through ModernBertForTokenClassification: %s", self.backbone_path)
             self.owner = ModernBertForTokenClassification.from_pretrained(
@@ -128,10 +95,19 @@ class HiddenStateBackbone(nn.Module):
             self.config = self.owner.config
         elif backbone_kind == "gena":
             logger.info("[backbone] loading GENA AutoModel: %s", self.backbone_path)
-            allow_transformers_bin_loading_on_legacy_torch(context=f"GENA backbone {self.backbone_path}")
-            self.encoder = AutoModel.from_pretrained(self.backbone_path, trust_remote_code=trust_remote_code)
-            self.owner = self.encoder
-            self.config = self.encoder.config
+            raw = AutoModel.from_pretrained(self.backbone_path, trust_remote_code=trust_remote_code)
+            self.owner = raw
+            self.config = raw.config
+            # Some released GENA checkpoints expose a masked-language-model class through
+            # AutoModel. Its first output is vocabulary logits [B, T, vocab_size], not
+            # hidden states. For fine-tuning we must use the internal encoder hidden
+            # states. If a `.bert` encoder exists, use it directly and log this choice.
+            if hasattr(raw, "bert"):
+                self.encoder = raw.bert
+                logger.info("[backbone] GENA AutoModel class=%s contains `.bert`; using internal BertModel encoder for hidden states", type(raw).__name__)
+            else:
+                self.encoder = raw
+                logger.info("[backbone] GENA AutoModel class=%s used directly as hidden-state encoder", type(raw).__name__)
         else:
             raise RuntimeError(f"HiddenStateBackbone supports only backbone_kind='gena' or 'moderngena', got {backbone_kind}")
         self.hidden_size = infer_hidden_size(self.config, context=f"HiddenStateBackbone:{backbone_kind}")
@@ -161,7 +137,27 @@ class HiddenStateBackbone(nn.Module):
         if self.backbone_kind == "gena":
             common["token_type_ids"] = token_type_ids
         out = self.encoder(**common)
-        hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+        hidden_states = getattr(out, "hidden_states", None)
+        hidden = getattr(out, "last_hidden_state", None)
+        if hidden is None:
+            first = out[0] if isinstance(out, (tuple, list)) or hasattr(out, "__getitem__") else None
+            if first is not None and getattr(first, "shape", None) is not None and first.shape[-1] == self.hidden_size:
+                hidden = first
+            elif hidden_states is not None and len(hidden_states) > 0:
+                hidden = hidden_states[-1]
+                logger.info("[backbone.forward] using hidden_states[-1] because first output is not hidden-sized")
+            else:
+                raise RuntimeError(
+                    f"Backbone did not return hidden states with hidden_size={self.hidden_size}. "
+                    f"Output type={type(out).__name__}"
+                )
         if hidden.shape[-1] != self.hidden_size:
-            raise RuntimeError(f"Backbone emitted hidden width {hidden.shape[-1]}, expected {self.hidden_size}")
-        return TokenClassifierOutput(loss=None, logits=hidden, hidden_states=getattr(out, "hidden_states", None), attentions=getattr(out, "attentions", None))
+            if hidden_states is not None and len(hidden_states) > 0 and hidden_states[-1].shape[-1] == self.hidden_size:
+                logger.info(
+                    "[backbone.forward] first hidden candidate had width %d; using hidden_states[-1] width %d instead",
+                    hidden.shape[-1], hidden_states[-1].shape[-1],
+                )
+                hidden = hidden_states[-1]
+            else:
+                raise RuntimeError(f"Backbone emitted hidden width {hidden.shape[-1]}, expected {self.hidden_size}")
+        return TokenClassifierOutput(loss=None, logits=hidden, hidden_states=hidden_states, attentions=getattr(out, "attentions", None))

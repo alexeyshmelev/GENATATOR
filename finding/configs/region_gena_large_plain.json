@@ -6,7 +6,8 @@
     "backbone_path": "AIRI-Institute/gena-lm-bert-large-t2t",
     "tokenizer_path": "AIRI-Institute/gena-lm-bert-large-t2t",
     "trust_remote_code": true,
-    "checkpoint_path": null
+    "checkpoint_path": null,
+    "allow_unsafe_torch_load_with_torch_lt_2_6": true
   },
   "train_dataset": {
     "path": "AIRI-Institute/genatator-gene-finding-dataset",

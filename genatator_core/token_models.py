@@ -17,9 +17,9 @@ logger = logging.getLogger(__name__)
 class PlainTokenClassifier(nn.Module):
     """Token-level classifier for GENA/ModernGENA without RMT/AMT/UNET."""
 
-    def __init__(self, backbone_path: str, backbone_kind: str, num_labels: int, trust_remote_code: bool = True):
+    def __init__(self, backbone_path: str, backbone_kind: str, num_labels: int, trust_remote_code: bool = True, allow_unsafe_torch_load: bool = True):
         super().__init__()
-        self.hidden_backbone = HiddenStateBackbone(backbone_path, backbone_kind, trust_remote_code=trust_remote_code, modernbert_num_labels=num_labels)
+        self.hidden_backbone = HiddenStateBackbone(backbone_path, backbone_kind, trust_remote_code=trust_remote_code, modernbert_num_labels=num_labels, allow_unsafe_torch_load=allow_unsafe_torch_load)
         self.hidden_size = self.hidden_backbone.hidden_size
         self.num_labels = int(num_labels)
         self.classifier = nn.Linear(self.hidden_size, self.num_labels)
@@ -46,9 +46,9 @@ class TokenClassifierWithUNet(nn.Module):
     Batch size is intentionally restricted to 1.
     """
 
-    def __init__(self, backbone_path: str, backbone_kind: str, num_labels: int, trust_remote_code: bool = True, nucleotide_vocab_size: int = 1000, unet_cycles: int = 1, unet_channels=None):
+    def __init__(self, backbone_path: str, backbone_kind: str, num_labels: int, trust_remote_code: bool = True, nucleotide_vocab_size: int = 1000, unet_cycles: int = 1, unet_channels=None, allow_unsafe_torch_load: bool = True):
         super().__init__()
-        self.hidden_backbone = HiddenStateBackbone(backbone_path, backbone_kind, trust_remote_code=trust_remote_code, modernbert_num_labels=num_labels)
+        self.hidden_backbone = HiddenStateBackbone(backbone_path, backbone_kind, trust_remote_code=trust_remote_code, modernbert_num_labels=num_labels, allow_unsafe_torch_load=allow_unsafe_torch_load)
         self.hidden_size = self.hidden_backbone.hidden_size
         self.num_labels = int(num_labels)
         self.unet_cycles = int(unet_cycles)
@@ -95,9 +95,9 @@ class TokenClassifierWithUNet(nn.Module):
 class TranscriptTypeClassifier(nn.Module):
     """GENA/ModernGENA transcript-type classifier without RMT/AMT/UNET."""
 
-    def __init__(self, backbone_path: str, backbone_kind: str, trust_remote_code: bool = True):
+    def __init__(self, backbone_path: str, backbone_kind: str, trust_remote_code: bool = True, allow_unsafe_torch_load: bool = True):
         super().__init__()
-        self.hidden_backbone = HiddenStateBackbone(backbone_path, backbone_kind, trust_remote_code=trust_remote_code, modernbert_num_labels=1)
+        self.hidden_backbone = HiddenStateBackbone(backbone_path, backbone_kind, trust_remote_code=trust_remote_code, modernbert_num_labels=1, allow_unsafe_torch_load=allow_unsafe_torch_load)
         self.hidden_size = self.hidden_backbone.hidden_size
         self.classifier = nn.Linear(self.hidden_size, 1)
         logger.info("[TranscriptTypeClassifier] backbone=%s hidden=%d labels=1", backbone_kind, self.hidden_size)
