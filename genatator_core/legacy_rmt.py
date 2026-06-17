@@ -94,13 +94,13 @@ class RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater(nn.Module
         self.num_mem_tokens = num_mem_tokens
         self.register_buffer("mem_token_ids", torch.arange(vocab_size, extended_vocab_size, dtype=torch.long))
         self.model.resize_token_embeddings(extended_vocab_size)
-        self.model.embeddings = get_word_embeddings(self.model, context="RMT.extend_word_embeddings.after")
+        _ = get_word_embeddings(self.model, context="RMT.extend_word_embeddings.after")
         self.memory_position = range(1, 1 + num_mem_tokens)
         logger.info("[RMT] extended embeddings: old_vocab=%d new_vocab=%d hidden=%d", vocab_size, extended_vocab_size, hidden)
 
     def set_memory(self, memory=None):
         if memory is None:
-            memory = self.model.embeddings(self.mem_token_ids)
+            memory = get_word_embeddings(self.model, context="RMT.memory_embeddings")(self.mem_token_ids)
         return memory
 
     def get_attention_mask(self, tensor):
@@ -187,7 +187,7 @@ class RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater(nn.Module
             seg_input_ids = torch.stack([s for s in segment_input_ids if s is not None])
             seg_attention_mask = self.get_attention_mask(seg_input_ids)
             seg_token_type_ids = self.get_token_type_ids(seg_input_ids)
-            seg_inputs_embeds = self.model.embeddings(seg_input_ids)
+            seg_inputs_embeds = get_word_embeddings(self.model, context="RMT.forward_embeddings")(seg_input_ids)
             seg_inputs_embeds[:, self.memory_position] = memory[non_empty_mask]
             out = self.model(input_ids=None, inputs_embeds=seg_inputs_embeds, attention_mask=seg_attention_mask, token_type_ids=seg_token_type_ids, output_hidden_states=True, return_dict=True)
             memory[non_empty_mask] = out.hidden_states[-1][:, self.memory_position]

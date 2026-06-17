@@ -70,6 +70,7 @@ def tiny_training(output_dir: str, metric: str, bs: int) -> dict:
         "bf16": False,
         "fp16": False,
         "resume_from_checkpoint": None,
+        "save_safetensors": False,
     }
 
 
@@ -214,15 +215,26 @@ def _read_one_parquet_row(parquet_path: Path) -> dict:
     return dict(rows[0])
 
 
-def _gene_finding_chr20_remote_parquets(chrom_length: int = DEFAULT_GF_CHROM_LENGTH, chunk_size: int = DEFAULT_GF_CHUNK_SIZE) -> list[str]:
-    files = []
-    for start in range(0, int(chrom_length), int(chunk_size)):
-        end = start + int(chunk_size)
-        files.append(
-            "data/test/part-00000/"
-            f"{DEFAULT_GF_ASSEMBLY}__{DEFAULT_GF_CHROM}__{start:012d}_{end:012d}.parquet"
-        )
-    return files
+def _gene_finding_chr20_remote_parquets() -> list[str]:
+    # Keep this list explicit. The last released T2T chr20 block ends at
+    # 66,210,255, not at the next 10 Mb boundary. Generating filenames by
+    # rounding to 70,000,000 produces a non-existent HF object and a 404.
+    # These are the only files smoke tests are allowed to touch for
+    # gene-finding on NC_060944.1.
+    starts_ends = [
+        (0, 10_000_000),
+        (10_000_000, 20_000_000),
+        (20_000_000, 30_000_000),
+        (30_000_000, 40_000_000),
+        (40_000_000, 50_000_000),
+        (50_000_000, 60_000_000),
+        (60_000_000, DEFAULT_GF_CHROM_LENGTH),
+    ]
+    return [
+        "data/test/part-00000/"
+        f"{DEFAULT_GF_ASSEMBLY}__{DEFAULT_GF_CHROM}__{start:012d}_{end:012d}.parquet"
+        for start, end in starts_ends
+    ]
 
 
 def _read_gene_finding_parquet_metadata(parquet_path: Path) -> dict:
@@ -260,11 +272,21 @@ def prepare_gene_finding_smoke_cache(
         starts = [int(_metadata_dict(r).get("start", 0)) for r in rows]
         ends = [int(_metadata_dict(r).get("end", 0)) for r in rows]
         chroms = sorted({str(_metadata_dict(r).get("chrom", "")) for r in rows})
+        assembled_existing = max(ends) - min(starts) if rows else 0
         print(
-            f"Using persistent real gene-finding full-chromosome parquet index: {out} "
-            f"blocks={len(rows)} chroms={chroms} assembled_total_length={max(ends)-min(starts) if rows else 0}"
+            f"Found persistent gene-finding parquet index: {out} "
+            f"blocks={len(rows)} chroms={chroms} assembled_total_length={assembled_existing}"
         )
-        return out
+        expected_blocks = len(_gene_finding_chr20_remote_parquets())
+        if len(rows) == expected_blocks and assembled_existing >= DEFAULT_GF_CHROM_LENGTH:
+            print(f"Using persistent real gene-finding full-chromosome parquet index: {out}")
+            return out
+        print(
+            "Existing gene-finding smoke index is stale or incomplete; rebuilding it. "
+            f"Expected blocks={expected_blocks} and assembled length >= {DEFAULT_GF_CHROM_LENGTH}, "
+            f"got blocks={len(rows)} assembled_total_length={assembled_existing}."
+        )
+        out.unlink()
 
     print(
         "Preparing persistent real gene-finding smoke cache as a full-chromosome parquet index.\n"
@@ -317,10 +339,10 @@ def prepare_gene_finding_smoke_cache(
         f"Saved persistent real gene-finding full-chromosome parquet index: {out} "
         f"blocks={len(index_rows)} assembled_total_length={assembled_len} chrom_length_metadata={chrom_len}"
     )
-    if assembled_len < 60_000_000:
+    if assembled_len < DEFAULT_GF_CHROM_LENGTH:
         raise RuntimeError(
             f"Gene-finding smoke index assembled length is unexpectedly short: {assembled_len}. "
-            f"Expected full chr20 around {DEFAULT_GF_CHROM_LENGTH}."
+            f"Expected full {DEFAULT_GF_CHROM} length {DEFAULT_GF_CHROM_LENGTH}."
         )
     return out
 
@@ -480,6 +502,13 @@ def prepare_segmentation_smoke_cache(
     print(f"Saved persistent real segmentation/transcript-type smoke cache: {out} transcripts_found={len(rows)} files={used_files}")
     return out
 
+def _smoke_infer_max_windows():
+    value = os.environ.get("GENATATOR_SMOKE_GF_INFER_MAX_WINDOWS", "4")
+    if value.lower() in {"none", "full", "0"}:
+        return None
+    return int(value)
+
+
 def finding_data(cache_path: Path, max_nt: int, max_tok: int, inference_subset: bool = False) -> dict:
     # Gene-finding smoke tests use a tiny local cache produced from the real HF
     # `test` split. This avoids slow streamed scanning and repeated remote reads.
@@ -493,7 +522,8 @@ def finding_data(cache_path: Path, max_nt: int, max_tok: int, inference_subset: 
         "overlap": 0.5,
         "target_group": "primary",
         "max_rows": None,
-        "max_windows": 1 if inference_subset else 2,
+        "max_windows": _smoke_infer_max_windows() if inference_subset else 2,
+        "parquet_block_cache_size": 1,
         "streaming": False,
     }
 
@@ -736,10 +766,10 @@ def main():
     ap.add_argument("--reference-gff", type=str, required=True, help="Human T2T chr20 reference GFF/GFF3 supplied by the user.")
     ap.add_argument("--work-dir", type=str, default="smoke_tests/runs")
     ap.add_argument("--gene-finding-row-slice", type=str, default="test[286:287]", help="Backward-compatible label only. Smoke loading now uses --gene-finding-remote-parquet or --gene-finding-local-parquet instead of load_dataset split slices.")
-    ap.add_argument("--gene-finding-remote-parquet", type=str, default=DEFAULT_GF_REMOTE_PARQUET, help="Exact parquet file inside the HF gene-finding dataset repo to use for smoke tests. This avoids load_dataset resolver storms.")
+    ap.add_argument("--gene-finding-remote-parquet", type=str, default=DEFAULT_GF_REMOTE_PARQUET, help="Deprecated compatibility option. Gene-finding smoke now resolves all exact NC_060944.1 test parquet blocks automatically.")
     ap.add_argument("--gene-finding-local-parquet", type=str, default=None, help="Optional local parquet file for gene-finding smoke cache creation. Use this to avoid any HF request.")
     ap.add_argument("--hf-local-files-only", action="store_true", help="Do not contact Hugging Face while preparing smoke caches. Requires the exact parquet to be present in the local HF cache, or --gene-finding-local-parquet.")
-    ap.add_argument("--gene-finding-cache-len", type=int, default=1536, help="Number of real nucleotides to keep from the selected gene-finding smoke row.")
+    ap.add_argument("--gene-finding-cache-len", type=int, default=0, help="Deprecated compatibility option. Gene-finding smoke now indexes the full NC_060944.1 chromosome and does not trim DNA/targets into JSONL.")
     ap.add_argument("--segmentation-cache-len", type=int, default=768, help="Number of real nucleotides to keep from each selected transcript-level smoke row.")
     ap.add_argument("--segmentation-cache-rows", type=int, default=2, help="Number of real transcript-level chr20 rows to keep for segmentation/transcript-type smoke tests.")
     ap.add_argument("--segmentation-remote-parquet", type=str, default=DEFAULT_SEGMENTATION_REMOTE_PARQUET, help="Exact parquet file inside the HF segmentation dataset repo to use for smoke tests. Defaults to val-human/data.parquet. The smoke runner never auto-downloads train-human or train-multi-specie shards.")

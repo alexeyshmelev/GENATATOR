@@ -124,8 +124,8 @@ class HiddenStateBackbone(nn.Module):
             raise RuntimeError(f"HiddenStateBackbone supports only backbone_kind='gena' or 'moderngena', got {backbone_kind}")
 
         self.hidden_size = infer_hidden_size(self.config, context=f"HiddenStateBackbone:{backbone_kind}")
-        self.embeddings = get_word_embeddings(self._embedding_source(), context=f"HiddenStateBackbone:{backbone_kind}")
-        _, emb_hidden = infer_vocab_size_from_embeddings(self.embeddings, context=f"HiddenStateBackbone:{backbone_kind}")
+        emb = get_word_embeddings(self._embedding_source(), context=f"HiddenStateBackbone:{backbone_kind}")
+        _, emb_hidden = infer_vocab_size_from_embeddings(emb, context=f"HiddenStateBackbone:{backbone_kind}")
         if emb_hidden != self.hidden_size:
             raise RuntimeError(f"Backbone hidden mismatch: config hidden_size={self.hidden_size}, embedding dim={emb_hidden}")
         logger.info("[backbone] loaded kind=%s hidden_size=%d class=%s", backbone_kind, self.hidden_size, type(self._encoder()).__name__)
@@ -149,8 +149,14 @@ class HiddenStateBackbone(nn.Module):
         if not hasattr(source, "resize_token_embeddings"):
             raise RuntimeError(f"Registered backbone source {type(source).__name__} does not support resize_token_embeddings")
         resized = source.resize_token_embeddings(new_num_tokens)
-        self.embeddings = get_word_embeddings(source, context="HiddenStateBackbone.after_resize")
+        _ = get_word_embeddings(source, context="HiddenStateBackbone.after_resize")
         return resized
+
+    @property
+    def embeddings(self):
+        # Kept as a compatibility property for RMT code. It is intentionally
+        # not a registered submodule, avoiding duplicate shared tensors during save.
+        return get_word_embeddings(self._embedding_source(), context="HiddenStateBackbone.embeddings")
 
     def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, inputs_embeds=None, output_hidden_states=True, return_dict=True, **kwargs):
         common = dict(

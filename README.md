@@ -509,8 +509,7 @@ transcript, without intergenic sequence or neighboring genes.
 
 Smoke tests must stay on T2T human chromosome 20 only. The smoke runner now:
 
-1. downloads or reuses exactly one gene-finding chr20 parquet file whose filename
-   contains `NC_060944.1`;
+1. downloads or reuses exactly seven gene-finding chr20 parquet blocks for `NC_060944.1`; the final block is explicitly `000060000000_000066210255`, not `000060000000_000070000000`;
 2. downloads or reuses only `val-human/data.parquet` for segmentation/transcript
    smoke rows;
 3. scans the segmentation parquet in small PyArrow batches with a tqdm progress
@@ -523,3 +522,15 @@ Smoke tests must stay on T2T human chromosome 20 only. The smoke runner now:
    prints transcript metadata spans and finding assembled chromosome lengths.
 
 The smoke path never auto-downloads `train-human` or `train-multi-specie`.
+
+## v17 smoke-test notes
+
+Gene-finding smoke cache now indexes the full T2T `NC_060944.1` chromosome as seven exact local parquet blocks. The JSONL cache stores only `parquet_path` and metadata for each block, so the full 66 Mb chromosome is assembled from coordinates without storing the whole DNA sequence or `targets` matrix in JSONL or RAM. Dataset logs should show `assembled_total_length` around `66210255` and `chrom_length_metadata=66210255`.
+
+For smoke runtime, training uses only a few windows (`max_windows=2`) even though the chromosome assembly is full. Gene-finding smoke inference uses `GENATATOR_SMOKE_GF_INFER_MAX_WINDOWS=4` by default to remain quick; set `GENATATOR_SMOKE_GF_INFER_MAX_WINDOWS=full` to run inference windows across the full chromosome. Normal non-smoke inference configs can set `max_windows: null` to compute whole-chromosome PR-AUC and GFF metrics.
+
+Trainer checkpoint saving defaults to `save_safetensors=false` to avoid shared-tensor save failures with GENA/ModernGENA wrappers and PyTorch 2.2.2. You can override this in JSON, but `.bin` checkpoints are the safest default in this environment.
+
+## v18 smoke-test fix
+
+The gene-finding chr20 block list is now hard-coded to the released file names. The final block ends at `000066210255`; the code no longer generates a non-existent `000070000000` endpoint. If a stale partial index exists, the smoke runner detects `blocks != 7` or `assembled_total_length < 66210255`, deletes the stale index, and rebuilds it from the exact block list.

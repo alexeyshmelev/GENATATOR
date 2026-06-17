@@ -118,7 +118,7 @@ def train_from_config(config_path: str, task: str) -> None:
         save_strategy="steps",
         save_steps=int(tr.get("save_steps", 1000)),
         save_total_limit=int(tr.get("save_total_limit", 3)),
-        save_safetensors=bool(tr.get("save_safetensors", True)),
+        save_safetensors=bool(tr.get("save_safetensors", False)),
         load_best_model_at_end=bool(tr.get("load_best_model_at_end", False)),
         metric_for_best_model=tr.get("metric_for_best_model"),
         greater_is_better=tr.get("greater_is_better"),
