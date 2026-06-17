@@ -534,3 +534,29 @@ Trainer checkpoint saving defaults to `save_safetensors=false` to avoid shared-t
 ## v18 smoke-test fix
 
 The gene-finding chr20 block list is now hard-coded to the released file names. The final block ends at `000066210255`; the code no longer generates a non-existent `000070000000` endpoint. If a stale partial index exists, the smoke runner detects `blocks != 7` or `assembled_total_length < 66210255`, deletes the stale index, and rebuilds it from the exact block list.
+
+## v19 smoke-test and AMT fixes
+
+The smoke runner now gives a visible but still short training loop. Defaults are:
+
+- `--smoke-train-steps 8`
+- `--smoke-train-windows 16`
+- `--smoke-infer-windows 16`
+- `--segmentation-cache-rows 8`
+
+This replaces the earlier 2-step / 2-window setup, which made tqdm appear almost empty. You can shorten or lengthen the smoke run explicitly from the command line:
+
+```bash
+python smoke_tests/run_smoke.py \
+  --num-gpus 2 \
+  --reference-gff /path/to/chr20.gff \
+  --work-dir smoke_tests/runs \
+  --smoke-cache-dir /path/to/.smoke_real_data_cache \
+  --smoke-train-steps 8 \
+  --smoke-train-windows 16 \
+  --smoke-infer-windows 16
+```
+
+Use `--smoke-infer-windows 0` for full-chromosome gene-finding inference. Training remains short by default even though the gene-finding cache indexes the full `NC_060944.1` chromosome.
+
+AMT loading was also revised to follow the provided AMT/ARMT logic. For ModernGENA, AMT now wraps a real `ModernBertModel` and patches its forward output so `last_hidden_state` is exposed as `.logits`, as expected by the remote AMT implementation. For GENA, AMT now builds the remote `BertForTokenClassification`, transfers pretrained GENA weights, replaces the classifier with `nn.Identity`, and passes that model directly into `AssociativeMemoryCell`. This preserves `get_input_embeddings()` and the internal layer path required by AMT. The default `layers_attr` is `layers` for ModernGENA and `bert.encoder.layer` for GENA, unless overridden in JSON.

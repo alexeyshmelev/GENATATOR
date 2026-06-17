@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import importlib
 import logging
+import types
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import BCEWithLogitsLoss
-from transformers import AutoModelForCausalLM
+from transformers import AutoModel, AutoModelForCausalLM, ModernBertModel
 from transformers.modeling_outputs import TokenClassifierOutput
 
-from .backbones import HiddenStateBackbone
+from .backbones import infer_hidden_size, get_word_embeddings
 from .config import local_or_remote
 from .unet import UNET1DSegmentationHead
 from .torch_compat import allow_transformers_torch_load_on_legacy_torch
@@ -18,43 +19,151 @@ from .torch_compat import allow_transformers_torch_load_on_legacy_torch
 logger = logging.getLogger(__name__)
 
 
-class _BackboneHiddenForMemory(nn.Module):
-    def __init__(self, hidden_backbone: HiddenStateBackbone):
-        super().__init__()
-        self.hidden_backbone = hidden_backbone
-        self.config = hidden_backbone.config
+def _patch_forward_ignore_cache(model: nn.Module) -> None:
+    """AMT may pass cache kwargs. BERT/ModernBERT encoders do not need them."""
+    orig_forward = model.forward
 
-    def forward(self, *args, **kwargs):
+    def _forward(self_, *args, **kwargs):
         kwargs.pop("use_cache", None)
         kwargs.pop("past_key_values", None)
-        return self.hidden_backbone(*args, **kwargs)
+        return orig_forward(*args, **kwargs)
+
+    model.forward = types.MethodType(_forward, model)
+
+
+def _patch_forward_return_hidden_as_logits(model: nn.Module) -> None:
+    """Make a bare encoder look like a token-classification model for AMT.
+
+    The remote AMT wrapper expects base_model(...).logits. For ModernBERT we keep
+    the exact user-provided AMT logic: load ModernBertModel, then return
+    last_hidden_state in a `.logits` field.
+    """
+    orig_forward = model.forward
+
+    def _forward(self_, *args, **kwargs):
+        kwargs.pop("use_cache", None)
+        kwargs.pop("past_key_values", None)
+        out = orig_forward(*args, **kwargs)
+        hidden = getattr(out, "last_hidden_state", None)
+        if hidden is None and isinstance(out, (tuple, list)) and len(out) > 0:
+            hidden = out[0]
+        if hidden is None:
+            raise RuntimeError(f"AMT base encoder {type(self_).__name__} did not return last_hidden_state")
+        class _Out:
+            pass
+        wrapped = _Out()
+        wrapped.logits = hidden
+        wrapped.hidden_states = getattr(out, "hidden_states", None)
+        wrapped.attentions = getattr(out, "attentions", None)
+        return wrapped
+
+    model.forward = types.MethodType(_forward, model)
+
+
+def _load_amt_base_model(backbone_path: str, backbone_kind: str, trust_remote_code: bool, allow_unsafe_torch_load: bool) -> tuple[nn.Module, object, int, str]:
+    """Load the base model in the same style as the provided AMT code.
+
+    ModernGENA: ModernBertModel -> forward patched to expose hidden states as logits.
+    GENA: AutoModel checkpoint -> remote BertForTokenClassification with Identity
+    classifier, so AMT receives a model with get_input_embeddings() and logits equal
+    to hidden states. This mirrors the supplied ARMT_AnnotationModel logic.
+    """
+    path = local_or_remote(backbone_path)
+    allow_transformers_torch_load_on_legacy_torch(allow_unsafe_torch_load, context=f"AMT.base:{backbone_kind}:{path}")
+
+    if backbone_kind == "moderngena":
+        logger.info("[AMT.base] loading ModernBertModel path=%s attn_implementation=sdpa", path)
+        base_model = ModernBertModel.from_pretrained(
+            path,
+            trust_remote_code=trust_remote_code,
+            attn_implementation="sdpa",
+        )
+        if hasattr(base_model, "config"):
+            if hasattr(base_model.config, "deterministic_flash_attn"):
+                base_model.config.deterministic_flash_attn = True
+            if hasattr(base_model.config, "use_sdpa_attn_mask"):
+                base_model.config.use_sdpa_attn_mask = True
+        _patch_forward_return_hidden_as_logits(base_model)
+        config = base_model.config
+        hidden_size = infer_hidden_size(config, context="AMT.ModernGENA")
+        layers_attr = "layers"
+        logger.info("[AMT.base] ModernGENA base_class=%s layers_attr=%s hidden_size=%d", type(base_model).__name__, layers_attr, hidden_size)
+        return base_model, config, hidden_size, layers_attr
+
+    if backbone_kind == "gena":
+        logger.info("[AMT.base] loading GENA AutoModel for state transfer path=%s", path)
+        auto_backbone = AutoModel.from_pretrained(path, trust_remote_code=trust_remote_code)
+        config = auto_backbone.config
+        module_name = auto_backbone.__class__.__module__
+        gena_mod = importlib.import_module(module_name)
+        if not hasattr(gena_mod, "BertForTokenClassification"):
+            raise RuntimeError(f"GENA remote module {module_name} has no BertForTokenClassification required by AMT")
+        BertForTokenClassification = getattr(gena_mod, "BertForTokenClassification")
+        base_model = BertForTokenClassification(config)
+        missing, unexpected = base_model.load_state_dict(auto_backbone.state_dict(), strict=False)
+        non_classifier_missing = [k for k in missing if not k.startswith("classifier.")]
+        if non_classifier_missing:
+            logger.info("[AMT.base] GENA missing non-classifier keys during transfer: %s", non_classifier_missing)
+        if unexpected:
+            logger.info("[AMT.base] GENA unexpected keys during transfer: %s", unexpected)
+        if not hasattr(base_model, "classifier"):
+            raise RuntimeError("GENA BertForTokenClassification has no classifier attribute")
+        base_model.classifier = nn.Identity()
+        _patch_forward_ignore_cache(base_model)
+        hidden_size = infer_hidden_size(config, context="AMT.GENA")
+        layers_attr = "bert.encoder.layer"
+        del auto_backbone
+        logger.info("[AMT.base] GENA base_class=%s classifier=Identity layers_attr=%s hidden_size=%d", type(base_model).__name__, layers_attr, hidden_size)
+        return base_model, config, hidden_size, layers_attr
+
+    raise RuntimeError(f"AMT supports only backbone_kind='gena' or 'moderngena', got {backbone_kind}")
 
 
 class AMTTokenClassifier(nn.Module):
     """AMT memory wrapper for GENA/ModernGENA only.
 
-    Active class choice: the remote AMT implementation is expected to expose
-    `AssociativeMemoryCell` and `AssociativeRecurrentWrapper`. The parameter is
-    named `amt_repo_id` throughout this repository. No parameters are frozen.
+    Active class choice follows the provided AMT code: the remote implementation
+    must expose `AssociativeMemoryCell` and `AssociativeRecurrentWrapper`.
+    No parameters are frozen.
     """
 
     def __init__(self, backbone_path: str, backbone_kind: str, num_labels: int, trust_remote_code: bool = True, amt_repo_id: str = "irodkin/armt-neox-tiny", use_unet: bool = False, nucleotide_vocab_size: int = 1000, unet_cycles: int = 1, unet_channels=None, allow_unsafe_torch_load: bool = True, **amt_kwargs):
         super().__init__()
         if backbone_kind not in {"gena", "moderngena"}:
             raise RuntimeError(f"AMT is allowed only for GENA/ModernGENA, got backbone_kind={backbone_kind}")
-        self.hidden_backbone = HiddenStateBackbone(backbone_path, backbone_kind=backbone_kind, trust_remote_code=trust_remote_code, modernbert_num_labels=num_labels, allow_unsafe_torch_load=allow_unsafe_torch_load)
-        self.hidden_size = self.hidden_backbone.hidden_size
         self.num_labels = int(num_labels)
         self.use_unet = bool(use_unet)
+
+        base_model, encoder_cfg, hidden_size, default_layers_attr = _load_amt_base_model(backbone_path, backbone_kind, trust_remote_code, allow_unsafe_torch_load)
+        self.hidden_size = int(hidden_size)
+        self.encoder_config = encoder_cfg
+
+        # Verify embedding interface before constructing AMT. This is the exact
+        # method that the remote AssociativeMemoryCell calls internally.
+        emb = base_model.get_input_embeddings()
+        if emb is None:
+            raise RuntimeError(f"AMT base model {type(base_model).__name__} returned None from get_input_embeddings()")
+        _ = get_word_embeddings(base_model, context=f"AMT.{backbone_kind}.base_embeddings")
 
         allow_transformers_torch_load_on_legacy_torch(allow_unsafe_torch_load, context=f"AMT:{amt_repo_id}")
         loaded = AutoModelForCausalLM.from_pretrained(local_or_remote(amt_repo_id), trust_remote_code=True)
         amt_mod = importlib.import_module(loaded.__class__.__module__)
         AssociativeMemoryCell = getattr(amt_mod, "AssociativeMemoryCell")
         AssociativeRecurrentWrapper = getattr(amt_mod, "AssociativeRecurrentWrapper")
-        layers_attr = amt_kwargs.pop("layers_attr", "hidden_backbone.encoder.encoder.layer" if backbone_kind == "gena" else "hidden_backbone.encoder.layers")
-        base_model = _BackboneHiddenForMemory(self.hidden_backbone)
-        logger.info("[AMT] repo=%s layers_attr=%s hidden=%d use_unet=%s", amt_repo_id, layers_attr, self.hidden_size, self.use_unet)
+        del loaded
+
+        layers_attr = amt_kwargs.pop("layers_attr", default_layers_attr)
+        act_on_value = bool(amt_kwargs.pop("act_on", False))
+        attend_prev_value = bool(amt_kwargs.pop("attend_to_previous_input", False))
+        segment_size_value = int(amt_kwargs.pop("segment_size", 128))
+        segment_alignment_value = amt_kwargs.pop("segment_alignment", "left")
+        sliding_window_value = bool(amt_kwargs.pop("sliding_window", False))
+        time_penalty_value = float(amt_kwargs.pop("time_penalty", 0.0))
+        logger.info(
+            "[AMT] repo=%s base_class=%s layers_attr=%s hidden=%d use_unet=%s num_mem=%s d_mem=%s segment_size=%d",
+            amt_repo_id, type(base_model).__name__, layers_attr, self.hidden_size, self.use_unet,
+            amt_kwargs.get("num_mem_tokens", 16), amt_kwargs.get("d_mem", 32), segment_size_value,
+        )
         memory_cell = AssociativeMemoryCell(
             base_model=base_model,
             num_mem_tokens=int(amt_kwargs.pop("num_mem_tokens", 16)),
@@ -66,23 +175,23 @@ class AMTTokenClassifier(nn.Module):
             use_denom=bool(amt_kwargs.pop("use_denom", True)),
             gating=bool(amt_kwargs.pop("gating", False)),
             freeze_mem=False,
-            act_on=bool(amt_kwargs.pop("act_on", False)),
+            act_on=act_on_value,
             max_hop=int(amt_kwargs.pop("max_hop", 4)),
             act_type=amt_kwargs.pop("act_type", "associative"),
             constant_depth=bool(amt_kwargs.pop("constant_depth", False)),
             act_format=amt_kwargs.pop("act_format", "linear"),
             noisy_halting=bool(amt_kwargs.pop("noisy_halting", False)),
-            attend_to_previous_input=bool(amt_kwargs.get("attend_to_previous_input", False)),
+            attend_to_previous_input=attend_prev_value,
             use_sink=bool(amt_kwargs.pop("use_sink", False)),
         )
         self.amt = AssociativeRecurrentWrapper(
             memory_cell,
-            segment_size=int(amt_kwargs.pop("segment_size", 128)),
-            segment_alignment=amt_kwargs.pop("segment_alignment", "left"),
-            sliding_window=bool(amt_kwargs.pop("sliding_window", False)),
-            attend_to_previous_input=bool(amt_kwargs.pop("attend_to_previous_input", False)),
-            act_on=bool(amt_kwargs.pop("act_on", False)),
-            time_penalty=float(amt_kwargs.pop("time_penalty", 0.0)),
+            segment_size=segment_size_value,
+            segment_alignment=segment_alignment_value,
+            sliding_window=sliding_window_value,
+            attend_to_previous_input=attend_prev_value,
+            act_on=act_on_value,
+            time_penalty=time_penalty_value,
         )
         if amt_kwargs:
             raise RuntimeError(f"Unused AMT parameters: {sorted(amt_kwargs.keys())}")

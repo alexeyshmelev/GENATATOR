@@ -26,6 +26,13 @@ MODELS = {
 NUC_TOKENIZER = "kuleshov-group/caduceus-ps_seqlen-131k_d_model-256_n_layer-16"
 CHR20_ALIASES = ["NC_060944.1", "chr20", "20"]
 
+# Runtime smoke controls. These are set from CLI in main(). Defaults are
+# intentionally small, but not tiny: tqdm now shows a visible multi-step
+# training/evaluation loop instead of the previous 2-step check.
+SMOKE_TRAIN_STEPS = 8
+SMOKE_TRAIN_WINDOWS = 16
+SMOKE_INFER_WINDOWS = 16
+
 
 def add_chr_alias_from_reference_gff(reference_gff: str) -> None:
     # The user supplies the chr20 reference GFF. We keep the smoke configs pinned to chr20,
@@ -47,11 +54,15 @@ def write_json(path: Path, obj: dict) -> Path:
     return path
 
 
-def tiny_training(output_dir: str, metric: str, bs: int) -> dict:
+def tiny_training(output_dir: str, metric: str, bs: int, steps: int) -> dict:
+    steps = int(steps)
+    if steps < 2:
+        raise RuntimeError("Smoke training needs at least 2 steps so tqdm, logging, evaluation, and saving are visible")
+    eval_every = max(1, steps // 2)
     return {
         "output_dir": output_dir,
         "overwrite_output_dir": True,
-        "max_steps": 2,
+        "max_steps": steps,
         "per_device_train_batch_size": bs,
         "per_device_eval_batch_size": bs,
         "gradient_accumulation_steps": 1,
@@ -60,8 +71,8 @@ def tiny_training(output_dir: str, metric: str, bs: int) -> dict:
         "warmup_steps": 0,
         "lr_scheduler_type": "constant",
         "logging_steps": 1,
-        "eval_steps": 1,
-        "save_steps": 1,
+        "eval_steps": eval_every,
+        "save_steps": eval_every,
         "save_total_limit": 1,
         "load_best_model_at_end": False,
         "metric_for_best_model": metric,
@@ -503,7 +514,7 @@ def prepare_segmentation_smoke_cache(
     return out
 
 def _smoke_infer_max_windows():
-    value = os.environ.get("GENATATOR_SMOKE_GF_INFER_MAX_WINDOWS", "4")
+    value = os.environ.get("GENATATOR_SMOKE_GF_INFER_MAX_WINDOWS", str(SMOKE_INFER_WINDOWS))
     if value.lower() in {"none", "full", "0"}:
         return None
     return int(value)
@@ -522,7 +533,7 @@ def finding_data(cache_path: Path, max_nt: int, max_tok: int, inference_subset: 
         "overlap": 0.5,
         "target_group": "primary",
         "max_rows": None,
-        "max_windows": _smoke_infer_max_windows() if inference_subset else 2,
+        "max_windows": _smoke_infer_max_windows() if inference_subset else SMOKE_TRAIN_WINDOWS,
         "parquet_block_cache_size": 1,
         "streaming": False,
     }
@@ -543,7 +554,7 @@ def seg_data(cache_path: Path, max_nt: int, max_tok: int, split: str = "train") 
         "crop_margin": 500,
         "random_crop": split == "train",
         "statuses": None,
-        "max_rows": 2,
+        "max_rows": None,
         "streaming": False,
     }
 
@@ -564,7 +575,7 @@ def make_finding_train_config(work: Path, gf_cache: Path, model_name: str, task:
         "model": model_cfg(model_name, family, extra),
         "train_dataset": finding_data(gf_cache, max_nt, max_tok, inference_subset=False),
         "eval_dataset": finding_data(gf_cache, max_nt, max_tok, inference_subset=False),
-        "training": tiny_training(str(work / name), "auc_mean", bs=1 if family in {"unet", "rmt"} else 2),
+        "training": tiny_training(str(work / name), "auc_mean", bs=1 if family in {"unet", "rmt"} else 2, steps=SMOKE_TRAIN_STEPS),
     }
     return write_json(work / "configs" / f"{name}.json", cfg)
 
@@ -584,7 +595,7 @@ def make_seg_train_config(work: Path, seg_cache: Path, model_name: str, variant:
         else:
             raise RuntimeError(f"Segmentation variant must be unet/rmt/amt for {model_name}, got {variant}")
     name = f"segmentation_{model_name}_{family}"
-    cfg = {"seed": 42, "model": model_cfg(model_name, family, extra), "train_dataset": seg_data(seg_cache, max_nt, max_tok, "train"), "eval_dataset": seg_data(seg_cache, max_nt, max_tok, "validation"), "training": tiny_training(str(work / name), "interval_f1_mean", bs=bs)}
+    cfg = {"seed": 42, "model": model_cfg(model_name, family, extra), "train_dataset": seg_data(seg_cache, max_nt, max_tok, "train"), "eval_dataset": seg_data(seg_cache, max_nt, max_tok, "validation"), "training": tiny_training(str(work / name), "interval_f1_mean", bs=bs, steps=SMOKE_TRAIN_STEPS)}
     return write_json(work / "configs" / f"{name}.json", cfg)
 
 
@@ -595,7 +606,7 @@ def make_tt_train_config(work: Path, seg_cache: Path, model_name: str) -> Path:
     if kind != "caduceus":
         max_tok = 64
     name = f"transcript_type_{model_name}_{family}"
-    cfg = {"seed": 42, "model": model_cfg(model_name, family), "train_dataset": seg_data(seg_cache, max_nt, max_tok, "train"), "eval_dataset": seg_data(seg_cache, max_nt, max_tok, "validation"), "training": tiny_training(str(work / name), "accuracy", bs=1 if kind == "caduceus" else 2)}
+    cfg = {"seed": 42, "model": model_cfg(model_name, family), "train_dataset": seg_data(seg_cache, max_nt, max_tok, "train"), "eval_dataset": seg_data(seg_cache, max_nt, max_tok, "validation"), "training": tiny_training(str(work / name), "accuracy", bs=1 if kind == "caduceus" else 2, steps=SMOKE_TRAIN_STEPS)}
     return write_json(work / "configs" / f"{name}.json", cfg)
 
 
@@ -771,13 +782,21 @@ def main():
     ap.add_argument("--hf-local-files-only", action="store_true", help="Do not contact Hugging Face while preparing smoke caches. Requires the exact parquet to be present in the local HF cache, or --gene-finding-local-parquet.")
     ap.add_argument("--gene-finding-cache-len", type=int, default=0, help="Deprecated compatibility option. Gene-finding smoke now indexes the full NC_060944.1 chromosome and does not trim DNA/targets into JSONL.")
     ap.add_argument("--segmentation-cache-len", type=int, default=768, help="Number of real nucleotides to keep from each selected transcript-level smoke row.")
-    ap.add_argument("--segmentation-cache-rows", type=int, default=2, help="Number of real transcript-level chr20 rows to keep for segmentation/transcript-type smoke tests.")
+    ap.add_argument("--segmentation-cache-rows", type=int, default=8, help="Number of real transcript-level chr20 rows to keep for segmentation/transcript-type smoke tests.")
     ap.add_argument("--segmentation-remote-parquet", type=str, default=DEFAULT_SEGMENTATION_REMOTE_PARQUET, help="Exact parquet file inside the HF segmentation dataset repo to use for smoke tests. Defaults to val-human/data.parquet. The smoke runner never auto-downloads train-human or train-multi-specie shards.")
     ap.add_argument("--segmentation-local-parquet", type=str, default=None, help="Optional local parquet file for segmentation/transcript-type smoke cache creation. Use this to avoid any HF request.")
     ap.add_argument("--segmentation-max-parquet-files", type=int, default=1, help="Deprecated compatibility option. Smoke tests now use exactly --segmentation-remote-parquet by default.")
     ap.add_argument("--segmentation-parquet-batch-size", type=int, default=16, help="Small Parquet record-batch size used while extracting chr20 transcript smoke rows.")
     ap.add_argument("--smoke-cache-dir", type=str, default=None, help="Persistent real-data smoke cache directory. Defaults to $GENATATOR_SMOKE_CACHE_DIR or ~/.cache/genatator_smoke.")
+    ap.add_argument("--smoke-train-steps", type=int, default=8, help="Number of update steps per smoke training job. Default 8: visible tqdm/log/eval without a long run.")
+    ap.add_argument("--smoke-train-windows", type=int, default=16, help="Number of gene-finding windows used in smoke training/validation jobs.")
+    ap.add_argument("--smoke-infer-windows", type=int, default=16, help="Number of gene-finding windows used in smoke inference jobs; use 0 for full chromosome inference.")
     args = ap.parse_args()
+    global SMOKE_TRAIN_STEPS, SMOKE_TRAIN_WINDOWS, SMOKE_INFER_WINDOWS
+    SMOKE_TRAIN_STEPS = int(args.smoke_train_steps)
+    SMOKE_TRAIN_WINDOWS = int(args.smoke_train_windows)
+    SMOKE_INFER_WINDOWS = None if int(args.smoke_infer_windows) == 0 else int(args.smoke_infer_windows)
+    print(f"Smoke runtime controls: train_steps={SMOKE_TRAIN_STEPS} train_windows={SMOKE_TRAIN_WINDOWS} infer_windows={SMOKE_INFER_WINDOWS if SMOKE_INFER_WINDOWS is not None else 'full'}")
     true_gff = Path(args.reference_gff).expanduser()
     if not true_gff.exists():
         raise FileNotFoundError(f"Reference GFF does not exist: {true_gff}. Smoke tests never use dummy GFF files.")
