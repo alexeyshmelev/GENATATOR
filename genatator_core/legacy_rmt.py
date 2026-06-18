@@ -217,12 +217,17 @@ class RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater(nn.Module
         if token_mask is None:
             raise RuntimeError("RMT token mask was not produced. labels_mask is required for repeater alignment.")
         curr_logits = token_logits[0, token_mask[0].bool(), :].unsqueeze(0)
-        lmask = letter_level_labels_mask[0].bool()
-        curr_repeater = embedding_repeater[0][lmask].long()
+        raw_lmask = letter_level_labels_mask[0].bool()
+        repeater_full = embedding_repeater[0].long()
+        lmask = raw_lmask & (repeater_full >= 0)
+        dropped = int((raw_lmask & (repeater_full < 0)).sum().item())
+        if dropped:
+            logger.info("[RMTRepeater] dropped %d nucleotide positions not covered by retained BPE tokens", dropped)
+        curr_repeater = repeater_full[lmask]
         if curr_repeater.numel() == 0:
-            raise RuntimeError("RMT embedding_repeater is empty after masking.")
-        if curr_repeater.min().item() < 0 or curr_repeater.max().item() >= curr_logits.shape[1]:
-            raise RuntimeError(f"RMT repeater range [{curr_repeater.min().item()}, {curr_repeater.max().item()}] incompatible with token length {curr_logits.shape[1]}")
+            raise RuntimeError("RMT embedding_repeater is empty after removing uncovered BPE positions.")
+        if curr_repeater.max().item() >= curr_logits.shape[1]:
+            raise RuntimeError(f"RMT repeater max {curr_repeater.max().item()} incompatible with token length {curr_logits.shape[1]}")
         nt_emb = self.nucleotide_embedding(letter_level_tokens[0][lmask].unsqueeze(0))
         repeated = torch.cat((nt_emb, curr_logits[:, curr_repeater, :]), dim=-1)
         target = letter_level_labels[0][lmask].unsqueeze(0) if letter_level_labels is not None else None
@@ -244,6 +249,6 @@ class RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater(nn.Module
             if target is not None:
                 loss = loss + loss_fct(collected_logits.float(), target.float())
             x = x + torch.cat(embedding_chunks, dim=1)
-        if collected_logits.shape[1] != letter_level_tokens.shape[1]:
-            collected_logits = F.pad(collected_logits, (0, 0, 0, letter_level_tokens.shape[1] - collected_logits.shape[1]))
-        return TokenClassifierOutput(loss=(loss / self.cycles if target is not None else None), logits=collected_logits)
+        full_logits = collected_logits.new_zeros((1, letter_level_tokens.shape[1], self.fc.out_features))
+        full_logits[:, lmask, :] = collected_logits
+        return TokenClassifierOutput(loss=(loss / self.cycles if target is not None else None), logits=full_logits)

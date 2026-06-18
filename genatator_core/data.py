@@ -635,7 +635,12 @@ class GenatatorDataset(torch.utils.data.Dataset):
                 letter_y = np.zeros((letter_len, labels.shape[1]), dtype=np.float32)
                 letter_y[:n] = labels[:n]
                 letter_mask = np.zeros(letter_len, dtype=bool)
-                letter_mask[:n] = True
+                # Only nucleotide positions that are actually covered by retained
+                # BPE tokens can be used by UNET/RMT/AMT repeaters. With small
+                # smoke-test max_tokens the tokenizer may truncate before
+                # max_nucleotides, leaving -100 in the repeater tail. Do not let
+                # those positions enter the loss or repeater indexing.
+                letter_mask[:n] = rep[:n] >= 0
                 item.update({
                     "letter_level_tokens": torch.tensor(nucleotide_ids(dna, self.nucleotide_tokenizer, letter_len), dtype=torch.long),
                     "letter_level_labels": torch.tensor(letter_y, dtype=torch.float32),

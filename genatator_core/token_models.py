@@ -69,12 +69,17 @@ class TokenClassifierWithUNet(nn.Module):
         hidden = self.hidden_backbone(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids).logits
         valid_token_mask = labels_mask[0].bool() if labels_mask is not None else attention_mask[0].bool()
         token_hidden = hidden[0, valid_token_mask, :].unsqueeze(0)
-        lmask = letter_level_labels_mask[0].bool()
-        repeater = embedding_repeater[0][lmask].long()
+        raw_lmask = letter_level_labels_mask[0].bool()
+        repeater_full = embedding_repeater[0].long()
+        lmask = raw_lmask & (repeater_full >= 0)
+        dropped = int((raw_lmask & (repeater_full < 0)).sum().item())
+        if dropped:
+            logger.info("[TokenClassifierWithUNet] dropped %d nucleotide positions not covered by retained BPE tokens", dropped)
+        repeater = repeater_full[lmask]
         if repeater.numel() == 0:
-            raise RuntimeError("UNET repeater is empty")
-        if repeater.min().item() < 0 or repeater.max().item() >= token_hidden.shape[1]:
-            raise RuntimeError(f"UNET repeater range [{repeater.min().item()}, {repeater.max().item()}] incompatible with token length {token_hidden.shape[1]}")
+            raise RuntimeError("UNET repeater is empty after removing uncovered BPE positions")
+        if repeater.max().item() >= token_hidden.shape[1]:
+            raise RuntimeError(f"UNET repeater max {repeater.max().item()} incompatible with token length {token_hidden.shape[1]}")
         nt_emb = self.nucleotide_embedding(letter_level_tokens[0][lmask].unsqueeze(0))
         x = torch.cat((nt_emb, token_hidden[:, repeater, :]), dim=-1)
         target = letter_level_labels[0][lmask].unsqueeze(0) if letter_level_labels is not None else None
@@ -88,8 +93,9 @@ class TokenClassifierWithUNet(nn.Module):
             if target is not None:
                 loss = loss + loss_fct(logits.float(), target.float())
             x = x + z
-        logits = F.pad(logits, (0, 0, 0, letter_level_tokens.shape[1] - logits.shape[1]))
-        return TokenClassifierOutput(loss=(loss / self.unet_cycles if target is not None else None), logits=logits)
+        full_logits = logits.new_zeros((1, letter_level_tokens.shape[1], self.num_labels))
+        full_logits[:, lmask, :] = logits
+        return TokenClassifierOutput(loss=(loss / self.unet_cycles if target is not None else None), logits=full_logits)
 
 
 class TranscriptTypeClassifier(nn.Module):
