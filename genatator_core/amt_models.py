@@ -66,7 +66,7 @@ def _load_amt_base_model(backbone_path: str, backbone_kind: str, trust_remote_co
     ModernGENA: ModernBertModel -> forward patched to expose hidden states as logits.
     GENA: AutoModel checkpoint -> remote BertForTokenClassification with Identity
     classifier, so AMT receives a model with get_input_embeddings() and logits equal
-    to hidden states. This mirrors the supplied ARMT_AnnotationModel logic.
+    to hidden states. This mirrors the supplied associative-memory fine-tuning logic.
     """
     path = local_or_remote(backbone_path)
     allow_transformers_torch_load_on_legacy_torch(allow_unsafe_torch_load, context=f"AMT.base:{backbone_kind}:{path}")

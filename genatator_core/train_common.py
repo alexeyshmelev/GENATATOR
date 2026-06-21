@@ -100,6 +100,17 @@ def train_from_config(config_path: str, task: str) -> None:
 
     model = build_model(cfg, task=task)
     tr = cfg["training"]
+    logging_strategy = str(tr.get("logging_strategy", "steps"))
+    evaluation_strategy = str(tr.get("evaluation_strategy", tr.get("eval_strategy", "steps")))
+    save_strategy = str(tr.get("save_strategy", "steps"))
+    logger.info(
+        "[training.strategy] logging=%s evaluation=%s save=%s epochs=%s max_steps=%s",
+        logging_strategy,
+        evaluation_strategy,
+        save_strategy,
+        tr.get("num_train_epochs", 1.0),
+        tr.get("max_steps", -1),
+    )
     ta_kwargs = dict(
         output_dir=str(output_dir),
         overwrite_output_dir=bool(tr.get("overwrite_output_dir", False)),
@@ -112,10 +123,10 @@ def train_from_config(config_path: str, task: str) -> None:
         weight_decay=float(tr.get("weight_decay", 1e-4)),
         warmup_steps=int(tr.get("warmup_steps", 1000)),
         lr_scheduler_type=tr.get("lr_scheduler_type", "constant_with_warmup"),
-        logging_strategy="steps",
+        logging_strategy=logging_strategy,
         logging_steps=int(tr.get("logging_steps", 100)),
         eval_steps=int(tr.get("eval_steps", 1000)),
-        save_strategy="steps",
+        save_strategy=save_strategy,
         save_steps=int(tr.get("save_steps", 1000)),
         save_total_limit=int(tr.get("save_total_limit", 3)),
         save_safetensors=bool(tr.get("save_safetensors", False)),
@@ -134,9 +145,9 @@ def train_from_config(config_path: str, task: str) -> None:
     )
     ta_params = inspect.signature(TrainingArguments.__init__).parameters
     if "eval_strategy" in ta_params:
-        ta_kwargs["eval_strategy"] = "steps"
+        ta_kwargs["eval_strategy"] = evaluation_strategy
     elif "evaluation_strategy" in ta_params:
-        ta_kwargs["evaluation_strategy"] = "steps"
+        ta_kwargs["evaluation_strategy"] = evaluation_strategy
     else:
         raise RuntimeError("Installed transformers.TrainingArguments supports neither eval_strategy nor evaluation_strategy")
     args = TrainingArguments(**ta_kwargs)
@@ -150,6 +161,7 @@ def train_from_config(config_path: str, task: str) -> None:
     )
     resume = tr.get("resume_from_checkpoint") or None
     logger.info("[training] resume_from_checkpoint=%s", resume)
-    trainer.train(resume_from_checkpoint=resume)
+    train_result = trainer.train(resume_from_checkpoint=resume)
     trainer.save_model(str(output_dir / "final_model"))
     trainer.save_state()
+    save_json(dict(train_result.metrics), output_dir / "train_metrics.json")

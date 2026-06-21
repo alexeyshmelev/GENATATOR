@@ -108,8 +108,9 @@ The repository supports both HF datasets and local mirrors. There is no source s
 | `max_rows` | Optional row cap, useful for smoke tests. |
 | `streaming` | Optional HF streaming mode. When `true`, the loader scans remote rows, applies `genomes`/`chromosomes`/`statuses`, materializes only matching rows, and then trains normally on that small real-data subset. |
 | `streaming_max_scanned_rows` | Maximum number of streamed rows to scan while looking for rows that match filters. |
-| `streaming_trim_rows` | Optional debug option. When `true`, a streamed row is trimmed to the span required by `max_nucleotides`, `overlap`, and `max_windows` before it is kept in memory. Current smoke tests instead build a local real-data cache from a direct HF test slice. |
-| `max_windows` | Optional window cap after dataset windowing, useful for smoke tests. |
+| `streaming_trim_rows` | Optional debug option. When `true`, a streamed row is trimmed to the span required by `max_nucleotides`, `overlap`, and `max_windows` before it is kept in memory. Smoke tests do not use this option; they build persistent chromosome indexes and compact selected-data files before any model starts. |
+| `max_windows` | Optional window cap after dataset windowing. |
+| `prewindowed` | When `true`, each gene-finding row is already one model-sized chromosome window and is used directly without reassembling/generating windows. Used by persistent smoke subsets. |
 | `max_nucleotides` | Nucleotide context length used for nucleotide models and UNET output. |
 | `max_tokens` | Token context length used for BPE models. |
 | `overlap` | Sliding-window overlap. The default is `0.5`. |
@@ -256,11 +257,48 @@ python transcript_type/infer.py --config transcript_type/configs/infer_moderngen
 
 The script writes a TSV with transcript IDs, reference type, predicted type, and lncRNA probability, then writes accuracy/F1/precision/recall JSON metrics. Reverse-complement averaging is controlled by `inference.use_reverse_complement`.
 
-## Smoke tests on real HF data
+## Smoke tests on one real held-out chromosome
 
-Smoke tests do **not** generate dummy data and do **not** use a dummy GFF. They use real data from the HF repositories and require a user-provided human T2T chromosome 20 reference GFF/GFF3. For gene finding, smoke tests use **only** a real HF `test` parquet shard from `NC_060944.1`; they never open the huge gene-finding `train` split or the gene-finding `validation` split. For segmentation and transcript type, the runner uses real `val-human` chromosome-20 transcript rows. Before launching any per-model job, the runner creates tiny persistent JSONL caches. The per-model train/validation/inference jobs then read only these local JSONL caches and never call the remote HF datasets.
+Smoke tests use no dummy DNA, labels, or GFF. The default chromosome is T2T `NC_060944.1`. The supplied reference GFF is used both to determine the exact chromosome alias and to run the final GFF metrics.
 
-Run:
+The two public datasets have different held-out layouts:
+
+- gene finding uses the official `test` split, which is the complete T2T genome stored as genomic parquet blocks;
+- segmentation and transcript type use `val-human/validation`, because that repository has no split named `test`; chromosome 20 in `val-human` is the released held-out final-evaluation set.
+
+### Dataset discovery and persistent indexes
+
+Before any GPU job starts, `smoke_tests/run_smoke.py`:
+
+1. prints the local dataset location it detected: an explicitly supplied local path or the resolved Hugging Face cache snapshot/file;
+2. iterates through every gene-finding `test` parquet sample with a tqdm bar, reads only its metadata column, selects only files whose metadata confirms the requested chromosome, and verifies the assembled chromosome span;
+3. iterates through every `val-human` transcript metadata row with a tqdm bar and stores every row index whose metadata chromosome matches the request;
+4. writes persistent per-sample metadata and chromosome-selection indexes to `smoke_tests/indexes/`;
+5. writes only the selected, compact smoke data to `smoke_tests/selected_data/`.
+
+For an uncached remote gene-finding sample, the one-time indexer uses seekable Hugging Face filesystem range reads to fetch the Parquet footer and metadata column without materializing DNA or target arrays. Its progress is checkpointed in `smoke_tests/indexes/gene_finding_test_sample_metadata.json`, so an interrupted scan resumes from stored metadata. The completed chromosome indexes are reused on later runs. Pass `--refresh-index` to repeat metadata discovery. Both generated directories are ignored by Git.
+
+For gene finding, every selected chromosome block contributes informative edge and region windows. The extraction scans one block at a time, keeps no rejected chromosome block in RAM, and writes model-sized windows to local JSONL. The default is four windows per chromosome block. For segmentation and transcript type, all chromosome-matching transcript rows are copied to one local parquet file in bounded batches; complete source transcripts are retained on disk, while model training takes one deterministic context crop from every transcript.
+
+### Deliberate overfit protocol
+
+The same chromosome-selected held-out samples are used for smoke training, validation, and separate inference. This is intentional: a visible fall in both training and validation loss confirms that the backbone, task head, labels, optimizer, validation path, checkpoint, and inference path are connected correctly.
+
+Defaults:
+
+```text
+4 epochs
+constant learning rate 1e-4
+evaluation once per epoch
+checkpoint once per epoch
+logging every optimizer step
+all selected samples visited each epoch
+no dataloader worker copies
+```
+
+After every training job, the launcher reads `trainer_state.json`. By default it stops the whole smoke run if the final training loss and final validation loss do not both improve over their first recorded values. Disable only for diagnosis with `--no-require-overfit`, or require a larger relative loss drop with `--overfit-min-relative-loss-drop`.
+
+### Run
 
 ```bash
 python smoke_tests/run_smoke.py \
@@ -269,29 +307,30 @@ python smoke_tests/run_smoke.py \
   --work-dir smoke_tests/runs
 ```
 
-Optional real-data cache controls. The segmentation cache uses `val-human/data.parquet` by default and reads it in small batches:
+Useful controls:
 
 ```bash
 python smoke_tests/run_smoke.py \
   --num-gpus 4 \
   --reference-gff /path/to/human_T2T_chr20_reference.gff3 \
-  --gene-finding-cache-len 1536 \
-  --segmentation-cache-len 768 \
-  --segmentation-cache-rows 2 \
-  --segmentation-parquet-batch-size 16
+  --requested-chromosome NC_060944.1 \
+  --gene-finding-windows-per-block 4 \
+  --smoke-epochs 4 \
+  --smoke-learning-rate 1e-4 \
+  --metadata-batch-size 16
 ```
 
-To bypass HF completely, pass local parquet files:
+Use already downloaded local datasets:
 
 ```bash
 python smoke_tests/run_smoke.py \
   --num-gpus 4 \
   --reference-gff /path/to/human_T2T_chr20_reference.gff3 \
-  --gene-finding-local-parquet /path/to/gene_finding_chr20.parquet \
-  --segmentation-local-parquet /path/to/segmentation_val_human.parquet
+  --gene-finding-dataset-path /path/to/genatator-gene-finding-dataset \
+  --segmentation-dataset-path /path/to/val-human/data.parquet
 ```
 
-Or choose GPU IDs explicitly:
+Use specific GPUs:
 
 ```bash
 python smoke_tests/run_smoke.py \
@@ -300,17 +339,9 @@ python smoke_tests/run_smoke.py \
   --reference-gff /path/to/human_T2T_chr20_reference.gff3
 ```
 
-The smoke runner:
+Each active job owns exactly one GPU. Independent task/model jobs run concurrently up to the GPU count, while inference waits for its matching training job. Any failed command, missing metric, or failed overfit check terminates the other active jobs and reports the command plus log tail.
 
-1. builds small JSON configs using real HF datasets;
-2. trains for two optimization steps;
-3. validates after the first step;
-4. saves checkpoints;
-5. runs inference on small human T2T chr20 subsets;
-6. computes final metrics with the configured metric packages;
-7. writes `summary.md` with job durations, logs, and metric previews.
-
-Each smoke job uses one GPU. Jobs are launched concurrently up to the number of available GPUs while respecting train→inference dependencies. If any job fails, the runner terminates active jobs and raises an error with the failed job name, command, GPU, log file, and the last log lines.
+The final `smoke_tests/runs/summary.md` includes selected-data statistics, job durations, first→last training and validation losses, overfit decisions, logs, and metric-file previews.
 
 ## Repository hygiene
 
@@ -326,237 +357,3 @@ genatator_core/model_builders.py
 ```
 
 The only memory-wrapper spelling used in configs and code is `amt` / `AMT`. Smoke tests use real HF datasets and a user-provided reference GFF.
-
-
-### Smoke-test dataset filtering note
-
-The smoke runner uses only real Hugging Face data, but it does **not** call `datasets.load_dataset(...)` while preparing smoke caches. For gene finding it downloads or reuses exactly one known T2T chr20 test parquet shard. For transcript-level tasks it downloads or reuses **only** `val-human/data.parquet` by default, then iterates over small Parquet record batches and keeps only real rows whose metadata points to `NC_060944.1` / chr20. It never auto-downloads `train-human` or `train-multi-specie` shards during smoke-cache preparation. The resulting local JSONL files are tiny and reused by every model. If filtering selects zero rows, the runner stops and tells you which parquet file was inspected; pass `--segmentation-local-parquet` or `--segmentation-remote-parquet val-human/data.parquet` to make the source explicit.
-
-## Smoke-test real-data cache behavior
-
-Smoke tests use real Hugging Face data only, but they now write tiny persistent JSONL caches before launching per-model jobs. This is necessary because the raw HF datasets are huge and repeated `load_dataset(...)` calls may re-check or re-prepare remote files even when each model only needs a few real rows.
-
-By default the cache directory is:
-
-```bash
-~/.cache/genatator_smoke
-```
-
-or the value of:
-
-```bash
-GENATATOR_SMOKE_CACHE_DIR
-```
-
-You can also set it explicitly:
-
-```bash
-python smoke_tests/run_smoke.py \
-  --num-gpus 2 \
-  --reference-gff /path/to/chr20.gff \
-  --work-dir smoke_tests/runs \
-  --smoke-cache-dir /disk/10tb/home/shmelev/GENATATOR/.smoke_real_data_cache
-```
-
-The smoke runner creates two persistent caches:
-
-- a gene-finding cache from a real `AIRI-Institute/genatator-gene-finding-dataset` chr20 test parquet shard;
-- a segmentation/transcript-type cache from real `AIRI-Institute/genatator-gene-segmentation-dataset` `val-human/data.parquet` only, filtered to human T2T chr20 without materializing the full HF dataset and without downloading multispecies data.
-
-After these files exist, deleting `smoke_tests/runs` will not trigger dataset preparation again. All train, validation, and inference jobs read the tiny local JSONL caches instead of touching the remote HF datasets.
-
-## v13 inference GFF behavior
-
-The inference writers now follow the two official evaluate interfaces used by the repository.
-
-### Gene finding GFF
-
-`finding/infer.py` writes a genome-oriented GFF3 file. Each predicted interval becomes:
-
-- one `gene` row on the chromosome coordinate system;
-- one transcript row of type `mRNA` by default;
-- one `exon` row spanning the full predicted transcript interval.
-
-The official annotation metric rejects empty prediction GFF files. Normal inference keeps the strict default behavior and raises an error if no intervals pass post-processing. Smoke-test inference explicitly sets:
-
-```json
-"empty_gff_policy": "best_interval"
-```
-
-With this setting, if a two-step smoke model produces no intervals, the code writes one best-scoring interval derived from the edge and region tracks. This is only to verify the full train-infer-evaluate path under tiny smoke training.
-
-### Segmentation GFF
-
-`segmentation/infer.py` writes prediction GFFs in the format expected by `AIRI-Institute/genatator-ab-initio-segmentation-leaderboard`:
-
-- prediction `seqid` is the reference `transcript_id`;
-- coordinates are transcript-relative by default;
-- rows include `gene`, transcript (`mRNA` or `lnc_RNA`), `exon`, and, for mRNA, `CDS` features.
-
-This differs from standard genome-oriented GFF used by the reference annotation. Use:
-
-```json
-"coordinate_mode": "transcript"
-```
-
-for the official segmentation metric. Smoke-test segmentation also sets:
-
-```json
-"empty_segment_policy": "best_interval"
-```
-
-so that a tiny randomly initialized or barely trained model still produces at least one exon/CDS feature and the evaluator can run.
-
-## Gene-finding inference metrics and post-processing
-
-`finding/infer.py` now performs two independent evaluations during inference.
-
-First, it gathers the edge and region probability tracks for the selected chromosome(s) and computes nucleotide-level PR-AUC on the whole chromosome at once. The reported blocks are:
-
-```json
-{
-  "pr_auc": {
-    "edge": {
-      "pooled": {"TSS+": ..., "TSS-": ..., "PolyA+": ..., "PolyA-": ...},
-      "per_chromosome": {"NC_060944.1": {...}},
-      "mean": ...
-    },
-    "region": {
-      "pooled": {"Intragenic+": ..., "Intragenic-": ...},
-      "per_chromosome": {"NC_060944.1": {...}},
-      "mean": ...
-    }
-  }
-}
-```
-
-Second, when `inference.true_gff` is provided, the script writes a genome-oriented prediction GFF and evaluates it through `AIRI-Institute/genatator-ab-initio-annotation-leaderboard`. The JSON output then contains both `pr_auc` and `annotation`.
-
-Gene-finding GFF construction uses the same FFT peak-calling and TSS/PolyA pairing logic as the public GENATATOR pipeline. The model edge-channel order is `TSS+, TSS-, PolyA+, PolyA-`; internally the post-processing code reorders this to the pipeline peak-calling order `TSS+, PolyA+, TSS-, PolyA-`.
-
-The `postprocess` JSON block supports:
-
-```json
-{
-  "lp_frac": 0.05,
-  "pk_prom": 0.1,
-  "pk_dist": 50,
-  "pk_height": null,
-  "interval_window_size": 2000000,
-  "max_pairs_per_seed": 10,
-  "prob_threshold": 0.5,
-  "zero_fraction_drop_threshold": 0.01,
-  "pairing_progress_every": null
-}
-```
-
-These parameters correspond to the FFT low-pass fraction, peak prominence, peak distance, optional peak height, maximum TSS/PolyA pairing distance, maximum nearest PolyA partners per TSS seed, intragenic probability threshold, maximum allowed non-intragenic fraction inside a candidate interval, and optional logging interval for peak pairing.
-
-## v15 notes: torch 2.2.2, chromosome-only smoke data, and GFF conventions
-
-### Loading GENA checkpoints with torch 2.2.2
-
-Several GENA checkpoints are distributed as legacy PyTorch `.bin` weights. Newer
-`transformers` releases block those files when `torch < 2.6` is installed. This
-repository keeps compatibility with `torch==2.2.2+cu121` by explicitly patching
-Transformers' safety gate before `from_pretrained(...)` when the model config has:
-
-```json
-"allow_unsafe_torch_load_with_torch_lt_2_6": true
-```
-
-This is enabled in the shipped configs because the requested runtime is pinned to
-torch 2.2.2. The code logs a warning every time this compatibility path is active.
-Use only trusted backbone repositories when this option is enabled.
-
-
-### GENA hidden-state extraction
-
-Some GENA checkpoints load as `BertForMaskedLM` through the remote-code `AutoModel` mapping.
-For those checkpoints, `out.logits` has shape `(batch, tokens, vocab_size)` and must not be
-used as the downstream hidden representation. The backbone adapter now explicitly uses
-`last_hidden_state` when available, otherwise `hidden_states[-1]`, and logs a detailed shape
-error if neither matches the configured hidden size.
-
-### Gene-finding GFF output
-
-Gene-finding edge/region models predict transcript boundaries and intragenic
-coverage, not exon-intron structure. For GFF-based boundary evaluation, every
-predicted TSS/PolyA interval is therefore written as:
-
-```text
-gene
-mRNA or lnc_RNA
-one exon spanning the full predicted transcript interval
-```
-
-This is intentional. The gene-finding leaderboard can then assess TSS/PolyA
-boundary localization through the transcript interval, while true exon/CDS
-segmentation is evaluated separately by the segmentation task.
-
-Gene-finding inference also computes whole-chromosome PR-AUC at nucleotide
-resolution before GFF post-processing. Edge PR-AUC is reported for TSS+, TSS-,
-PolyA+, and PolyA-. Region PR-AUC is reported for Intragenic+ and Intragenic-.
-
-### Segmentation GFF output
-
-Segmentation prediction GFFs are transcript-coordinate files. The `seqid` column
-is the transcript ID, not a chromosome. This follows the official segmentation
-metric assumption: each model receives only the DNA sequence of an individual
-transcript, without intergenic sequence or neighboring genes.
-
-### Smoke-test data extraction
-
-Smoke tests must stay on T2T human chromosome 20 only. The smoke runner now:
-
-1. downloads or reuses exactly seven gene-finding chr20 parquet blocks for `NC_060944.1`; the final block is explicitly `000060000000_000066210255`, not `000060000000_000070000000`;
-2. downloads or reuses only `val-human/data.parquet` for segmentation/transcript
-   smoke rows;
-3. scans the segmentation parquet in small PyArrow batches with a tqdm progress
-   bar;
-4. selects only rows whose metadata chromosome matches `NC_060944.1`, `chr20`, or
-   `20`;
-5. immediately trims each selected row before writing the persistent JSONL smoke
-   cache;
-6. prints the number of selected chr20 transcripts and, during dataset loading,
-   prints transcript metadata spans and finding assembled chromosome lengths.
-
-The smoke path never auto-downloads `train-human` or `train-multi-specie`.
-
-## v17 smoke-test notes
-
-Gene-finding smoke cache now indexes the full T2T `NC_060944.1` chromosome as seven exact local parquet blocks. The JSONL cache stores only `parquet_path` and metadata for each block, so the full 66 Mb chromosome is assembled from coordinates without storing the whole DNA sequence or `targets` matrix in JSONL or RAM. Dataset logs should show `assembled_total_length` around `66210255` and `chrom_length_metadata=66210255`.
-
-For smoke runtime, training uses only a few windows (`max_windows=2`) even though the chromosome assembly is full. Gene-finding smoke inference uses `GENATATOR_SMOKE_GF_INFER_MAX_WINDOWS=4` by default to remain quick; set `GENATATOR_SMOKE_GF_INFER_MAX_WINDOWS=full` to run inference windows across the full chromosome. Normal non-smoke inference configs can set `max_windows: null` to compute whole-chromosome PR-AUC and GFF metrics.
-
-Trainer checkpoint saving defaults to `save_safetensors=false` to avoid shared-tensor save failures with GENA/ModernGENA wrappers and PyTorch 2.2.2. You can override this in JSON, but `.bin` checkpoints are the safest default in this environment.
-
-## v18 smoke-test fix
-
-The gene-finding chr20 block list is now hard-coded to the released file names. The final block ends at `000066210255`; the code no longer generates a non-existent `000070000000` endpoint. If a stale partial index exists, the smoke runner detects `blocks != 7` or `assembled_total_length < 66210255`, deletes the stale index, and rebuilds it from the exact block list.
-
-## v19 smoke-test and AMT fixes
-
-The smoke runner now gives a visible but still short training loop. Defaults are:
-
-- `--smoke-train-steps 8`
-- `--smoke-train-windows 16`
-- `--smoke-infer-windows 16`
-- `--segmentation-cache-rows 8`
-
-This replaces the earlier 2-step / 2-window setup, which made tqdm appear almost empty. You can shorten or lengthen the smoke run explicitly from the command line:
-
-```bash
-python smoke_tests/run_smoke.py \
-  --num-gpus 2 \
-  --reference-gff /path/to/chr20.gff \
-  --work-dir smoke_tests/runs \
-  --smoke-cache-dir /path/to/.smoke_real_data_cache \
-  --smoke-train-steps 8 \
-  --smoke-train-windows 16 \
-  --smoke-infer-windows 16
-```
-
-Use `--smoke-infer-windows 0` for full-chromosome gene-finding inference. Training remains short by default even though the gene-finding cache indexes the full `NC_060944.1` chromosome.
-
-AMT loading was also revised to follow the provided AMT/ARMT logic. For ModernGENA, AMT now wraps a real `ModernBertModel` and patches its forward output so `last_hidden_state` is exposed as `.logits`, as expected by the remote AMT implementation. For GENA, AMT now builds the remote `BertForTokenClassification`, transfers pretrained GENA weights, replaces the classifier with `nn.Identity`, and passes that model directly into `AssociativeMemoryCell`. This preserves `get_input_embeddings()` and the internal layer path required by AMT. The default `layers_attr` is `layers` for ModernGENA and `bert.encoder.layer` for GENA, unless overridden in JSON.

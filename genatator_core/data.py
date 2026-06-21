@@ -479,15 +479,40 @@ class GenatatorDataset(torch.utils.data.Dataset):
         self.crop_margin = int(cfg.get("crop_margin", 500))
         self.random_crop = bool(cfg.get("random_crop", is_train and task in {"segmentation", "transcript_type"}))
         self.reverse_complement = bool(cfg.get("reverse_complement", False))
+        self.prewindowed = bool(cfg.get("prewindowed", False))
         self.windows: List[Any] = []
         if task.startswith("finding"):
-            self._build_finding_windows()
+            if self.prewindowed:
+                self._build_prewindowed_finding_indices()
+            else:
+                self._build_finding_windows()
         else:
             self._build_transcript_indices()
         max_windows = cfg.get("max_windows")
         if max_windows:
             self.windows = self.windows[: int(max_windows)]
         logger.info("[dataset] task=%s family=%s windows=%d max_nt=%d max_tokens=%d overlap=%.3f rc=%s is_train=%s", task, self.model_family, len(self.windows), self.max_nucleotides, self.max_tokens, self.overlap, self.reverse_complement, self.is_train)
+
+    def _build_prewindowed_finding_indices(self) -> None:
+        self.windows = list(self.row_indices)
+        by_source_block: Dict[int, int] = {}
+        by_chrom: Dict[str, int] = {}
+        for row_i in self.row_indices:
+            row = self.raw[row_i]
+            meta = parse_metadata(row.get("metadata", {}))
+            source_start = meta.start
+            raw_meta = row.get("metadata", {})
+            if isinstance(raw_meta, dict):
+                source_start = int(raw_meta.get("smoke_source_block_start", source_start))
+            by_source_block[source_start] = by_source_block.get(source_start, 0) + 1
+            by_chrom[meta.chrom] = by_chrom.get(meta.chrom, 0) + 1
+        logger.info(
+            "[finding.prewindowed] task=%s samples=%d chromosomes=%s samples_per_source_block=%s",
+            self.task,
+            len(self.windows),
+            by_chrom,
+            dict(sorted(by_source_block.items())),
+        )
 
     def _build_finding_windows(self) -> None:
         grouped: Dict[Tuple[str, str], List[Tuple[int, ParsedMetadata]]] = {}
@@ -518,6 +543,17 @@ class GenatatorDataset(torch.utils.data.Dataset):
         return len(self.windows)
 
     def _slice_finding(self, idx: int) -> Tuple[str, np.ndarray, ParsedMetadata, int]:
+        if self.prewindowed:
+            row_i = self.windows[idx]
+            row = self.raw[row_i]
+            seq = str(row["dna_sequence"]).upper()
+            labels = np.asarray(row["targets"], dtype=np.float32)[:, self.target_indices]
+            meta = parse_metadata(row.get("metadata", {}))
+            if len(seq) != labels.shape[0]:
+                raise RuntimeError(
+                    f"Prewindowed gene-finding DNA/label mismatch row={row_i}: seq={len(seq)} labels={labels.shape}"
+                )
+            return seq, labels, meta, 0
         key, s, e = self.windows[idx]
         return self.assemblies[key].get_slice(s, e, self.target_indices)
 
