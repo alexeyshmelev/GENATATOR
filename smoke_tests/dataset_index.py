@@ -1,22 +1,18 @@
 from __future__ import annotations
 
-import gc
 import json
-import os
 import re
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-import numpy as np
 from tqdm.auto import tqdm
 
 GF_REPO_ID = "AIRI-Institute/genatator-gene-finding-dataset"
 SEG_REPO_ID = "AIRI-Institute/genatator-gene-segmentation-dataset"
 GF_SPLIT_PREFIX = "data/test/"
-SEG_REMOTE_PARQUET = "val-human/data.parquet"
-INDEX_SCHEMA_VERSION = 3
+SEG_CONFIG_PREFIX = "val-human/"
+INDEX_SCHEMA_VERSION = 4
 
 
 def _json_dump(path: Path, value: Any) -> None:
@@ -28,6 +24,15 @@ def _json_dump(path: Path, value: Any) -> None:
 
 def _json_load(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _write_jsonl(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write(json.dumps(row, separators=(",", ":"), ensure_ascii=False) + "\n")
+    tmp.replace(path)
 
 
 def _parse_metadata(value: Any) -> Dict[str, Any]:
@@ -59,8 +64,8 @@ def _parse_metadata(value: Any) -> Dict[str, Any]:
 
 
 def _chrom_aliases(chromosome: str) -> set[str]:
-    out = {str(chromosome)}
     value = str(chromosome)
+    out = {value}
     if value.lower().startswith("chr"):
         out.add(value[3:])
     elif value.isdigit():
@@ -69,9 +74,7 @@ def _chrom_aliases(chromosome: str) -> set[str]:
 
 
 def _chrom_matches(value: Any, aliases: set[str]) -> bool:
-    value = str(value or "")
-    candidates = _chrom_aliases(value)
-    return bool(candidates & aliases)
+    return bool(_chrom_aliases(str(value or "")) & aliases)
 
 
 def _hf_cache_repo_dir(repo_id: str, repo_type: str = "dataset") -> Path:
@@ -79,7 +82,7 @@ def _hf_cache_repo_dir(repo_id: str, repo_type: str = "dataset") -> Path:
 
     prefix = "datasets" if repo_type == "dataset" else "models"
     owner, name = repo_id.split("/", 1)
-    return Path(HF_HUB_CACHE) / f"{prefix}--{owner}--{name}"
+    return Path(HF_HUB_CACHE).expanduser().resolve() / f"{prefix}--{owner}--{name}"
 
 
 def _latest_snapshot(repo_id: str, repo_type: str = "dataset") -> Optional[Path]:
@@ -88,31 +91,28 @@ def _latest_snapshot(repo_id: str, repo_type: str = "dataset") -> Optional[Path]
     if not snapshots.exists():
         return None
     dirs = [p for p in snapshots.iterdir() if p.is_dir()]
-    if not dirs:
-        return None
-    return max(dirs, key=lambda p: p.stat().st_mtime)
+    return max(dirs, key=lambda p: p.stat().st_mtime) if dirs else None
 
 
 def _resolve_hf_file(repo_id: str, filename: str, local_files_only: bool) -> Path:
     from huggingface_hub import hf_hub_download
 
     try:
-        path = Path(
-            hf_hub_download(
-                repo_id=repo_id,
-                filename=filename,
-                repo_type="dataset",
-                local_files_only=True,
-            )
-        ).resolve()
-        print(f"[dataset-location] reuse HF cache file: {path}")
-        return path
+        path = hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            repo_type="dataset",
+            local_files_only=True,
+        )
+        resolved = Path(path).resolve()
+        print(f"[dataset-location] reuse HF cache file: {resolved}")
+        return resolved
     except Exception as cache_error:
         if local_files_only:
             raise RuntimeError(
-                f"Required dataset file is not in the local HF cache: {repo_id}/{filename}"
+                f"Required dataset file is absent from the local HF cache: {repo_id}/{filename}"
             ) from cache_error
-        print(f"[dataset-location] downloading one required file: {repo_id}/{filename}")
+        print(f"[dataset-location] downloading required selected file: {repo_id}/{filename}")
         return Path(
             hf_hub_download(
                 repo_id=repo_id,
@@ -129,10 +129,11 @@ def _list_repo_files_cached(repo_id: str, manifest_path: Path, refresh: bool) ->
         files = list(payload["files"])
         print(f"[dataset-index] reuse repository file manifest: {manifest_path} files={len(files)}")
         return files
+
     from huggingface_hub import HfApi
 
-    print(f"[dataset-index] listing repository files once: {repo_id}")
-    files = HfApi().list_repo_files(repo_id=repo_id, repo_type="dataset")
+    print(f"[dataset-index] list repository files once: {repo_id}")
+    files = list(HfApi().list_repo_files(repo_id=repo_id, repo_type="dataset"))
     _json_dump(manifest_path, {"repo_id": repo_id, "files": files})
     return files
 
@@ -140,147 +141,89 @@ def _list_repo_files_cached(repo_id: str, manifest_path: Path, refresh: bool) ->
 def _metadata_from_gene_finding_parquet(path: Path) -> Dict[str, Any]:
     import pyarrow.parquet as pq
 
-    table = pq.read_table(str(path), columns=["metadata"], memory_map=True)
+    parquet = pq.ParquetFile(str(path))
+    table = parquet.read(columns=["metadata"], use_threads=False)
     if table.num_rows != 1:
         raise RuntimeError(f"Expected one row in gene-finding parquet {path}, found {table.num_rows}")
     return _parse_metadata(table.column("metadata")[0].as_py())
 
 
-
-
-def _metadata_from_remote_gene_finding_parquet(
-    fs: Any, repo_id: str, filename: str
-) -> Dict[str, Any]:
-    """Read only the metadata column from one remote parquet sample.
-
-    HfFileSystem exposes a seekable file object, so PyArrow performs range reads
-    for the parquet footer and the tiny metadata column instead of downloading
-    the DNA and target columns. This is intentionally used only while building
-    the persistent smoke index.
-    """
+def _metadata_from_remote_gene_finding_parquet(fs: Any, filename: str) -> Dict[str, Any]:
+    """Read only the Parquet footer and metadata column through HTTP range requests."""
     import pyarrow.parquet as pq
 
-    remote_path = f"datasets/{repo_id}/{filename}"
+    remote_path = f"datasets/{GF_REPO_ID}/{filename}"
     with fs.open(remote_path, "rb") as handle:
         parquet = pq.ParquetFile(handle)
         table = parquet.read(columns=["metadata"], use_threads=False)
     if table.num_rows != 1:
         raise RuntimeError(
-            f"Expected one row in remote gene-finding parquet {remote_path}, "
-            f"found {table.num_rows}"
+            f"Expected one row in remote gene-finding parquet {remote_path}, found {table.num_rows}"
         )
     return _parse_metadata(table.column("metadata")[0].as_py())
 
 
-def _nested_target_scalar_to_numpy(scalar: Any) -> np.ndarray:
-    """Convert one Arrow scalar containing L x C targets without Python-list expansion."""
-    import pyarrow as pa
+def _local_gene_finding_parquets(local_dataset_path: str) -> List[Tuple[str, Path]]:
+    root = Path(local_dataset_path).expanduser().resolve()
+    if not root.exists():
+        raise FileNotFoundError(root)
+    print(f"[dataset-location] gene-finding local source: {root}")
+    if root.is_file():
+        return [(root.name, root)]
 
-    outer = scalar.values
-    if pa.types.is_fixed_size_list(outer.type):
-        width = int(outer.type.list_size)
-        flat = outer.values.to_numpy(zero_copy_only=False)
-        return np.asarray(flat, dtype=np.float32).reshape(len(outer), width)
-    if pa.types.is_list(outer.type) or pa.types.is_large_list(outer.type):
-        offsets = outer.offsets.to_numpy(zero_copy_only=False).astype(np.int64)
-        widths = np.diff(offsets)
-        if widths.size == 0:
-            return np.zeros((0, 0), dtype=np.float32)
-        if not np.all(widths == widths[0]):
-            raise RuntimeError("Gene-finding target channel width is not constant")
-        width = int(widths[0])
-        flat_values = outer.values
-        start = int(offsets[0])
-        stop = int(offsets[-1])
-        flat = flat_values.slice(start, stop - start).to_numpy(zero_copy_only=False)
-        return np.asarray(flat, dtype=np.float32).reshape(len(outer), width)
-    raise RuntimeError(f"Unsupported Arrow targets type: {outer.type}")
-
-
-def _read_gene_finding_block(path: Path) -> Tuple[str, np.ndarray, Dict[str, Any]]:
-    import pyarrow.parquet as pq
-
-    table = pq.read_table(str(path), columns=["dna_sequence", "targets", "metadata"], memory_map=True)
-    if table.num_rows != 1:
-        raise RuntimeError(f"Expected one row in gene-finding parquet {path}, found {table.num_rows}")
-    dna = str(table.column("dna_sequence")[0].as_py()).upper()
-    targets = _nested_target_scalar_to_numpy(table.column("targets")[0])
-    metadata = _parse_metadata(table.column("metadata")[0].as_py())
-    if len(dna) != targets.shape[0]:
-        raise RuntimeError(f"DNA/target length mismatch in {path}: {len(dna)} vs {targets.shape}")
-    return dna, targets, metadata
-
-
-def _evenly_pick(values: np.ndarray, count: int) -> List[int]:
-    if values.size == 0 or count <= 0:
-        return []
-    positions = np.linspace(0, values.size - 1, num=min(count, values.size), dtype=np.int64)
-    return [int(values[i]) for i in positions]
-
-
-def _window_around(position: int, length: int, context: int) -> Tuple[int, int]:
-    if length <= context:
-        return 0, length
-    # Smoke windows are selected from the same 50%-overlap grid used by normal
-    # chromosome sliding. The positive position is mapped to the nearest grid
-    # window rather than creating an arbitrary crop.
-    step = max(1, context // 2)
-    desired = max(0, int(position) - context // 2)
-    start = (desired // step) * step
-    start = max(0, min(length - context, start))
-    return start, start + context
-
-
-def _choose_windows(targets: np.ndarray, context: int, count: int, task: str) -> List[Tuple[int, int]]:
-    length = targets.shape[0]
-    if task == "edge":
-        positive = np.flatnonzero(np.max(targets[:, 0:4], axis=1) > 0.05)
-        centers = _evenly_pick(positive, count)
-    elif task == "region":
-        binary = np.max(targets[:, 4:6], axis=1) >= 0.5
-        transitions = np.flatnonzero(binary[1:] != binary[:-1]) + 1
-        centers = _evenly_pick(transitions, count)
-        if len(centers) < count:
-            positive = np.flatnonzero(binary)
-            for p in _evenly_pick(positive, count - len(centers)):
-                if p not in centers:
-                    centers.append(p)
+    split_root = root / "data" / "test"
+    if split_root.exists():
+        files = sorted(split_root.rglob("*.parquet"))
+    elif root.name == "test" or "test" in root.parts:
+        files = sorted(root.rglob("*.parquet"))
     else:
-        raise ValueError(task)
-    if not centers:
-        centers = [int(x) for x in np.linspace(0, max(0, length - 1), num=max(1, count), dtype=np.int64)]
-    windows: List[Tuple[int, int]] = []
-    for center in centers:
-        window = _window_around(center, length, context)
-        if window not in windows:
-            windows.append(window)
-    fill_positions = np.linspace(0, max(0, length - 1), num=max(1, count * 4), dtype=np.int64)
-    for center in fill_positions:
-        if len(windows) >= count:
-            break
-        window = _window_around(int(center), length, context)
-        if window not in windows:
-            windows.append(window)
-    return windows[:count]
+        files = sorted(
+            p for p in root.rglob("*.parquet")
+            if "/data/test/" in p.as_posix()
+        )
+    if not files:
+        raise RuntimeError(
+            f"No gene-finding test-split parquet files found under {root}. "
+            "Pass the dataset snapshot root, data/test directory, or one parquet file."
+        )
+    return [(str(p.relative_to(root)), p.resolve()) for p in files]
 
 
-def _write_jsonl(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        for row in rows:
-            fh.write(json.dumps(row, separators=(",", ":")) + "\n")
-    tmp.replace(path)
+def _remote_gene_finding_parquets(index_dir: Path, refresh: bool) -> Tuple[List[Tuple[str, Optional[Path]]], Optional[Path]]:
+    cache_root = _hf_cache_repo_dir(GF_REPO_ID)
+    snapshot = _latest_snapshot(GF_REPO_ID)
+    print(f"[dataset-location] HF_HUB_CACHE={cache_root.parent}")
+    print(f"[dataset-location] gene-finding cache repository={cache_root}")
+    print(f"[dataset-location] gene-finding cache snapshot={snapshot or '<not cached>'}")
+
+    manifest = _list_repo_files_cached(
+        GF_REPO_ID,
+        index_dir / "gene_finding_repo_files.json",
+        refresh,
+    )
+    names = sorted(
+        f for f in manifest
+        if f.startswith(GF_SPLIT_PREFIX) and f.endswith(".parquet")
+    )
+    if not names:
+        raise RuntimeError(f"No parquet files found under {GF_REPO_ID}/{GF_SPLIT_PREFIX}")
+    entries: List[Tuple[str, Optional[Path]]] = []
+    for name in names:
+        local = snapshot / name if snapshot is not None else None
+        entries.append((name, local.resolve() if local is not None and local.exists() else None))
+    print(
+        f"[dataset-location] gene-finding required source=test parquet_files={len(entries)} "
+        f"already_cached={sum(path is not None for _, path in entries)}"
+    )
+    return entries, snapshot
 
 
 @dataclass
 class GeneFindingSelection:
     index_path: Path
-    edge_data_path: Path
-    region_data_path: Path
+    selected_index_path: Path
+    source_samples_scanned: int
     selected_blocks: int
-    edge_samples: int
-    region_samples: int
     assembled_length: int
 
 
@@ -293,72 +236,47 @@ def prepare_gene_finding_selection(
     local_dataset_path: Optional[str],
     local_files_only: bool,
     refresh: bool,
-    edge_context: int,
-    region_context: int,
-    windows_per_block: int,
 ) -> GeneFindingSelection:
+    """Scan every gene-finding test sample and retain all blocks of one chromosome.
+
+    Only metadata is read for rejected samples. Full DNA/target arrays are never copied
+    into the smoke index. The selected block files are loaded lazily, one block at a
+    time, by the training/validation/inference datasets.
+    """
     alias_set = set(aliases) | _chrom_aliases(chromosome)
     index_dir.mkdir(parents=True, exist_ok=True)
     selected_data_dir.mkdir(parents=True, exist_ok=True)
     safe_chrom = re.sub(r"[^A-Za-z0-9_.-]", "_", chromosome)
     index_path = index_dir / f"gene_finding_test_{safe_chrom}.json"
-    edge_data = selected_data_dir / f"gene_finding_test_{safe_chrom}_edge.jsonl"
-    region_data = selected_data_dir / f"gene_finding_test_{safe_chrom}_region.jsonl"
+    selected_index_path = index_dir / f"gene_finding_test_{safe_chrom}_selected_blocks.jsonl"
 
-    if index_path.exists() and edge_data.exists() and region_data.exists() and not refresh:
+    if index_path.exists() and selected_index_path.exists() and not refresh:
         payload = _json_load(index_path)
         if (
             payload.get("schema_version") == INDEX_SCHEMA_VERSION
             and payload.get("chromosome") == chromosome
-            and int(payload.get("edge_context", -1)) == int(edge_context)
-            and int(payload.get("region_context", -1)) == int(region_context)
-            and int(payload.get("windows_per_block", -1)) == int(windows_per_block)
+            and all(Path(row["local_path"]).exists() for row in payload.get("selected_blocks", []))
         ):
-            paths_ok = all(Path(x["local_path"]).exists() for x in payload["selected_blocks"])
-            if paths_ok:
-                print(f"[dataset-index] reuse gene-finding chromosome index: {index_path}")
-                for _ in tqdm(payload["selected_blocks"], desc="reuse gene-finding selected block index"):
-                    pass
-                return GeneFindingSelection(
-                    index_path=index_path,
-                    edge_data_path=edge_data,
-                    region_data_path=region_data,
-                    selected_blocks=len(payload["selected_blocks"]),
-                    edge_samples=int(payload["edge_samples"]),
-                    region_samples=int(payload["region_samples"]),
-                    assembled_length=int(payload["assembled_length"]),
-                )
+            print(f"[dataset-index] reuse gene-finding chromosome index: {index_path}")
+            for _ in tqdm(payload["selected_blocks"], desc="reuse all selected gene-finding block indexes", unit="block"):
+                pass
+            return GeneFindingSelection(
+                index_path=index_path,
+                selected_index_path=selected_index_path,
+                source_samples_scanned=int(payload["source_samples_scanned"]),
+                selected_blocks=len(payload["selected_blocks"]),
+                assembled_length=int(payload["assembled_length"]),
+            )
 
     if local_dataset_path:
-        root = Path(local_dataset_path).expanduser().resolve()
-        if not root.exists():
-            raise FileNotFoundError(root)
-        print(f"[dataset-location] gene-finding local dataset: {root}")
-        if root.is_file():
-            all_test_paths = [root]
-        else:
-            candidates = list(root.glob("data/test/**/*.parquet"))
-            if not candidates:
-                candidates = list(root.rglob("*.parquet"))
-            all_test_paths = sorted(p.resolve() for p in candidates)
-        manifest_entries = [(str(p), p) for p in all_test_paths]
-        print(f"[dataset-location] local gene-finding test parquet files={len(manifest_entries)}")
+        manifest_entries = [(name, path) for name, path in _local_gene_finding_parquets(local_dataset_path)]
+        snapshot = None
+        source_signature = f"local:{Path(local_dataset_path).expanduser().resolve()}"
+        print(f"[dataset-location] gene-finding local test parquet_files={len(manifest_entries)}")
     else:
-        snapshot = _latest_snapshot(GF_REPO_ID)
-        print(f"[dataset-location] gene-finding HF cache snapshot: {snapshot or '<not cached>'}")
-        manifest_file = index_dir / "gene_finding_repo_files.json"
-        files = _list_repo_files_cached(GF_REPO_ID, manifest_file, refresh)
-        test_files = sorted(f for f in files if f.startswith(GF_SPLIT_PREFIX) and f.endswith(".parquet"))
-        manifest_entries = [(f, None) for f in test_files]
-        print(f"[dataset-location] gene-finding remote test manifest files={len(manifest_entries)}")
+        manifest_entries, snapshot = _remote_gene_finding_parquets(index_dir, refresh)
+        source_signature = f"hf:{GF_REPO_ID}:test"
 
-    selected: List[Dict[str, Any]] = []
-    remote_fs = None
-    source_signature = (
-        f"local:{Path(local_dataset_path).expanduser().resolve()}"
-        if local_dataset_path
-        else f"hf:{GF_REPO_ID}"
-    )
     metadata_cache_path = index_dir / "gene_finding_test_sample_metadata.json"
     metadata_cache: Dict[str, Dict[str, Any]] = {}
     if metadata_cache_path.exists() and not refresh:
@@ -366,59 +284,53 @@ def prepare_gene_finding_selection(
         if cached_payload.get("source_signature") == source_signature:
             metadata_cache = dict(cached_payload.get("entries", {}))
             print(
-                f"[dataset-index] reuse per-sample gene-finding metadata cache: "
-                f"{metadata_cache_path} entries={len(metadata_cache)}"
+                f"[dataset-index] reuse per-sample metadata cache: {metadata_cache_path} "
+                f"entries={len(metadata_cache)}"
             )
+
+    remote_fs = None
     if not local_dataset_path:
         from huggingface_hub import HfFileSystem
 
         remote_fs = HfFileSystem()
         print(
-            "[dataset-location] uncached gene-finding samples will be inspected "
-            "through HfFileSystem parquet range reads (metadata column only)"
+            "[dataset-location] uncached rejected test samples are inspected through "
+            "Parquet metadata range reads; only selected chromosome files are downloaded"
         )
 
-    local_metadata_reads = 0
-    remote_metadata_reads = 0
-    cached_metadata_reads = 0
-    progress = tqdm(
-        manifest_entries,
-        desc="scan every gene-finding test sample metadata",
-        unit="sample",
-    )
+    selected: List[Dict[str, Any]] = []
+    cached_reads = local_reads = remote_reads = 0
+    progress = tqdm(manifest_entries, desc="scan every gene-finding test sample metadata", unit="sample")
     for sample_i, (repo_name, local_path) in enumerate(progress, start=1):
-        path: Optional[Path]
+        path: Optional[Path] = Path(local_path).resolve() if local_path is not None else None
         if repo_name in metadata_cache:
             meta = dict(metadata_cache[repo_name])
-            cached_metadata_reads += 1
-            if local_path is not None:
-                path = Path(local_path).resolve()
-            else:
-                cached_path = snapshot / repo_name if snapshot is not None else None
-                path = cached_path.resolve() if cached_path is not None and cached_path.exists() else None
-        elif local_path is not None:
-            path = Path(local_path).resolve()
+            cached_reads += 1
+        elif path is not None:
             meta = _metadata_from_gene_finding_parquet(path)
             metadata_cache[repo_name] = meta
-            local_metadata_reads += 1
+            local_reads += 1
         else:
-            cached_path = snapshot / repo_name if snapshot is not None else None
-            if cached_path is not None and cached_path.exists():
-                path = cached_path.resolve()
-                meta = _metadata_from_gene_finding_parquet(path)
-                local_metadata_reads += 1
-            else:
-                if local_files_only:
-                    raise RuntimeError(
-                        "Cannot inspect every gene-finding test sample with "
-                        "--hf-local-files-only because this parquet is absent from the HF cache: "
-                        f"{repo_name}"
-                    )
-                assert remote_fs is not None
-                meta = _metadata_from_remote_gene_finding_parquet(remote_fs, GF_REPO_ID, repo_name)
-                path = None
-                remote_metadata_reads += 1
+            if local_files_only:
+                raise RuntimeError(
+                    "Cannot scan the complete gene-finding test split with --hf-local-files-only; "
+                    f"this parquet is missing from the cache: {repo_name}"
+                )
+            assert remote_fs is not None
+            meta = _metadata_from_remote_gene_finding_parquet(remote_fs, repo_name)
             metadata_cache[repo_name] = meta
+            remote_reads += 1
+
+        if _chrom_matches(meta.get("chrom", meta.get("chromosome", "")), alias_set):
+            if path is None:
+                path = _resolve_hf_file(GF_REPO_ID, repo_name, local_files_only=local_files_only)
+            selected.append(
+                {
+                    "repo_file": repo_name,
+                    "local_path": str(path.resolve()),
+                    "metadata": meta,
+                }
+            )
 
         if sample_i % 25 == 0:
             _json_dump(
@@ -430,22 +342,12 @@ def prepare_gene_finding_selection(
                 },
             )
         progress.set_postfix(
-            cached=cached_metadata_reads,
-            local=local_metadata_reads,
-            remote=remote_metadata_reads,
+            cached=cached_reads,
+            local=local_reads,
+            remote=remote_reads,
             selected=len(selected),
         )
-
-        if _chrom_matches(meta.get("chrom", meta.get("chromosome", "")), alias_set):
-            if path is None:
-                path = _resolve_hf_file(GF_REPO_ID, repo_name, local_files_only=local_files_only)
-            selected.append(
-                {
-                    "repo_file": repo_name,
-                    "local_path": str(Path(path).resolve()),
-                    "metadata": meta,
-                }
-            )
+    progress.close()
 
     _json_dump(
         metadata_cache_path,
@@ -455,144 +357,179 @@ def prepare_gene_finding_selection(
             "entries": metadata_cache,
         },
     )
-    print(
-        f"[dataset-index] gene-finding metadata scan complete: "
-        f"samples={len(manifest_entries)} cached_reads={cached_metadata_reads} "
-        f"local_reads={local_metadata_reads} remote_metadata_only_reads={remote_metadata_reads} "
-        f"selected={len(selected)} metadata_cache={metadata_cache_path}"
-    )
-
     if not selected:
-        raise RuntimeError(f"No gene-finding test blocks found for chromosome aliases={sorted(alias_set)}")
-    selected.sort(key=lambda x: int(x["metadata"].get("start", 0)))
-    starts = [int(x["metadata"].get("start", 0)) for x in selected]
-    ends = [int(x["metadata"].get("end", 0)) for x in selected]
+        raise RuntimeError(f"No gene-finding test samples found for chromosome aliases={sorted(alias_set)}")
+
+    selected.sort(key=lambda row: int(row["metadata"].get("start", 0)))
+    starts = [int(row["metadata"].get("start", 0)) for row in selected]
+    ends = [int(row["metadata"].get("end", 0)) for row in selected]
     assembled_length = max(ends) - min(starts)
-    print(
-        f"[dataset-index] selected gene-finding blocks={len(selected)} chromosome={chromosome} "
-        f"assembled_total_length={assembled_length}"
-    )
 
-    edge_rows: List[Dict[str, Any]] = []
-    region_rows: List[Dict[str, Any]] = []
-    block_stats: List[Dict[str, Any]] = []
-    for block in tqdm(selected, desc="extract informative windows from every selected gene-finding block"):
-        dna, targets, meta = _read_gene_finding_block(Path(block["local_path"]))
-        block_start = int(meta.get("start", 0))
-        edge_windows = _choose_windows(targets, edge_context, windows_per_block, "edge")
-        region_windows = _choose_windows(targets, region_context, windows_per_block, "region")
-        for task, windows, out_rows in (
-            ("edge", edge_windows, edge_rows),
-            ("region", region_windows, region_rows),
-        ):
-            for local_start, local_end in windows:
-                item_meta = dict(meta)
-                item_meta["start"] = block_start + local_start
-                item_meta["end"] = block_start + local_end
-                item_meta["sequence_length"] = local_end - local_start
-                item_meta["smoke_source_block_start"] = block_start
-                item_meta["smoke_task"] = task
-                out_rows.append(
-                    {
-                        "dna_sequence": dna[local_start:local_end],
-                        "targets": targets[local_start:local_end].tolist(),
-                        "metadata": item_meta,
-                    }
-                )
-        block_stats.append(
+    # The JSONL contains only selected block references and metadata. It is the
+    # complete chromosome input for every edge/region train, validation and test job.
+    _write_jsonl(
+        selected_index_path,
+        [
             {
-                "local_path": block["local_path"],
-                "start": int(meta.get("start", 0)),
-                "end": int(meta.get("end", 0)),
-                "edge_windows": [[int(a), int(b)] for a, b in edge_windows],
-                "region_windows": [[int(a), int(b)] for a, b in region_windows],
-                "edge_positive_nucleotides": int(np.count_nonzero(np.max(targets[:, 0:4], axis=1) > 0.05)),
-                "region_positive_nucleotides": int(np.count_nonzero(np.max(targets[:, 4:6], axis=1) >= 0.5)),
+                "parquet_path": row["local_path"],
+                "repo_file": row["repo_file"],
+                "metadata": row["metadata"],
             }
-        )
-        del dna, targets
-        gc.collect()
-
-    _write_jsonl(edge_data, edge_rows)
-    _write_jsonl(region_data, region_rows)
+            for row in selected
+        ],
+    )
     payload = {
         "schema_version": INDEX_SCHEMA_VERSION,
         "repo_id": GF_REPO_ID,
         "source_split": "test",
         "chromosome": chromosome,
         "aliases": sorted(alias_set),
+        "source_samples_scanned": len(manifest_entries),
         "selected_blocks": selected,
-        "block_stats": block_stats,
         "assembled_length": assembled_length,
-        "edge_context": edge_context,
-        "region_context": region_context,
-        "windows_per_block": windows_per_block,
-        "edge_samples": len(edge_rows),
-        "region_samples": len(region_rows),
-        "edge_data_path": str(edge_data),
-        "region_data_path": str(region_data),
+        "selected_index_path": str(selected_index_path),
+        "loading_policy": "selected parquet blocks are loaded lazily one at a time; every 50%-overlap model window is used",
     }
     _json_dump(index_path, payload)
     print(
-        f"[dataset-index] saved gene-finding index={index_path} edge_samples={len(edge_rows)} "
-        f"region_samples={len(region_rows)}"
+        f"[dataset-index] gene-finding scan complete: source_test_samples={len(manifest_entries)} "
+        f"selected_blocks={len(selected)} chromosome={chromosome} "
+        f"assembled_total_length={assembled_length}"
     )
-    return GeneFindingSelection(index_path, edge_data, region_data, len(selected), len(edge_rows), len(region_rows), assembled_length)
+    print(f"[dataset-index] saved selected block index: {selected_index_path}")
+    return GeneFindingSelection(
+        index_path=index_path,
+        selected_index_path=selected_index_path,
+        source_samples_scanned=len(manifest_entries),
+        selected_blocks=len(selected),
+        assembled_length=assembled_length,
+    )
+
+
+def _local_segmentation_parquets(local_dataset_path: str) -> List[Tuple[str, Path]]:
+    root = Path(local_dataset_path).expanduser().resolve()
+    if not root.exists():
+        raise FileNotFoundError(root)
+    print(f"[dataset-location] segmentation local source: {root}")
+    if root.is_file():
+        return [(root.name, root)]
+
+    config_root = root / "val-human"
+    if config_root.exists():
+        files = sorted(config_root.rglob("*.parquet"))
+    elif root.name == "val-human" or "val-human" in root.parts:
+        files = sorted(root.rglob("*.parquet"))
+    else:
+        files = sorted(p for p in root.rglob("*.parquet") if "/val-human/" in p.as_posix())
+    if not files:
+        raise RuntimeError(
+            f"No val-human parquet files found under {root}. "
+            "Smoke tests intentionally exclude train-human and train-multi-specie."
+        )
+    return [(str(p.relative_to(root)), p.resolve()) for p in files]
+
+
+def _remote_segmentation_parquets(
+    index_dir: Path,
+    refresh: bool,
+    local_files_only: bool,
+) -> List[Tuple[str, Path]]:
+    cache_root = _hf_cache_repo_dir(SEG_REPO_ID)
+    snapshot = _latest_snapshot(SEG_REPO_ID)
+    print(f"[dataset-location] HF_HUB_CACHE={cache_root.parent}")
+    print(f"[dataset-location] segmentation cache repository={cache_root}")
+    print(f"[dataset-location] segmentation cache snapshot={snapshot or '<not cached>'}")
+    manifest = _list_repo_files_cached(
+        SEG_REPO_ID,
+        index_dir / "segmentation_repo_files.json",
+        refresh,
+    )
+    names = sorted(
+        f for f in manifest
+        if f.startswith(SEG_CONFIG_PREFIX) and f.endswith(".parquet")
+    )
+    if not names:
+        raise RuntimeError(f"No parquet files found under {SEG_REPO_ID}/{SEG_CONFIG_PREFIX}")
+    print(
+        f"[dataset-location] segmentation required source=val-human parquet_files={len(names)}; "
+        "train-human and train-multi-specie are excluded"
+    )
+    paths = []
+    for name in tqdm(names, desc="download/reuse val-human parquet files only", unit="file"):
+        paths.append((name, _resolve_hf_file(SEG_REPO_ID, name, local_files_only=local_files_only)))
+    return paths
 
 
 @dataclass
 class TranscriptSelection:
     index_path: Path
     selected_parquet_path: Path
+    source_rows_scanned: int
     selected_rows: int
     total_nucleotides: int
     transcript_type_counts: Dict[str, int]
 
 
-def _resolve_segmentation_parquet(local_dataset_path: Optional[str], local_files_only: bool) -> Path:
-    if local_dataset_path:
-        p = Path(local_dataset_path).expanduser().resolve()
-        if not p.exists():
-            raise FileNotFoundError(p)
-        if p.is_file():
-            print(f"[dataset-location] segmentation local parquet: {p}")
-            return p
-        candidates = [p / SEG_REMOTE_PARQUET, p / "data.parquet"]
-        candidates += sorted(p.rglob("*.parquet"))
-        for candidate in candidates:
-            if candidate.exists() and "val-human" in str(candidate):
-                print(f"[dataset-location] segmentation local val-human parquet: {candidate}")
-                return candidate.resolve()
-        raise RuntimeError(f"Could not find val-human parquet under {p}")
-    snapshot = _latest_snapshot(SEG_REPO_ID)
-    print(f"[dataset-location] segmentation HF cache snapshot: {snapshot or '<not cached>'}")
-    return _resolve_hf_file(SEG_REPO_ID, SEG_REMOTE_PARQUET, local_files_only)
-
-
-def _scan_segmentation_metadata(parquet_path: Path, aliases: set[str], batch_size: int) -> Tuple[List[int], List[Dict[str, Any]], int]:
+def _scan_transcript_metadata_file(
+    parquet_path: Path,
+    aliases: set[str],
+    batch_size: int,
+) -> Tuple[List[Dict[str, Any]], int]:
     import pyarrow.parquet as pq
 
-    pf = pq.ParquetFile(str(parquet_path))
-    selected_indices: List[int] = []
-    selected_meta: List[Dict[str, Any]] = []
+    parquet = pq.ParquetFile(str(parquet_path))
+    columns = ["metadata"]
+    has_status = "status" in parquet.schema_arrow.names
+    if has_status:
+        columns.append("status")
+    total_batches = (parquet.metadata.num_rows + batch_size - 1) // batch_size
+    selected: List[Dict[str, Any]] = []
     global_i = 0
-    iterator = pf.iter_batches(batch_size=batch_size, columns=["metadata", "status"])
-    total_batches = (pf.metadata.num_rows + batch_size - 1) // batch_size
-    for batch in tqdm(iterator, total=total_batches, desc="scan every val-human transcript metadata row"):
+    iterator = parquet.iter_batches(batch_size=batch_size, columns=columns, use_threads=False)
+    for batch in tqdm(
+        iterator,
+        total=total_batches,
+        desc=f"scan transcript metadata: {parquet_path.name}",
+        unit="batch",
+        leave=False,
+    ):
         metas = batch.column(batch.schema.get_field_index("metadata")).to_pylist()
-        statuses = batch.column(batch.schema.get_field_index("status")).to_pylist()
+        statuses = (
+            batch.column(batch.schema.get_field_index("status")).to_pylist()
+            if has_status
+            else [None] * len(metas)
+        )
         for meta_value, status in zip(metas, statuses):
             meta = _parse_metadata(meta_value)
-            if _chrom_matches(meta.get("chrom", ""), aliases):
-                selected_indices.append(global_i)
-                selected_meta.append({"row_index": global_i, "metadata": meta, "status": int(status)})
+            if _chrom_matches(meta.get("chrom", meta.get("chromosome", "")), aliases):
+                selected.append(
+                    {
+                        "row_index": global_i,
+                        "metadata": meta,
+                        "status": None if status is None else int(status),
+                    }
+                )
             global_i += 1
-    return selected_indices, selected_meta, int(pf.metadata.num_rows)
+    return selected, int(parquet.metadata.num_rows)
 
 
-def _extract_selected_segmentation_rows(
-    parquet_path: Path,
-    selected_indices: Sequence[int],
+def _selected_rows_by_row_group(parquet: Any, global_indices: Sequence[int]) -> Dict[int, set[int]]:
+    starts: List[int] = []
+    cursor = 0
+    for group_i in range(parquet.metadata.num_row_groups):
+        starts.append(cursor)
+        cursor += int(parquet.metadata.row_group(group_i).num_rows)
+    out: Dict[int, set[int]] = {}
+    group_i = 0
+    for global_index in sorted(int(x) for x in global_indices):
+        while group_i + 1 < len(starts) and global_index >= starts[group_i + 1]:
+            group_i += 1
+        out.setdefault(group_i, set()).add(global_index - starts[group_i])
+    return out
+
+
+def _copy_selected_transcript_rows(
+    selected_entries: Sequence[Dict[str, Any]],
     output_path: Path,
     batch_size: int,
 ) -> Tuple[int, int, Dict[str, int]]:
@@ -601,91 +538,69 @@ def _extract_selected_segmentation_rows(
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    pf = pq.ParquetFile(str(parquet_path))
-    selected_sorted = sorted(int(x) for x in selected_indices)
-    selected_set = set(selected_sorted)
+    by_file: Dict[str, List[int]] = {}
+    for entry in selected_entries:
+        by_file.setdefault(str(entry["source_parquet"]), []).append(int(entry["row_index"]))
 
-    row_group_starts: List[int] = []
-    cursor = 0
-    for rg_i in range(pf.metadata.num_row_groups):
-        row_group_starts.append(cursor)
-        cursor += int(pf.metadata.row_group(rg_i).num_rows)
-
-    selected_by_row_group: Dict[int, set[int]] = {}
-    rg_i = 0
-    for global_index in selected_sorted:
-        while (
-            rg_i + 1 < len(row_group_starts)
-            and global_index >= row_group_starts[rg_i + 1]
-        ):
-            rg_i += 1
-        local_index = global_index - row_group_starts[rg_i]
-        selected_by_row_group.setdefault(rg_i, set()).add(local_index)
-
-    print(
-        f"[dataset-index] full transcript columns will be read only from "
-        f"selected_row_groups={sorted(selected_by_row_group)} / "
-        f"total_row_groups={pf.metadata.num_row_groups}; batch_size={batch_size}"
-    )
+    plans: Dict[str, Tuple[Any, Dict[int, set[int]]]] = {}
+    total_batches = 0
+    for filename, indices in by_file.items():
+        parquet = pq.ParquetFile(filename)
+        plan = _selected_rows_by_row_group(parquet, indices)
+        plans[filename] = (parquet, plan)
+        total_batches += sum(
+            math.ceil(int(parquet.metadata.row_group(group_i).num_rows) / batch_size)
+            for group_i in plan
+        )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = output_path.with_suffix(output_path.suffix + ".tmp")
     if tmp.exists():
         tmp.unlink()
     writer = None
-    selected_rows = 0
+    copied = 0
     total_nt = 0
     type_counts: Dict[str, int] = {}
-    total_batches = sum(
-        math.ceil(int(pf.metadata.row_group(i).num_rows) / batch_size)
-        for i in selected_by_row_group
-    )
-    progress = tqdm(total=total_batches, desc="copy only selected chromosome transcripts")
+    progress = tqdm(total=total_batches, desc="copy every selected chromosome transcript", unit="batch")
     try:
-        for group_i in sorted(selected_by_row_group):
-            wanted_local = selected_by_row_group[group_i]
-            group_cursor = 0
-            iterator = pf.iter_batches(
-                batch_size=batch_size,
-                row_groups=[group_i],
-                columns=["dna_sequence", "labels", "metadata", "status"],
-            )
-            for batch in iterator:
-                take_local = [
-                    j
-                    for j in range(batch.num_rows)
-                    if group_cursor + j in wanted_local
-                ]
-                if take_local:
-                    table = pa.Table.from_batches([batch]).take(
-                        pa.array(take_local, type=pa.int64())
-                    )
-                    if writer is None:
-                        writer = pq.ParquetWriter(str(tmp), table.schema, compression="zstd")
-                    writer.write_table(table)
-                    selected_rows += table.num_rows
-                    dnas = table.column("dna_sequence").to_pylist()
-                    metas = table.column("metadata").to_pylist()
-                    total_nt += sum(len(str(x)) for x in dnas)
-                    for m in metas:
-                        transcript_type = str(
-                            _parse_metadata(m).get("transcript_type", "")
-                        )
-                        type_counts[transcript_type] = type_counts.get(transcript_type, 0) + 1
-                group_cursor += batch.num_rows
-                progress.update(1)
-                progress.set_postfix(copied=selected_rows, expected=len(selected_set))
+        for filename in sorted(plans):
+            parquet, plan = plans[filename]
+            for group_i in sorted(plan):
+                wanted_local = plan[group_i]
+                group_cursor = 0
+                iterator = parquet.iter_batches(
+                    batch_size=batch_size,
+                    row_groups=[group_i],
+                    columns=["dna_sequence", "labels", "metadata", "status"],
+                    use_threads=False,
+                )
+                for batch in iterator:
+                    take = [j for j in range(batch.num_rows) if group_cursor + j in wanted_local]
+                    if take:
+                        table = pa.Table.from_batches([batch]).take(pa.array(take, type=pa.int64()))
+                        if writer is None:
+                            writer = pq.ParquetWriter(str(tmp), table.schema, compression="zstd")
+                        writer.write_table(table)
+                        copied += table.num_rows
+                        dnas = table.column("dna_sequence").to_pylist()
+                        metas = table.column("metadata").to_pylist()
+                        total_nt += sum(len(str(dna)) for dna in dnas)
+                        for meta_value in metas:
+                            tx_type = str(_parse_metadata(meta_value).get("transcript_type", ""))
+                            type_counts[tx_type] = type_counts.get(tx_type, 0) + 1
+                    group_cursor += batch.num_rows
+                    progress.update(1)
+                    progress.set_postfix(copied=copied, expected=len(selected_entries))
     finally:
         progress.close()
         if writer is not None:
             writer.close()
-    if selected_rows != len(selected_indices):
+    if copied != len(selected_entries):
         raise RuntimeError(
-            f"Selected transcript extraction mismatch: expected={len(selected_indices)} "
-            f"wrote={selected_rows}"
+            f"Selected transcript extraction mismatch: expected={len(selected_entries)} copied={copied}"
         )
     tmp.replace(output_path)
-    return selected_rows, total_nt, type_counts
+    return copied, total_nt, type_counts
 
 
 def prepare_transcript_selection(
@@ -699,6 +614,7 @@ def prepare_transcript_selection(
     refresh: bool,
     batch_size: int,
 ) -> TranscriptSelection:
+    """Scan every val-human transcript row and persist all requested-chromosome rows."""
     alias_set = set(aliases) | _chrom_aliases(chromosome)
     index_dir.mkdir(parents=True, exist_ok=True)
     selected_data_dir.mkdir(parents=True, exist_ok=True)
@@ -711,30 +627,51 @@ def prepare_transcript_selection(
         if (
             payload.get("schema_version") == INDEX_SCHEMA_VERSION
             and payload.get("chromosome") == chromosome
-            and Path(payload["source_parquet"]).exists()
+            and all(Path(path).exists() for path in payload.get("source_parquets", []))
         ):
             print(f"[dataset-index] reuse transcript chromosome index: {index_path}")
-            for _ in tqdm(payload["selected_rows"], desc="reuse selected transcript row indexes"):
+            for _ in tqdm(payload["selected_rows"], desc="reuse all selected transcript row indexes", unit="transcript"):
                 pass
             return TranscriptSelection(
                 index_path=index_path,
                 selected_parquet_path=selected_parquet,
+                source_rows_scanned=int(payload["source_rows_scanned"]),
                 selected_rows=int(payload["selected_row_count"]),
                 total_nucleotides=int(payload["selected_total_nucleotides"]),
                 transcript_type_counts=dict(payload["transcript_type_counts"]),
             )
 
-    parquet_path = _resolve_segmentation_parquet(local_dataset_path, local_files_only)
-    print(f"[dataset-location] segmentation source file: {parquet_path}")
-    selected_indices, selected_meta, total_rows = _scan_segmentation_metadata(parquet_path, alias_set, batch_size)
-    if not selected_indices:
-        raise RuntimeError(f"No val-human transcript rows found for chromosome aliases={sorted(alias_set)}")
-    print(
-        f"[dataset-index] val-human rows_scanned={total_rows} selected_transcripts={len(selected_indices)} "
-        f"chromosome={chromosome}"
+    if local_dataset_path:
+        source_files = _local_segmentation_parquets(local_dataset_path)
+        print(f"[dataset-location] local val-human parquet_files={len(source_files)}")
+    else:
+        source_files = _remote_segmentation_parquets(index_dir, refresh, local_files_only)
+
+    selected_entries: List[Dict[str, Any]] = []
+    source_rows_scanned = 0
+    file_progress = tqdm(source_files, desc="scan every val-human parquet file", unit="file")
+    for repo_name, parquet_path in file_progress:
+        selected, rows = _scan_transcript_metadata_file(parquet_path, alias_set, batch_size)
+        source_rows_scanned += rows
+        for row in selected:
+            row["repo_file"] = repo_name
+            row["source_parquet"] = str(parquet_path.resolve())
+            selected_entries.append(row)
+        file_progress.set_postfix(rows=source_rows_scanned, selected=len(selected_entries))
+    file_progress.close()
+
+    if not selected_entries:
+        raise RuntimeError(f"No val-human transcripts found for chromosome aliases={sorted(alias_set)}")
+    selected_entries.sort(
+        key=lambda row: (
+            str(row["source_parquet"]),
+            int(row["row_index"]),
+        )
     )
-    selected_count, total_nt, type_counts = _extract_selected_segmentation_rows(
-        parquet_path, selected_indices, selected_parquet, batch_size
+    selected_count, total_nt, type_counts = _copy_selected_transcript_rows(
+        selected_entries,
+        selected_parquet,
+        batch_size,
     )
     payload = {
         "schema_version": INDEX_SCHEMA_VERSION,
@@ -744,17 +681,27 @@ def prepare_transcript_selection(
         "smoke_role": "test",
         "chromosome": chromosome,
         "aliases": sorted(alias_set),
-        "source_parquet": str(parquet_path),
-        "total_source_rows": total_rows,
+        "source_parquets": [str(path.resolve()) for _, path in source_files],
+        "source_rows_scanned": source_rows_scanned,
         "selected_row_count": selected_count,
         "selected_total_nucleotides": total_nt,
         "transcript_type_counts": type_counts,
-        "selected_rows": selected_meta,
+        "selected_rows": selected_entries,
         "selected_parquet": str(selected_parquet),
     }
     _json_dump(index_path, payload)
     print(
-        f"[dataset-index] saved transcript index={index_path} selected_parquet={selected_parquet} "
-        f"transcripts={selected_count} total_nucleotides={total_nt} transcript_types={type_counts}"
+        f"[dataset-index] transcript scan complete: source_val-human_rows={source_rows_scanned} "
+        f"selected_transcripts={selected_count} chromosome={chromosome} "
+        f"selected_total_nucleotides={total_nt} transcript_types={type_counts}"
     )
-    return TranscriptSelection(index_path, selected_parquet, selected_count, total_nt, type_counts)
+    print(f"[dataset-index] saved transcript index={index_path}")
+    print(f"[dataset-index] saved selected transcript parquet={selected_parquet}")
+    return TranscriptSelection(
+        index_path=index_path,
+        selected_parquet_path=selected_parquet,
+        source_rows_scanned=source_rows_scanned,
+        selected_rows=selected_count,
+        total_nucleotides=total_nt,
+        transcript_type_counts=type_counts,
+    )

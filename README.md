@@ -110,7 +110,7 @@ The repository supports both HF datasets and local mirrors. There is no source s
 | `streaming_max_scanned_rows` | Maximum number of streamed rows to scan while looking for rows that match filters. |
 | `streaming_trim_rows` | Optional debug option. When `true`, a streamed row is trimmed to the span required by `max_nucleotides`, `overlap`, and `max_windows` before it is kept in memory. Smoke tests do not use this option; they build persistent chromosome indexes and compact selected-data files before any model starts. |
 | `max_windows` | Optional window cap after dataset windowing. |
-| `prewindowed` | When `true`, each gene-finding row is already one model-sized chromosome window and is used directly without reassembling/generating windows. Used by persistent smoke subsets. |
+| `prewindowed` | When `true`, each row is already one model-sized window. Normal and smoke chromosome runs use `false`: selected chromosome blocks are assembled and every 50%-overlap window is visited. |
 | `max_nucleotides` | Nucleotide context length used for nucleotide models and UNET output. |
 | `max_tokens` | Token context length used for BPE models. |
 | `overlap` | Sliding-window overlap. The default is `0.5`. |
@@ -259,89 +259,93 @@ The script writes a TSV with transcript IDs, reference type, predicted type, and
 
 ## Smoke tests on one real held-out chromosome
 
-Smoke tests use no dummy DNA, labels, or GFF. The default chromosome is T2T `NC_060944.1`. The supplied reference GFF is used both to determine the exact chromosome alias and to run the final GFF metrics.
+Smoke tests use no dummy DNA, labels, or GFF. The default chromosome is T2T `NC_060944.1`. The same chromosome-selected held-out data are deliberately used for training, validation, and separate inference so that a visible loss decrease verifies the complete pipeline.
 
-The two public datasets have different held-out layouts:
+The public repositories expose different held-out layouts:
 
-- gene finding uses the official `test` split, which is the complete T2T genome stored as genomic parquet blocks;
-- segmentation and transcript type use `val-human/validation`, because that repository has no split named `test`; chromosome 20 in `val-human` is the released held-out final-evaluation set.
+- gene finding uses every sample in the official `test` split whose metadata identifies the requested chromosome;
+- segmentation and transcript type use every matching transcript in `val-human/validation`, the human held-out configuration containing chromosome 20.
 
-### Dataset discovery and persistent indexes
+No training or inference sample cap is applied. The only smoke-training size control is the number of complete epochs.
 
-Before any GPU job starts, `smoke_tests/run_smoke.py`:
+### Dataset discovery and persistent chromosome indexes
 
-1. prints the local dataset location it detected: an explicitly supplied local path or the resolved Hugging Face cache snapshot/file;
-2. iterates through every gene-finding `test` parquet sample with a tqdm bar, reads only its metadata column, selects only files whose metadata confirms the requested chromosome, and verifies the assembled chromosome span;
-3. iterates through every `val-human` transcript metadata row with a tqdm bar and stores every row index whose metadata chromosome matches the request;
-4. writes persistent per-sample metadata and chromosome-selection indexes to `smoke_tests/indexes/`;
-5. writes only the selected, compact smoke data to `smoke_tests/selected_data/`.
+Before any GPU process starts, `smoke_tests/run_smoke.py` performs a CPU-only indexing phase:
 
-For an uncached remote gene-finding sample, the one-time indexer uses seekable Hugging Face filesystem range reads to fetch the Parquet footer and metadata column without materializing DNA or target arrays. Its progress is checkpointed in `smoke_tests/indexes/gene_finding_test_sample_metadata.json`, so an interrupted scan resumes from stored metadata. The completed chromosome indexes are reused on later runs. Pass `--refresh-index` to repeat metadata discovery. Both generated directories are ignored by Git.
+1. prints the resolved Hugging Face system cache directory and the local snapshot used, or the explicitly supplied local dataset location;
+2. lists parquet files only from `data/test/` in the gene-finding repository;
+3. iterates through every gene-finding test parquet sample with tqdm and reads only its metadata column;
+4. downloads or retains full parquet data only for samples whose metadata chromosome matches the request;
+5. stores the selected block paths and metadata in `smoke_tests/indexes/` and a small selected-block JSONL index;
+6. lists parquet files only from `val-human/` in the segmentation repository; `train-human` and `train-multi-specie` are never considered by smoke tests;
+7. iterates through every `val-human` metadata row with tqdm, records every matching transcript row index, and copies all matching rows to one local selected parquet in bounded batches;
+8. persists both chromosome indexes so future runs reuse them without rescanning metadata. Use `--refresh-index` to force a new scan.
 
-For gene finding, every selected chromosome block contributes informative edge and region windows. The extraction scans one block at a time, keeps no rejected chromosome block in RAM, and writes model-sized windows to local JSONL. The default is four windows per chromosome block. For segmentation and transcript type, all chromosome-matching transcript rows are copied to one local parquet file in bounded batches; complete source transcripts are retained on disk, while model training takes one deterministic context crop from every transcript.
+Rejected chromosome samples are never materialized. Gene-finding training loads one selected chromosome parquet block into RAM at a time and traverses windows in genomic order. The seven chr20 blocks are assembled as one chromosome, and every fixed-size window with 50% overlap is used. Sequential training avoids random block reloads. Segmentation and transcript-type jobs use every selected transcript row; no row limit is applied.
 
 ### Deliberate overfit protocol
-
-The same chromosome-selected held-out samples are used for smoke training, validation, and separate inference. This is intentional: a visible fall in both training and validation loss confirms that the backbone, task head, labels, optimizer, validation path, checkpoint, and inference path are connected correctly.
 
 Defaults:
 
 ```text
-4 epochs
+4 complete epochs
 constant learning rate 1e-4
+training, validation, and inference on the same selected held-out chromosome data
 evaluation once per epoch
 checkpoint once per epoch
-logging every optimizer step
-all selected samples visited each epoch
+one logged train loss per epoch
+all selected samples/windows visited every epoch
+one GPU per active task/model job
 no dataloader worker copies
 ```
 
-After every training job, the launcher reads `trainer_state.json`. By default it stops the whole smoke run if the final training loss and final validation loss do not both improve over their first recorded values. Disable only for diagnosis with `--no-require-overfit`, or require a larger relative loss drop with `--overfit-min-relative-loss-drop`.
+After each training job, the launcher reads `trainer_state.json` and stops the complete smoke run unless both training and validation loss decrease between their first and final observations.
 
 ### Run
 
 ```bash
 python smoke_tests/run_smoke.py \
-  --num-gpus 4 \
+  --num-gpus 2 \
   --reference-gff /path/to/human_T2T_chr20_reference.gff3 \
-  --work-dir smoke_tests/runs
+  --work-dir smoke_tests/runs \
+  --smoke-epochs 4
 ```
 
-Useful controls:
+Use a persistent selected-data directory outside the repository:
 
 ```bash
 python smoke_tests/run_smoke.py \
-  --num-gpus 4 \
+  --num-gpus 2 \
   --reference-gff /path/to/human_T2T_chr20_reference.gff3 \
-  --requested-chromosome NC_060944.1 \
-  --gene-finding-windows-per-block 4 \
-  --smoke-epochs 4 \
-  --smoke-learning-rate 1e-4 \
-  --metadata-batch-size 16
+  --work-dir smoke_tests/runs \
+  --smoke-cache-dir /path/to/genatator_smoke_selected_data \
+  --smoke-epochs 3
 ```
 
 Use already downloaded local datasets:
 
 ```bash
 python smoke_tests/run_smoke.py \
-  --num-gpus 4 \
+  --num-gpus 2 \
   --reference-gff /path/to/human_T2T_chr20_reference.gff3 \
   --gene-finding-dataset-path /path/to/genatator-gene-finding-dataset \
-  --segmentation-dataset-path /path/to/val-human/data.parquet
+  --segmentation-dataset-path /path/to/genatator-gene-segmentation-dataset \
+  --smoke-epochs 4
 ```
 
 Use specific GPUs:
 
 ```bash
 python smoke_tests/run_smoke.py \
-  --gpus 0,2,3 \
-  --num-gpus 3 \
-  --reference-gff /path/to/human_T2T_chr20_reference.gff3
+  --gpus 0,2 \
+  --num-gpus 2 \
+  --reference-gff /path/to/human_T2T_chr20_reference.gff3 \
+  --smoke-epochs 4
 ```
 
-Each active job owns exactly one GPU. Independent task/model jobs run concurrently up to the GPU count, while inference waits for its matching training job. Any failed command, missing metric, or failed overfit check terminates the other active jobs and reports the command plus log tail.
+Each active job owns exactly one GPU. Independent task/model jobs run concurrently up to the requested GPU count; each inference job waits for its matching training job. A failed command, missing metric, or failed overfit check terminates all active jobs and prints the command and log tail.
 
-The final `smoke_tests/runs/summary.md` includes selected-data statistics, job durations, first→last training and validation losses, overfit decisions, logs, and metric-file previews.
+The final `smoke_tests/runs/summary.md` records source rows scanned, selected chromosome blocks/transcripts, the number of full chromosome windows per epoch, job durations, first-to-final training and validation losses, metrics, and log paths.
 
 ## Repository hygiene
 

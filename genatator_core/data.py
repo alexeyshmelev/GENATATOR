@@ -30,13 +30,62 @@ def _load_jsonl_rows(path: Path) -> MaterializedRows:
     return MaterializedRows(rows)
 
 
+def _nested_target_scalar_to_numpy(scalar: Any) -> np.ndarray:
+    """Convert one Arrow L x C target scalar without expanding to nested Python lists."""
+    import pyarrow as pa
+
+    outer = scalar.values
+    if pa.types.is_fixed_size_list(outer.type):
+        width = int(outer.type.list_size)
+        flat = outer.values.to_numpy(zero_copy_only=False)
+        return np.asarray(flat, dtype=np.float32).reshape(len(outer), width)
+    if pa.types.is_list(outer.type) or pa.types.is_large_list(outer.type):
+        offsets = outer.offsets.to_numpy(zero_copy_only=False).astype(np.int64)
+        widths = np.diff(offsets)
+        if widths.size == 0:
+            return np.zeros((0, 0), dtype=np.float32)
+        if not np.all(widths == widths[0]):
+            raise RuntimeError("Gene-finding target channel width is not constant")
+        width = int(widths[0])
+        start = int(offsets[0])
+        stop = int(offsets[-1])
+        flat = outer.values.slice(start, stop - start).to_numpy(zero_copy_only=False)
+        return np.asarray(flat, dtype=np.float32).reshape(len(outer), width)
+    raise RuntimeError(f"Unsupported Arrow targets type: {outer.type}")
+
+
 def _read_parquet_block_row(parquet_path: str) -> Dict[str, Any]:
+    """Load one selected chromosome block into RAM.
+
+    Gene-finding smoke jobs traverse chromosome windows sequentially and retain only
+    the current selected parquet block. Rejected chromosomes are never loaded here.
+    """
     import pyarrow.parquet as pq
-    table = pq.read_table(str(parquet_path), columns=["dna_sequence", "targets"])
-    rows = table.to_pylist()
-    if len(rows) != 1:
-        raise RuntimeError(f"Expected exactly one row in gene-finding parquet block {parquet_path}, got {len(rows)}")
-    return rows[0]
+
+    table = pq.read_table(
+        str(parquet_path),
+        columns=["dna_sequence", "targets"],
+        memory_map=True,
+        use_threads=False,
+    )
+    if table.num_rows != 1:
+        raise RuntimeError(
+            f"Expected exactly one row in gene-finding parquet block {parquet_path}, "
+            f"got {table.num_rows}"
+        )
+    dna = str(table.column("dna_sequence")[0].as_py()).upper()
+    targets = _nested_target_scalar_to_numpy(table.column("targets")[0])
+    if len(dna) != targets.shape[0]:
+        raise RuntimeError(
+            f"DNA/target length mismatch in {parquet_path}: dna={len(dna)} targets={targets.shape}"
+        )
+    logger.info(
+        "[finding.parquet_block.ram] loaded selected block only path=%s length=%d target_channels=%d",
+        parquet_path,
+        len(dna),
+        targets.shape[1],
+    )
+    return {"dna_sequence": dna, "targets": targets}
 
 
 @dataclass(frozen=True)

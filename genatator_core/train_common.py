@@ -4,6 +4,7 @@ import logging
 from typing import Any, Dict
 import inspect
 
+from torch.utils.data import SequentialSampler
 from transformers import Trainer, TrainingArguments
 
 from .config import load_json, save_json
@@ -13,6 +14,30 @@ from .model_builders import build_model
 from .utils import ensure_dir, set_seed
 
 logger = logging.getLogger(__name__)
+
+
+class GenatatorTrainer(Trainer):
+    """Trainer with an explicit sequential sampler for chromosome smoke runs.
+
+    Normal training keeps the standard Transformers sampler. Smoke configs set
+    ``training.sequential_train=true`` so the complete chromosome is traversed in
+    genomic order. This prevents repeated 10 Mb parquet block reloads caused by
+    random window access and makes one epoch exactly one pass over every window.
+    """
+
+    def __init__(self, *args, sequential_train: bool = False, **kwargs):
+        self.sequential_train = bool(sequential_train)
+        super().__init__(*args, **kwargs)
+
+    def _get_train_sampler(self, *args, **kwargs):
+        if self.sequential_train:
+            dataset = args[0] if args else kwargs.get("train_dataset", self.train_dataset)
+            logger.info(
+                "[training.sampler] SequentialSampler enabled; every selected sample/window "
+                "is visited once per epoch in dataset order"
+            )
+            return SequentialSampler(dataset)
+        return super()._get_train_sampler(*args, **kwargs)
 
 
 def dataset_family_from_model(model_cfg: Dict[str, Any]) -> str:
@@ -151,13 +176,14 @@ def train_from_config(config_path: str, task: str) -> None:
     else:
         raise RuntimeError("Installed transformers.TrainingArguments supports neither eval_strategy nor evaluation_strategy")
     args = TrainingArguments(**ta_kwargs)
-    trainer = Trainer(
+    trainer = GenatatorTrainer(
         model=model,
         args=args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=GenatatorCollator(),
         compute_metrics=metric_for_task(task),
+        sequential_train=bool(tr.get("sequential_train", False)),
     )
     resume = tr.get("resume_from_checkpoint") or None
     logger.info("[training] resume_from_checkpoint=%s", resume)

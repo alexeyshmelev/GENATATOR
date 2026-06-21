@@ -97,7 +97,7 @@ def overfit_training(output_dir: Path, batch_size: int, epochs: int, learning_ra
         "weight_decay": 0.0,
         "warmup_steps": 0,
         "lr_scheduler_type": "constant",
-        "logging_strategy": "steps",
+        "logging_strategy": "epoch",
         "logging_steps": 1,
         "evaluation_strategy": "epoch",
         "save_strategy": "epoch",
@@ -110,6 +110,7 @@ def overfit_training(output_dir: Path, batch_size: int, epochs: int, learning_ra
         "bf16": False,
         "fp16": False,
         "resume_from_checkpoint": None,
+        "sequential_train": True,
     }
 
 
@@ -123,7 +124,7 @@ def finding_data(path: Path, aliases: List[str], max_nt: int, max_tok: int) -> d
         "max_tokens": int(max_tok),
         "overlap": 0.5,
         "target_group": "primary",
-        "prewindowed": True,
+        "prewindowed": False,
         "max_rows": None,
         "max_windows": None,
         "streaming": False,
@@ -157,7 +158,7 @@ def make_finding_train_config(
 ) -> Path:
     max_tok = 64 if task == "edge" else 128
     max_nt = 512 if task == "edge" else 1024
-    data_path = selection.edge_data_path if task == "edge" else selection.region_data_path
+    data_path = selection.selected_index_path
     family = "caduceus" if MODELS[model_name]["kind"] == "caduceus" else variant
     extra = None
     if family == "unet":
@@ -301,12 +302,12 @@ def make_finding_infer_config(
     region_train_cfg = json.loads((work / "configs" / f"finding_region_{model_name}_{variant}.json").read_text())
     edge_cfg = {
         "model": edge_train_cfg["model"],
-        "dataset": finding_data(selection.edge_data_path, aliases, 512, 64),
+        "dataset": finding_data(selection.selected_index_path, aliases, 512, 64),
         "inference": {"checkpoint_path": str(edge_train / "final_model"), "batch_size": 1},
     }
     region_cfg = {
         "model": region_train_cfg["model"],
-        "dataset": finding_data(selection.region_data_path, aliases, 1024, 128),
+        "dataset": finding_data(selection.selected_index_path, aliases, 1024, 128),
         "inference": {"checkpoint_path": str(region_train / "final_model"), "batch_size": 1},
     }
     cfg = {
@@ -600,6 +601,13 @@ def collect_metric_files(work: Path) -> List[Path]:
     return sorted(work.glob("**/*.metrics.json")) + sorted(work.glob("**/trainer_state.json"))
 
 
+def window_count(length: int, context: int, overlap: float = 0.5) -> int:
+    if length <= context:
+        return 1
+    step = max(1, int(context * (1.0 - overlap)))
+    return ((length - context + step - 1) // step) + 1
+
+
 def write_summary(
     work: Path,
     done: dict,
@@ -612,10 +620,12 @@ def write_summary(
         "## Selected real test data",
         "",
         f"- Gene-finding source split: `test`",
+        f"- Gene-finding source test samples scanned: **{gf_selection.source_samples_scanned}**",
         f"- Gene-finding selected chromosome blocks: **{gf_selection.selected_blocks}**",
         f"- Gene-finding assembled chromosome length: **{gf_selection.assembled_length:,} nt**",
-        f"- Gene-finding edge training samples: **{gf_selection.edge_samples}**",
-        f"- Gene-finding region training samples: **{gf_selection.region_samples}**",
+        f"- Gene-finding edge windows per epoch (512 nt, 50% overlap): **{window_count(gf_selection.assembled_length, 512):,}**",
+        f"- Gene-finding region windows per epoch (1024 nt, 50% overlap): **{window_count(gf_selection.assembled_length, 1024):,}**",
+        f"- Transcript source rows scanned: **{tx_selection.source_rows_scanned}**",
         f"- Transcript source: `val-human/validation` (held-out chromosome test role)",
         f"- Selected transcript rows: **{tx_selection.selected_rows}**",
         f"- Selected transcript nucleotides: **{tx_selection.total_nucleotides:,} nt**",
@@ -679,21 +689,12 @@ def main() -> None:
     parser.add_argument("--segmentation-local-parquet", default=None, help="Backward-compatible alias for --segmentation-dataset-path.")
     parser.add_argument("--hf-local-files-only", action="store_true")
     parser.add_argument("--refresh-index", action="store_true")
-    parser.add_argument("--gene-finding-windows-per-block", type=int, default=4)
-    parser.add_argument("--gene-finding-edge-context", type=int, default=512)
-    parser.add_argument("--gene-finding-region-context", type=int, default=1024)
     parser.add_argument("--metadata-batch-size", type=int, default=16)
-    parser.add_argument("--smoke-epochs", type=int, default=4)
-    parser.add_argument("--smoke-learning-rate", type=float, default=1e-4)
-    parser.add_argument("--overfit-min-relative-loss-drop", type=float, default=0.0)
-    parser.add_argument("--no-require-overfit", action="store_true")
+    parser.add_argument("--smoke-epochs", type=int, default=4, help="The only smoke-training size control: complete passes over every selected sample/window.")
     args = parser.parse_args()
 
-    global SMOKE_EPOCHS, SMOKE_LR, REQUIRE_OVERFIT, OVERFIT_MIN_RELATIVE_DROP
+    global SMOKE_EPOCHS
     SMOKE_EPOCHS = int(args.smoke_epochs)
-    SMOKE_LR = float(args.smoke_learning_rate)
-    REQUIRE_OVERFIT = not bool(args.no_require_overfit)
-    OVERFIT_MIN_RELATIVE_DROP = float(args.overfit_min_relative_loss_drop)
     if SMOKE_EPOCHS < 2:
         raise RuntimeError("Smoke overfit protocol requires at least 2 epochs")
 
@@ -703,8 +704,8 @@ def main() -> None:
     aliases = aliases_from_reference_gff(reference_gff, args.requested_chromosome)
     print(f"Requested chromosome aliases: {aliases}")
     print(
-        f"Smoke overfit protocol: epochs={SMOKE_EPOCHS} learning_rate={SMOKE_LR} "
-        f"require_overfit={REQUIRE_OVERFIT} min_relative_drop={OVERFIT_MIN_RELATIVE_DROP}"
+        f"Smoke overfit protocol: epochs={SMOKE_EPOCHS}; all selected samples/windows are used "
+        f"for training, validation, and inference; learning_rate={SMOKE_LR}; require_overfit=True"
     )
 
     index_dir = (REPO / args.index_dir).resolve()
@@ -726,9 +727,6 @@ def main() -> None:
         local_dataset_path=gene_finding_dataset_path,
         local_files_only=args.hf_local_files_only,
         refresh=args.refresh_index,
-        edge_context=args.gene_finding_edge_context,
-        region_context=args.gene_finding_region_context,
-        windows_per_block=args.gene_finding_windows_per_block,
     )
     tx_selection = prepare_transcript_selection(
         chromosome=args.requested_chromosome,
