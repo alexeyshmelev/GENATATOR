@@ -63,6 +63,7 @@
     "dataloader_num_workers": 16,
     "bf16": true,
     "fp16": false,
-    "resume_from_checkpoint": null
+    "resume_from_checkpoint": null,
+    "save_safetensors": false
   }
 }

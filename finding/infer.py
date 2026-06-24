@@ -179,7 +179,7 @@ region_tracks, region_truth = predict_tracks(cfg["region"], "finding_region", de
 metrics: Dict[str, object] = {
     "pr_auc": {
         "edge": compute_whole_chromosome_pr_auc(edge_tracks, edge_truth, ["TSS+", "TSS-", "PolyA+", "PolyA-"]),
-        "region": compute_whole_chromosome_pr_auc(region_tracks, region_truth, ["Intragenic+", "Intragenic-"]),
+        "region": compute_whole_chromosome_pr_auc(region_tracks, region_truth, ["intragenic+", "intragenic-"]),
     }
 }
 logger.info("Whole-chromosome PR-AUC edge=%s", json.dumps(metrics["pr_auc"]["edge"]["pooled"], ensure_ascii=False))
@@ -201,7 +201,7 @@ for chrom in sorted(edge_tracks):
     if edge.shape[0] != 4:
         raise RuntimeError(f"Edge tracks must have 4 channels in model order TSS+,TSS-,PolyA+,PolyA-, got {edge.shape}")
     if region.shape[0] != 2:
-        raise RuntimeError(f"Region tracks must have 2 channels in order Intragenic+,Intragenic-, got {region.shape}")
+        raise RuntimeError(f"Region tracks must have 2 channels in order intragenic+,intragenic-, got {region.shape}")
 
     # The public GENATATOR pipeline peak caller expects TSS+, PolyA+, TSS-, PolyA-.
     edge_for_peak = np.stack([edge[0], edge[2], edge[1], edge[3]], axis=0)

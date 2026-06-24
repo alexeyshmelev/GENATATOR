@@ -14,7 +14,7 @@ from .config import local_or_remote
 from .legacy_caduceus import CaduceusMiddleLossTokenClassifier, CaduceusTranscriptTypeMiddleLossClassifier, infer_caduceus_hidden_size
 from .legacy_rmt import RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater
 from .token_models import PlainTokenClassifier, TokenClassifierWithUNet, TranscriptTypeClassifier
-from .torch_compat import allow_transformers_torch_load_on_legacy_torch
+from .torch_compat import allow_transformers_torch_load_on_legacy_torch, trusted_torch_load
 
 logger = logging.getLogger(__name__)
 
@@ -125,13 +125,13 @@ def load_finetuned_weights(model, checkpoint_path: str) -> None:
         if (p / "model.safetensors").exists():
             state = safe_load_file(str(p / "model.safetensors"))
         elif (p / "pytorch_model.bin").exists():
-            state = torch.load(p / "pytorch_model.bin", map_location="cpu")
+            state = trusted_torch_load(p / "pytorch_model.bin", map_location="cpu")
         else:
             raise RuntimeError(f"Checkpoint directory has neither model.safetensors nor pytorch_model.bin: {p}")
     elif p.suffix == ".safetensors":
         state = safe_load_file(str(p))
     else:
-        state = torch.load(p, map_location="cpu")
+        state = trusted_torch_load(p, map_location="cpu")
     if isinstance(state, dict) and "state_dict" in state:
         state = state["state_dict"]
     clean = {k[7:] if k.startswith("module.") else k: v for k, v in state.items()}

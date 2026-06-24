@@ -9,8 +9,9 @@ from transformers import Trainer, TrainingArguments
 
 from .config import load_json, save_json
 from .data import GenatatorCollator, GenatatorDataset, make_tokenizer
-from .metrics_training import metric_for_task
+from .metrics_training import metric_for_task, metric_names_for_task
 from .model_builders import build_model
+from .torch_compat import allow_transformers_torch_load_on_legacy_torch
 from .utils import ensure_dir, set_seed
 
 logger = logging.getLogger(__name__)
@@ -25,9 +26,36 @@ class GenatatorTrainer(Trainer):
     random window access and makes one epoch exactly one pass over every window.
     """
 
-    def __init__(self, *args, sequential_train: bool = False, **kwargs):
+    def __init__(
+        self,
+        *args,
+        sequential_train: bool = False,
+        allow_legacy_torch_load: bool = True,
+        **kwargs,
+    ):
         self.sequential_train = bool(sequential_train)
+        self.allow_legacy_torch_load = bool(allow_legacy_torch_load)
         super().__init__(*args, **kwargs)
+
+    def _enable_trusted_checkpoint_loading(self, context: str) -> None:
+        allow_transformers_torch_load_on_legacy_torch(
+            self.allow_legacy_torch_load,
+            context=context,
+        )
+
+    def _load_best_model(self):
+        self._enable_trusted_checkpoint_loading("GenatatorTrainer._load_best_model")
+        logger.info(
+            "[checkpoint.best] restoring best checkpoint=%s metric=%s best_metric=%s",
+            self.state.best_model_checkpoint,
+            self.args.metric_for_best_model,
+            self.state.best_metric,
+        )
+        return super()._load_best_model()
+
+    def _load_from_checkpoint(self, *args, **kwargs):
+        self._enable_trusted_checkpoint_loading("GenatatorTrainer._load_from_checkpoint")
+        return super()._load_from_checkpoint(*args, **kwargs)
 
     def _get_train_sampler(self, *args, **kwargs):
         if self.sequential_train:
@@ -136,6 +164,11 @@ def train_from_config(config_path: str, task: str) -> None:
         tr.get("num_train_epochs", 1.0),
         tr.get("max_steps", -1),
     )
+    logger.info(
+        "[metrics.validation] task=%s ordered_metrics=%s final_benchmark_metrics_run_only_in_inference=true",
+        task,
+        list(metric_names_for_task(task)),
+    )
     ta_kwargs = dict(
         output_dir=str(output_dir),
         overwrite_output_dir=bool(tr.get("overwrite_output_dir", False)),
@@ -184,6 +217,9 @@ def train_from_config(config_path: str, task: str) -> None:
         data_collator=GenatatorCollator(),
         compute_metrics=metric_for_task(task),
         sequential_train=bool(tr.get("sequential_train", False)),
+        allow_legacy_torch_load=bool(
+            model_cfg.get("allow_unsafe_torch_load_with_torch_lt_2_6", True)
+        ),
     )
     resume = tr.get("resume_from_checkpoint") or None
     logger.info("[training] resume_from_checkpoint=%s", resume)

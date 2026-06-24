@@ -45,11 +45,12 @@
     "save_steps": 1000,
     "save_total_limit": 3,
     "load_best_model_at_end": true,
-    "metric_for_best_model": "auc_mean",
-    "greater_is_better": true,
+    "metric_for_best_model": "loss",
+    "greater_is_better": false,
     "dataloader_num_workers": 16,
     "bf16": true,
     "fp16": false,
-    "resume_from_checkpoint": null
+    "resume_from_checkpoint": null,
+    "save_safetensors": false
   }
 }

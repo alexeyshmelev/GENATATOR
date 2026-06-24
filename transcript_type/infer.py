@@ -30,10 +30,12 @@ with open(out_tsv, "w", newline="", encoding="utf-8") as f:
         y_pred.append(1 if pred == "lnc_RNA" else 0)
         w.writerow([meta.transcript_id, meta.gene_id, meta.genome, meta.chrom, meta.start, meta.end, true, prob, pred])
 metrics = {
-    "accuracy": evaluate.load("accuracy").compute(predictions=y_pred, references=y_true)["accuracy"],
-    "f1": evaluate.load("f1").compute(predictions=y_pred, references=y_true)["f1"],
-    "precision": evaluate.load("precision").compute(predictions=y_pred, references=y_true)["precision"],
-    "recall": evaluate.load("recall").compute(predictions=y_pred, references=y_true)["recall"],
+    "accuracy": float(
+        evaluate.load("accuracy").compute(
+            predictions=y_pred,
+            references=y_true,
+        )["accuracy"]
+    )
 }
 metrics_path = Path(cfg["inference"].get("metrics_json", out_tsv.with_suffix(".metrics.json")))
 with open(metrics_path, "w", encoding="utf-8") as f:

@@ -84,7 +84,24 @@ def model_cfg(model_name: str, family: str, extra: Optional[dict] = None) -> dic
     return cfg
 
 
-def overfit_training(output_dir: Path, batch_size: int, epochs: int, learning_rate: float) -> dict:
+def overfit_training(
+    output_dir: Path,
+    batch_size: int,
+    epochs: int,
+    learning_rate: float,
+    task: str,
+) -> dict:
+    if task in {"finding_edge", "finding_region"}:
+        best_metric = "loss"
+        greater_is_better = False
+    elif task == "segmentation":
+        best_metric = "interval_f1_exon"
+        greater_is_better = True
+    elif task == "transcript_type":
+        best_metric = "accuracy"
+        greater_is_better = True
+    else:
+        raise RuntimeError(f"Unsupported smoke training task: {task}")
     return {
         "output_dir": str(output_dir),
         "overwrite_output_dir": True,
@@ -104,8 +121,8 @@ def overfit_training(output_dir: Path, batch_size: int, epochs: int, learning_ra
         "save_total_limit": 1,
         "save_safetensors": False,
         "load_best_model_at_end": True,
-        "metric_for_best_model": "loss",
-        "greater_is_better": False,
+        "metric_for_best_model": best_metric,
+        "greater_is_better": greater_is_better,
         "dataloader_num_workers": 0,
         "bf16": False,
         "fp16": False,
@@ -202,7 +219,7 @@ def make_finding_train_config(
         # chromosome-selected test samples.
         "train_dataset": dataset,
         "eval_dataset": dict(dataset),
-        "training": overfit_training(work / name, bs, SMOKE_EPOCHS, SMOKE_LR),
+        "training": overfit_training(work / name, bs, SMOKE_EPOCHS, SMOKE_LR, f"finding_{task}"),
     }
     return write_json(work / "configs" / f"{name}.json", cfg)
 
@@ -260,7 +277,7 @@ def make_seg_train_config(
         "model": model_cfg(model_name, family, extra),
         "train_dataset": dataset,
         "eval_dataset": dict(dataset),
-        "training": overfit_training(work / name, bs, SMOKE_EPOCHS, SMOKE_LR),
+        "training": overfit_training(work / name, bs, SMOKE_EPOCHS, SMOKE_LR, "segmentation"),
     }
     return write_json(work / "configs" / f"{name}.json", cfg)
 
@@ -283,7 +300,7 @@ def make_tt_train_config(
         "model": model_cfg(model_name, family),
         "train_dataset": dataset,
         "eval_dataset": dict(dataset),
-        "training": overfit_training(work / name, bs, SMOKE_EPOCHS, SMOKE_LR),
+        "training": overfit_training(work / name, bs, SMOKE_EPOCHS, SMOKE_LR, "transcript_type"),
     }
     return write_json(work / "configs" / f"{name}.json", cfg)
 
