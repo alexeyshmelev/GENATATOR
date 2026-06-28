@@ -103,14 +103,13 @@ def finding_pr_auc_metrics(
         positives = int(references.sum())
         negatives = int(references.size - positives)
         if positives == 0 or negatives == 0:
-            raise RuntimeError(
-                f"Cannot compute PR-AUC for {task_name} class {class_name!r}: "
-                f"positives={positives} negatives={negatives}. Use an evaluation "
-                "set containing both positive and negative examples for every class."
+            metrics[f"pr_auc_{class_name}"] = float("nan")
+            metrics[f"pr_auc_{class_name}_defined"] = 0.0
+        else:
+            metrics[f"pr_auc_{class_name}"] = float(
+                average_precision_score(references, scores)
             )
-        metrics[f"pr_auc_{class_name}"] = float(
-            average_precision_score(references, scores)
-        )
+            metrics[f"pr_auc_{class_name}_defined"] = 1.0
     return metrics
 
 

@@ -169,6 +169,15 @@ def train_from_config(config_path: str, task: str) -> None:
         task,
         list(metric_names_for_task(task)),
     )
+    logging_interval = int(tr.get("logging_interval", tr.get("logging_steps", 100)))
+    eval_interval = int(tr.get("eval_interval", tr.get("eval_steps", logging_interval)))
+    save_interval = int(tr.get("save_interval", tr.get("save_steps", eval_interval)))
+    logger.info(
+        "[training.intervals] logging_interval=%d eval_interval=%d save_interval=%d",
+        logging_interval,
+        eval_interval,
+        save_interval,
+    )
     ta_kwargs = dict(
         output_dir=str(output_dir),
         overwrite_output_dir=bool(tr.get("overwrite_output_dir", False)),
@@ -182,10 +191,10 @@ def train_from_config(config_path: str, task: str) -> None:
         warmup_steps=int(tr.get("warmup_steps", 1000)),
         lr_scheduler_type=tr.get("lr_scheduler_type", "constant_with_warmup"),
         logging_strategy=logging_strategy,
-        logging_steps=int(tr.get("logging_steps", 100)),
-        eval_steps=int(tr.get("eval_steps", 1000)),
+        logging_steps=logging_interval,
+        eval_steps=eval_interval,
         save_strategy=save_strategy,
-        save_steps=int(tr.get("save_steps", 1000)),
+        save_steps=save_interval,
         save_total_limit=int(tr.get("save_total_limit", 3)),
         save_safetensors=bool(tr.get("save_safetensors", False)),
         load_best_model_at_end=bool(tr.get("load_best_model_at_end", False)),

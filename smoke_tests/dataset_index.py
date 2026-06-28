@@ -12,7 +12,7 @@ GF_REPO_ID = "AIRI-Institute/genatator-gene-finding-dataset"
 SEG_REPO_ID = "AIRI-Institute/genatator-gene-segmentation-dataset"
 GF_SPLIT_PREFIX = "data/test/"
 SEG_CONFIG_PREFIX = "val-human/"
-INDEX_SCHEMA_VERSION = 4
+INDEX_SCHEMA_VERSION = 5
 
 
 def _json_dump(path: Path, value: Any) -> None:
@@ -225,7 +225,52 @@ class GeneFindingSelection:
     source_samples_scanned: int
     selected_blocks: int
     assembled_length: int
+    source_chromosome_length: int = 0
+    smoke_fraction: float = 0.10
 
+
+
+
+def _copy_gene_finding_smoke_fraction(
+    *,
+    selected_blocks: Sequence[Dict[str, Any]],
+    output_path: Path,
+    fraction: float,
+) -> Tuple[int, Dict[str, Any]]:
+    """Materialize the first selected chromosome block fraction as one real smoke parquet row."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    if not selected_blocks:
+        raise RuntimeError("No selected gene-finding blocks available for smoke materialization")
+    first = sorted(selected_blocks, key=lambda r: int(r["metadata"].get("start", 0)))[0]
+    source_path = Path(first["local_path"]).expanduser().resolve()
+    table = pq.read_table(str(source_path), columns=["dna_sequence", "targets", "metadata"], memory_map=True, use_threads=False)
+    if table.num_rows != 1:
+        raise RuntimeError(f"Expected one row in {source_path}, got {table.num_rows}")
+    dna = str(table.column("dna_sequence")[0].as_py()).upper()
+    targets = table.column("targets")[0].as_py()
+    keep_len = max(1, int(len(dna) * float(fraction)))
+    keep_len = min(len(dna), keep_len)
+    meta = _parse_metadata(table.column("metadata")[0].as_py())
+    meta["end"] = int(meta.get("start", 0)) + keep_len
+    meta["sequence_length"] = keep_len
+    meta["target_shape"] = [keep_len, 12]
+    meta["smoke_fraction_of_source_block"] = float(fraction)
+    meta["smoke_source_parquet"] = str(source_path)
+    meta["smoke_source_block_length"] = len(dna)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    out = pa.Table.from_pydict({
+        "dna_sequence": [dna[:keep_len]],
+        "targets": [targets[:keep_len]],
+        "metadata": [json.dumps(meta, separators=(",", ":"), ensure_ascii=False)],
+    })
+    pq.write_table(out, str(output_path), compression="zstd")
+    print(
+        f"[dataset-selection] materialized gene-finding smoke parquet: {output_path} "
+        f"source={source_path.name} kept_nt={keep_len} source_nt={len(dna)} fraction={fraction:.3f}"
+    )
+    return keep_len, meta
 
 def prepare_gene_finding_selection(
     *,
@@ -248,14 +293,13 @@ def prepare_gene_finding_selection(
     selected_data_dir.mkdir(parents=True, exist_ok=True)
     safe_chrom = re.sub(r"[^A-Za-z0-9_.-]", "_", chromosome)
     index_path = index_dir / f"gene_finding_test_{safe_chrom}.json"
-    selected_index_path = index_dir / f"gene_finding_test_{safe_chrom}_selected_blocks.jsonl"
+    selected_index_path = selected_data_dir / f"gene_finding_test_{safe_chrom}_first_block_10pct.parquet"
 
     if index_path.exists() and selected_index_path.exists() and not refresh:
         payload = _json_load(index_path)
         if (
             payload.get("schema_version") == INDEX_SCHEMA_VERSION
             and payload.get("chromosome") == chromosome
-            and all(Path(row["local_path"]).exists() for row in payload.get("selected_blocks", []))
         ):
             print(f"[dataset-index] reuse gene-finding chromosome index: {index_path}")
             for _ in tqdm(payload["selected_blocks"], desc="reuse all selected gene-finding block indexes", unit="block"):
@@ -266,6 +310,8 @@ def prepare_gene_finding_selection(
                 source_samples_scanned=int(payload["source_samples_scanned"]),
                 selected_blocks=len(payload["selected_blocks"]),
                 assembled_length=int(payload["assembled_length"]),
+                source_chromosome_length=int(payload.get("source_chromosome_length", payload.get("assembled_length", 0))),
+                smoke_fraction=float(payload.get("smoke_fraction", 0.10)),
             )
 
     if local_dataset_path:
@@ -322,12 +368,12 @@ def prepare_gene_finding_selection(
             remote_reads += 1
 
         if _chrom_matches(meta.get("chrom", meta.get("chromosome", "")), alias_set):
-            if path is None:
-                path = _resolve_hf_file(GF_REPO_ID, repo_name, local_files_only=local_files_only)
+            # Do not download every chromosome block for smoke tests. Store all
+            # matching indexes, but materialize only the first selected block below.
             selected.append(
                 {
                     "repo_file": repo_name,
-                    "local_path": str(path.resolve()),
+                    "local_path": str(path.resolve()) if path is not None else None,
                     "metadata": meta,
                 }
             )
@@ -365,18 +411,15 @@ def prepare_gene_finding_selection(
     ends = [int(row["metadata"].get("end", 0)) for row in selected]
     assembled_length = max(ends) - min(starts)
 
-    # The JSONL contains only selected block references and metadata. It is the
-    # complete chromosome input for every edge/region train, validation and test job.
-    _write_jsonl(
-        selected_index_path,
-        [
-            {
-                "parquet_path": row["local_path"],
-                "repo_file": row["repo_file"],
-                "metadata": row["metadata"],
-            }
-            for row in selected
-        ],
+    source_chromosome_length = assembled_length
+    smoke_fraction = 0.10
+    selected.sort(key=lambda row: int(row["metadata"].get("start", 0)))
+    if not selected[0].get("local_path"):
+        selected[0]["local_path"] = str(_resolve_hf_file(GF_REPO_ID, selected[0]["repo_file"], local_files_only=local_files_only))
+    smoke_len, smoke_meta = _copy_gene_finding_smoke_fraction(
+        selected_blocks=selected,
+        output_path=selected_index_path,
+        fraction=smoke_fraction,
     )
     payload = {
         "schema_version": INDEX_SCHEMA_VERSION,
@@ -386,23 +429,28 @@ def prepare_gene_finding_selection(
         "aliases": sorted(alias_set),
         "source_samples_scanned": len(manifest_entries),
         "selected_blocks": selected,
-        "assembled_length": assembled_length,
+        "source_chromosome_length": source_chromosome_length,
+        "assembled_length": smoke_len,
+        "smoke_fraction": smoke_fraction,
+        "smoke_selected_block_metadata": smoke_meta,
         "selected_index_path": str(selected_index_path),
-        "loading_policy": "selected parquet blocks are loaded lazily one at a time; every 50%-overlap model window is used",
+        "loading_policy": "smoke tests train/validate/test on the first 10% of one real selected chromosome parquet block",
     }
     _json_dump(index_path, payload)
     print(
         f"[dataset-index] gene-finding scan complete: source_test_samples={len(manifest_entries)} "
         f"selected_blocks={len(selected)} chromosome={chromosome} "
-        f"assembled_total_length={assembled_length}"
+        f"source_chromosome_length={source_chromosome_length} smoke_training_length={smoke_len}"
     )
-    print(f"[dataset-index] saved selected block index: {selected_index_path}")
+    print(f"[dataset-index] saved selected 10pct smoke parquet: {selected_index_path}")
     return GeneFindingSelection(
         index_path=index_path,
         selected_index_path=selected_index_path,
         source_samples_scanned=len(manifest_entries),
         selected_blocks=len(selected),
-        assembled_length=assembled_length,
+        assembled_length=smoke_len,
+        source_chromosome_length=source_chromosome_length,
+        smoke_fraction=smoke_fraction,
     )
 
 

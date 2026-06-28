@@ -115,9 +115,12 @@ def overfit_training(
         "warmup_steps": 0,
         "lr_scheduler_type": "constant",
         "logging_strategy": "epoch",
+        "logging_interval": 1,
         "logging_steps": 1,
         "evaluation_strategy": "epoch",
+        "eval_interval": 1,
         "save_strategy": "epoch",
+        "save_interval": 1,
         "save_total_limit": 1,
         "save_safetensors": False,
         "load_best_model_at_end": True,
@@ -638,8 +641,9 @@ def write_summary(
         "",
         f"- Gene-finding source split: `test`",
         f"- Gene-finding source test samples scanned: **{gf_selection.source_samples_scanned}**",
-        f"- Gene-finding selected chromosome blocks: **{gf_selection.selected_blocks}**",
-        f"- Gene-finding assembled chromosome length: **{gf_selection.assembled_length:,} nt**",
+        f"- Gene-finding selected chromosome blocks found during scan: **{gf_selection.selected_blocks}**",
+        f"- Gene-finding source chromosome length from selected blocks: **{gf_selection.source_chromosome_length:,} nt**",
+        f"- Gene-finding smoke training length: **{gf_selection.assembled_length:,} nt** ({gf_selection.smoke_fraction:.0%} of the first selected block)",
         f"- Gene-finding edge windows per epoch (512 nt, 50% overlap): **{window_count(gf_selection.assembled_length, 512):,}**",
         f"- Gene-finding region windows per epoch (1024 nt, 50% overlap): **{window_count(gf_selection.assembled_length, 1024):,}**",
         f"- Transcript source rows scanned: **{tx_selection.source_rows_scanned}**",
@@ -721,8 +725,9 @@ def main() -> None:
     aliases = aliases_from_reference_gff(reference_gff, args.requested_chromosome)
     print(f"Requested chromosome aliases: {aliases}")
     print(
-        f"Smoke overfit protocol: epochs={SMOKE_EPOCHS}; all selected samples/windows are used "
-        f"for training, validation, and inference; learning_rate={SMOKE_LR}; require_overfit=True"
+        f"Smoke overfit protocol: epochs={SMOKE_EPOCHS}; gene finding uses the first 10% "
+        f"of one selected chromosome parquet block; segmentation/transcript-type use all selected transcripts; "
+        f"learning_rate={SMOKE_LR}; require_overfit=True"
     )
 
     index_dir = (REPO / args.index_dir).resolve()

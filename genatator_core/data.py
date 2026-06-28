@@ -14,6 +14,7 @@ import torch
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict, IterableDataset as HFIterableDataset, load_dataset, load_from_disk
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from tqdm.auto import tqdm
 
 from .config import is_local, local_or_remote
 from .utils import reverse_complement
@@ -395,16 +396,63 @@ def make_windows(length: int, max_len: int, overlap: float) -> List[Tuple[int, i
     return out
 
 
+FINDING_TARGET_NAMES = (
+    "primary_tss_+",
+    "primary_tss_-",
+    "primary_polya_+",
+    "primary_polya_-",
+    "intragenic_regions_+",
+    "intragenic_regions_-",
+    "mrna_tss_+",
+    "mrna_tss_-",
+    "mrna_polya_+",
+    "mrna_polya_-",
+    "mrna_intragenic_regions_+",
+    "mrna_intragenic_regions_-",
+)
+
+
+def _finding_group(cfg: Dict[str, Any]) -> str:
+    group = str(cfg.get("target_group", cfg.get("finding_target_group", "primary"))).lower()
+    aliases = {
+        "primary": "primary",
+        "combined": "primary",
+        "all": "primary",
+        "mrna_lnc": "primary",
+        "mrna+lncrna": "primary",
+        "mrna+lnc_rna": "primary",
+        "mrna": "mrna",
+        "mrna_only": "mrna",
+        "protein_coding": "mrna",
+        "coding": "mrna",
+    }
+    if group not in aliases:
+        raise RuntimeError(
+            "Invalid gene-finding target_group. Expected one of primary/combined/all "
+            "for mRNA+lncRNA targets or mrna/mrna_only/protein_coding for mRNA-only targets; "
+            f"got {cfg.get('target_group')!r}"
+        )
+    return aliases[group]
+
+
 def channel_indices(task: str, cfg: Dict[str, Any]) -> List[int]:
     if "target_indices" in cfg:
         return [int(i) for i in cfg["target_indices"]]
-    group = cfg.get("target_group", "primary")
     if task == "finding_edge":
-        return [0, 1, 2, 3] if group in {"primary", "combined", "all"} else [6, 7, 8, 9]
+        return [0, 1, 2, 3] if _finding_group(cfg) == "primary" else [6, 7, 8, 9]
     if task == "finding_region":
-        return [4, 5] if group in {"primary", "combined", "all"} else [10, 11]
+        return [4, 5] if _finding_group(cfg) == "primary" else [10, 11]
     if task in {"segmentation", "transcript_type"}:
         return [0, 1, 2, 3, 4]
+    raise RuntimeError(f"Unknown task={task}")
+
+
+def channel_names_for_task(task: str, cfg: Dict[str, Any]) -> List[str]:
+    idx = channel_indices(task, cfg)
+    if task.startswith("finding"):
+        return [FINDING_TARGET_NAMES[i] for i in idx]
+    if task in {"segmentation", "transcript_type"}:
+        return ["5UTR", "exon", "intron", "3UTR", "CDS"]
     raise RuntimeError(f"Unknown task={task}")
 
 
@@ -459,6 +507,118 @@ def nucleotide_ids(seq: str, tokenizer: PreTrainedTokenizerBase, max_len: int) -
         ids += [pad] * (max_len - len(ids))
     return np.asarray(ids[:max_len], dtype=np.int64)
 
+
+
+
+def _human_bytes(n: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    x = float(n)
+    for unit in units:
+        if x < 1024.0 or unit == units[-1]:
+            return f"{x:.2f} {unit}"
+        x /= 1024.0
+    return f"{n} B"
+
+
+def _row_disk_path(row: Dict[str, Any]) -> Optional[Path]:
+    for key in ("parquet_path", "source_parquet", "local_path"):
+        val = row.get(key)
+        if val:
+            p = Path(str(val)).expanduser()
+            if p.exists():
+                return p.resolve()
+    return None
+
+
+def _slice_targets_for_task(task: str, row: Dict[str, Any], target_indices: List[int]) -> Dict[str, Any]:
+    out = dict(row)
+    if task.startswith("finding") and "targets" in out:
+        arr = np.asarray(out["targets"], dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[1] < max(target_indices) + 1:
+            raise RuntimeError(f"Gene-finding targets must have shape [L, 12], got {arr.shape}")
+        out["targets"] = arr[:, target_indices]
+        out["targets_are_selected"] = True
+    elif task in {"segmentation", "transcript_type"} and "labels" in out:
+        arr = np.asarray(out["labels"], dtype=np.float32)
+        out["labels"] = arr
+    return out
+
+
+def _log_selected_dataset_stats(task: str, cfg: Dict[str, Any], raw: Any, row_indices: List[int], target_indices: List[int]) -> None:
+    rows = [raw[i] for i in row_indices]
+    metas = [parse_metadata(r.get("metadata", {})) for r in rows]
+    chromosomes = sorted({m.chrom for m in metas})
+    genomes = sorted({m.genome for m in metas})
+    genes = sorted({m.gene_id for m in metas if m.gene_id})
+    transcripts = sorted({m.transcript_id for m in metas if m.transcript_id})
+    disk_paths = sorted({p for r in rows for p in [_row_disk_path(r)] if p is not None})
+    if not disk_paths:
+        cfg_path = cfg.get("path")
+        if cfg_path and Path(str(cfg_path)).expanduser().exists():
+            p0 = Path(str(cfg_path)).expanduser().resolve()
+            if p0.is_file():
+                disk_paths = [p0]
+            elif p0.is_dir():
+                disk_paths = sorted(list(p0.rglob("*.parquet")) + list(p0.rglob("*.jsonl")) + list(p0.rglob("*.json")))
+    disk_size = sum(p.stat().st_size for p in disk_paths if p.exists())
+    seq_total = 0
+    target_bytes = 0
+    if task.startswith("finding"):
+        for m in metas:
+            length = max(0, int(m.end) - int(m.start))
+            seq_total += length
+            target_bytes += length * len(target_indices) * 4
+        kind = "chromosome_blocks"
+        sample_count = len(rows)
+    else:
+        for r in rows:
+            seq_len = len(str(r.get("dna_sequence", "")))
+            if seq_len == 0:
+                meta = parse_metadata(r.get("metadata", {}))
+                seq_len = max(0, meta.end - meta.start)
+            seq_total += seq_len
+            target_bytes += seq_len * 5 * 4
+        kind = "transcripts"
+        sample_count = len(rows)
+    logger.info(
+        "[dataset.stats.before_ram] task=%s path=%s split=%s selected_%s=%d parquet_files=%d "
+        "chromosomes=%d genomes=%d genes=%d transcripts=%d sequence_nt=%d disk_size=%s "
+        "expected_ram_sequence=%s expected_ram_targets=%s target_indices=%s target_names=%s",
+        task,
+        cfg.get("path"),
+        cfg.get("split"),
+        kind,
+        sample_count,
+        len(disk_paths),
+        len(chromosomes),
+        len(genomes),
+        len(genes),
+        len(transcripts),
+        seq_total,
+        _human_bytes(disk_size),
+        _human_bytes(seq_total),
+        _human_bytes(target_bytes),
+        target_indices,
+        channel_names_for_task(task, cfg),
+    )
+
+
+def _preload_selected_rows_to_ram(task: str, raw: Any, row_indices: List[int], target_indices: List[int]) -> MaterializedRows:
+    rows: List[Dict[str, Any]] = []
+    for row_i in tqdm(row_indices, desc=f"load selected {task} rows into CPU RAM", unit="row"):
+        row = raw[row_i]
+        if isinstance(row, dict) and row.get("parquet_path"):
+            full = _read_parquet_block_row(row["parquet_path"])
+            rows.append({
+                "dna_sequence": full["dna_sequence"],
+                "targets": full["targets"][:, target_indices],
+                "targets_are_selected": True,
+                "metadata": row.get("metadata", {}),
+            })
+        else:
+            rows.append(_slice_targets_for_task(task, row, target_indices))
+    logger.info("[dataset.ram] loaded_selected_rows=%d task=%s", len(rows), task)
+    return MaterializedRows(rows)
 
 class ChromosomeAssembly:
     def __init__(self, key: Tuple[str, str], rows: List[Tuple[int, ParsedMetadata]], raw: HFDataset):
@@ -525,6 +685,15 @@ class GenatatorDataset(torch.utils.data.Dataset):
         self.max_tokens = int(cfg.get("max_tokens", cfg.get("context_length", 1024)))
         self.overlap = float(cfg.get("overlap", 0.5))
         self.target_indices = channel_indices(task, cfg)
+        _log_selected_dataset_stats(task, cfg, self.raw, self.row_indices, self.target_indices)
+        # The training pipeline always materializes the requested split/chromosome/filter
+        # into CPU RAM before window generation. For gene-finding parquet indexes this
+        # loads only selected chromosome blocks, never rejected chromosomes.
+        self.raw = _preload_selected_rows_to_ram(task, self.raw, self.row_indices, self.target_indices)
+        self.row_indices = list(range(len(self.raw)))
+        if task.startswith("finding"):
+            # Targets in RAM have already been sliced to the requested target group.
+            self.target_indices = list(range(len(channel_indices(task, cfg))))
         self.crop_margin = int(cfg.get("crop_margin", 500))
         self.random_crop = bool(cfg.get("random_crop", is_train and task in {"segmentation", "transcript_type"}))
         self.reverse_complement = bool(cfg.get("reverse_complement", False))

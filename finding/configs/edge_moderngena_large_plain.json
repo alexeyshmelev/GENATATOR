@@ -51,6 +51,9 @@
     "bf16": true,
     "fp16": false,
     "resume_from_checkpoint": null,
-    "save_safetensors": false
+    "save_safetensors": false,
+    "logging_interval": 100,
+    "eval_interval": 1000,
+    "save_interval": 1000
   }
 }
