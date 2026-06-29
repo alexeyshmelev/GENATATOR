@@ -7,7 +7,7 @@ finding/             # transcript boundary and intragenic-region prediction
 segmentation/        # exon / intron / UTR / CDS segmentation inside transcripts
 transcript_type/     # mRNA vs lncRNA transcript classification
 genatator_core/      # shared datasets, model wrappers, trainers, metrics, GFF writers
-smoke_tests/         # end-to-end real-data smoke/overfit tests
+smoke_tests/         # end-to-end real-data smoke tests
 ```
 
 The repository is for **fine-tuning**, not pretraining.  All model parameters are trainable; there is no freezing option.
@@ -289,7 +289,7 @@ Training/validation/inference report only accuracy.
 
 ## Smoke tests
 
-Smoke tests use real data and are designed to verify that every task/model path can train, validate, infer, write metrics, and overfit a small held-out subset.
+Smoke tests use real data and are designed to verify that every task/model path can train, validate, infer, and write metrics on the selected held-out subset. The runner does not enforce any metric-based success criterion; inspect the metrics manually.
 
 Run:
 
@@ -310,7 +310,7 @@ The smoke runner:
 4. selects only samples from the requested chromosome;
 5. saves indexes under `smoke_tests/indexes` for future runs;
 6. materializes selected smoke data under the selected-data directory;
-7. trains, validates, and tests on the same selected subset to check visible overfitting;
+7. trains, validates, and tests on the same selected subset so metric changes are easy to inspect manually;
 8. assigns one GPU per active task/model job;
 9. writes `summary.md` with durations and metrics.
 

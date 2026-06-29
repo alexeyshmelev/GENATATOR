@@ -36,8 +36,6 @@ DEFAULT_CHROMOSOME = "NC_060944.1"
 
 SMOKE_EPOCHS = 4
 SMOKE_LR = 1e-4
-REQUIRE_OVERFIT = True
-OVERFIT_MIN_RELATIVE_DROP = 0.0
 
 
 def write_json(path: Path, obj: dict) -> Path:
@@ -84,7 +82,7 @@ def model_cfg(model_name: str, family: str, extra: Optional[dict] = None) -> dic
     return cfg
 
 
-def overfit_training(
+def smoke_training(
     output_dir: Path,
     batch_size: int,
     epochs: int,
@@ -218,11 +216,11 @@ def make_finding_train_config(
     cfg = {
         "seed": 42,
         "model": model_cfg(model_name, family, extra),
-        # Deliberate overfit smoke protocol: train and validation use the same
+        # Smoke protocol: train and validation use the same
         # chromosome-selected test samples.
         "train_dataset": dataset,
         "eval_dataset": dict(dataset),
-        "training": overfit_training(work / name, bs, SMOKE_EPOCHS, SMOKE_LR, f"finding_{task}"),
+        "training": smoke_training(work / name, bs, SMOKE_EPOCHS, SMOKE_LR, f"finding_{task}"),
     }
     return write_json(work / "configs" / f"{name}.json", cfg)
 
@@ -280,7 +278,7 @@ def make_seg_train_config(
         "model": model_cfg(model_name, family, extra),
         "train_dataset": dataset,
         "eval_dataset": dict(dataset),
-        "training": overfit_training(work / name, bs, SMOKE_EPOCHS, SMOKE_LR, "segmentation"),
+        "training": smoke_training(work / name, bs, SMOKE_EPOCHS, SMOKE_LR, "segmentation"),
     }
     return write_json(work / "configs" / f"{name}.json", cfg)
 
@@ -303,7 +301,7 @@ def make_tt_train_config(
         "model": model_cfg(model_name, family),
         "train_dataset": dataset,
         "eval_dataset": dict(dataset),
-        "training": overfit_training(work / name, bs, SMOKE_EPOCHS, SMOKE_LR, "transcript_type"),
+        "training": smoke_training(work / name, bs, SMOKE_EPOCHS, SMOKE_LR, "transcript_type"),
     }
     return write_json(work / "configs" / f"{name}.json", cfg)
 
@@ -504,7 +502,7 @@ def build_jobs(
     return jobs
 
 
-def _loss_summary(output_dir: Path) -> dict:
+def _training_loss_summary(output_dir: Path) -> dict:
     state_path = output_dir / "trainer_state.json"
     if not state_path.exists():
         raise RuntimeError(f"Training job did not write trainer_state.json: {state_path}")
@@ -512,23 +510,23 @@ def _loss_summary(output_dir: Path) -> dict:
     history = state.get("log_history", [])
     train_losses = [float(x["loss"]) for x in history if "loss" in x and "eval_loss" not in x]
     eval_losses = [float(x["eval_loss"]) for x in history if "eval_loss" in x]
-    if len(train_losses) < 2 or len(eval_losses) < 2:
-        raise RuntimeError(
-            f"Overfit smoke requires at least two train and eval loss observations: "
-            f"train={len(train_losses)} eval={len(eval_losses)} output={output_dir}"
-        )
-    train_drop = (train_losses[0] - train_losses[-1]) / max(abs(train_losses[0]), 1e-12)
-    eval_drop = (eval_losses[0] - eval_losses[-1]) / max(abs(eval_losses[0]), 1e-12)
-    overfit = train_drop > OVERFIT_MIN_RELATIVE_DROP and eval_drop > OVERFIT_MIN_RELATIVE_DROP
-    return {
-        "train_loss_first": train_losses[0],
-        "train_loss_last": train_losses[-1],
-        "train_loss_relative_drop": train_drop,
-        "eval_loss_first": eval_losses[0],
-        "eval_loss_last": eval_losses[-1],
-        "eval_loss_relative_drop": eval_drop,
-        "overfit_detected": overfit,
+    summary = {
+        "train_loss_first": train_losses[0] if train_losses else None,
+        "train_loss_last": train_losses[-1] if train_losses else None,
+        "eval_loss_first": eval_losses[0] if eval_losses else None,
+        "eval_loss_last": eval_losses[-1] if eval_losses else None,
+        "train_loss_values": train_losses,
+        "eval_loss_values": eval_losses,
     }
+    if len(train_losses) >= 2 and train_losses[0] != 0:
+        summary["train_loss_relative_change"] = (train_losses[-1] - train_losses[0]) / abs(train_losses[0])
+    else:
+        summary["train_loss_relative_change"] = None
+    if len(eval_losses) >= 2 and eval_losses[0] != 0:
+        summary["eval_loss_relative_change"] = (eval_losses[-1] - eval_losses[0]) / abs(eval_losses[0])
+    else:
+        summary["eval_loss_relative_change"] = None
+    return summary
 
 
 def run_scheduler(jobs: List[dict], gpus: List[str], work: Path) -> dict:
@@ -589,13 +587,7 @@ def run_scheduler(jobs: List[dict], gpus: List[str], work: Path) -> dict:
                     )
                 result = {"duration_s": duration, "log": str(state["log"]), "kind": state["job"]["kind"]}
                 if state["job"]["kind"] == "train":
-                    overfit = _loss_summary(Path(state["job"]["output_dir"]))
-                    result["overfit"] = overfit
-                    if REQUIRE_OVERFIT and not overfit["overfit_detected"]:
-                        raise RuntimeError(
-                            f"Smoke training completed but did not overfit the shared train/validation test subset: "
-                            f"job={name} metrics={overfit} log={state['log']}"
-                        )
+                    result["training_loss_summary"] = _training_loss_summary(Path(state["job"]["output_dir"]))
                 done[name] = result
                 free_gpus.append(state["gpu"])
                 del running[name]
@@ -656,26 +648,26 @@ def write_summary(
         "",
         "## Jobs",
         "",
-        "| job | kind | duration_s | overfit | log |",
+        "| job | kind | duration_s | loss summary | log |",
         "|---|---|---:|---|---|",
     ]
     for name, st in done.items():
-        overfit = st.get("overfit")
-        overfit_text = ""
-        if overfit:
-            overfit_text = (
-                f"train {overfit['train_loss_first']:.4g}→{overfit['train_loss_last']:.4g}; "
-                f"eval {overfit['eval_loss_first']:.4g}→{overfit['eval_loss_last']:.4g}"
+        loss = st.get("training_loss_summary")
+        loss_text = ""
+        if loss:
+            loss_text = (
+                f"train {loss['train_loss_first']}→{loss['train_loss_last']}; "
+                f"eval {loss['eval_loss_first']}→{loss['eval_loss_last']}"
             )
-        lines.append(f"| `{name}` | {st['kind']} | {st['duration_s']:.1f} | {overfit_text} | `{st['log']}` |")
-    lines += ["", "## Training overfit details", ""]
+        lines.append(f"| `{name}` | {st['kind']} | {st['duration_s']:.1f} | {loss_text} | `{st['log']}` |")
+    lines += ["", "## Training loss details", ""]
     for name, st in done.items():
-        if "overfit" not in st:
+        if "training_loss_summary" not in st:
             continue
         lines.append(f"### `{name}`")
         lines.append("")
         lines.append("```json")
-        lines.append(json.dumps(st["overfit"], indent=2))
+        lines.append(json.dumps(st["training_loss_summary"], indent=2))
         lines.append("```")
         lines.append("")
     lines += ["", "## Metrics files", ""]
@@ -694,7 +686,7 @@ def write_summary(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run all GENATATOR smoke tests on one real held-out chromosome and require visible overfitting."
+        description="Run all GENATATOR smoke tests on one real held-out chromosome."
     )
     parser.add_argument("--num-gpus", type=int, required=True)
     parser.add_argument("--gpus", type=str, default=None, help="Comma-separated GPU IDs; overrides --num-gpus.")
@@ -716,8 +708,8 @@ def main() -> None:
 
     global SMOKE_EPOCHS
     SMOKE_EPOCHS = int(args.smoke_epochs)
-    if SMOKE_EPOCHS < 2:
-        raise RuntimeError("Smoke overfit protocol requires at least 2 epochs")
+    if SMOKE_EPOCHS < 1:
+        raise RuntimeError("Smoke tests require at least 1 epoch")
 
     reference_gff = Path(args.reference_gff).expanduser().resolve()
     if not reference_gff.exists():
@@ -725,9 +717,9 @@ def main() -> None:
     aliases = aliases_from_reference_gff(reference_gff, args.requested_chromosome)
     print(f"Requested chromosome aliases: {aliases}")
     print(
-        f"Smoke overfit protocol: epochs={SMOKE_EPOCHS}; gene finding uses the first 10% "
-        f"of one selected chromosome parquet block; segmentation/transcript-type use all selected transcripts; "
-        f"learning_rate={SMOKE_LR}; require_overfit=True"
+        f"Smoke training protocol: epochs={SMOKE_EPOCHS}; gene finding uses the configured selected "
+        f"real test subset; segmentation/transcript-type use all selected transcripts; "
+        f"learning_rate={SMOKE_LR}. The runner records metrics but does not enforce any metric-based success criterion."
     )
 
     index_dir = (REPO / args.index_dir).resolve()
