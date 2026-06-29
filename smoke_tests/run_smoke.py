@@ -165,6 +165,8 @@ def transcript_data(path: Path, aliases: List[str], max_nt: int, max_tok: int) -
         "statuses": None,
         "max_rows": None,
         "streaming": False,
+        "loader": "direct_parquet",
+        "parquet_batch_size": 64,
     }
 
 

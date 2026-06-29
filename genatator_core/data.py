@@ -294,9 +294,200 @@ def _materialize_streaming_dataset(iterable, cfg: Dict[str, Any]) -> Materialize
     logger.info("[dataset.streaming] materialized_rows=%d scanned_rows=%d max_rows=%d observed=%s", len(rows), scanned, max_rows, json.dumps(_metadata_summary_from_rows(rows), ensure_ascii=False))
     return MaterializedRows(rows)
 
+
+
+# -----------------------------------------------------------------------------
+# Direct parquet loading for transcript-level datasets
+# -----------------------------------------------------------------------------
+# Hugging Face `datasets.load_dataset(...)` may fail on these transcript parquet
+# files with a PyArrow "List index overflow" while it is preparing an Arrow
+# cache. The model logic does not require the HF Dataset object here, so for the
+# GENATATOR segmentation dataset we read parquet files directly with PyArrow in
+# bounded record batches and materialize the requested rows into RAM ourselves.
+
+def _looks_like_segmentation_dataset_ref(path: str, cfg: Dict[str, Any]) -> bool:
+    ref = str(path)
+    if "genatator-gene-segmentation-dataset" in ref:
+        return True
+    if cfg.get("loader") == "direct_parquet":
+        return True
+    return False
+
+
+def _repo_parquet_files(repo_id: str, cfg: Dict[str, Any]) -> List[str]:
+    from huggingface_hub import HfApi
+
+    config_name = cfg.get("config_name")
+    data_files = cfg.get("data_files")
+    if data_files:
+        files = data_files.get(cfg.get("split", "train"), data_files) if isinstance(data_files, dict) else data_files
+        if isinstance(files, str):
+            return [files]
+        return list(files)
+    if not config_name:
+        raise RuntimeError(
+            "Remote direct parquet loading requires config_name for the segmentation dataset, "
+            "for example train-human, train-multi-specie, or val-human."
+        )
+    prefix = str(config_name).strip("/") + "/"
+    files = HfApi().list_repo_files(repo_id=repo_id, repo_type="dataset")
+    parquet_files = sorted(f for f in files if f.startswith(prefix) and f.endswith(".parquet"))
+    if not parquet_files:
+        raise RuntimeError(f"No parquet files found in repo={repo_id} prefix={prefix}")
+    return parquet_files
+
+
+def _local_parquet_files(path: Path, cfg: Dict[str, Any]) -> List[Path]:
+    data_files = cfg.get("data_files")
+    if data_files:
+        files = data_files.get(cfg.get("split", "train"), data_files) if isinstance(data_files, dict) else data_files
+        if isinstance(files, str):
+            files = [files]
+        return [Path(f).expanduser().resolve() for f in files]
+    if path.is_file() and path.suffix.lower() == ".parquet":
+        return [path.resolve()]
+    if path.is_dir():
+        config_name = cfg.get("config_name")
+        if config_name and (path / str(config_name)).exists():
+            return sorted((path / str(config_name)).rglob("*.parquet"))
+        return sorted(path.rglob("*.parquet"))
+    return []
+
+
+def _download_or_reuse_hf_parquets(repo_id: str, filenames: List[str], cfg: Dict[str, Any]) -> List[Path]:
+    from huggingface_hub import hf_hub_download
+
+    local_only = bool(cfg.get("local_files_only", False) or cfg.get("hf_local_files_only", False))
+    paths: List[Path] = []
+    for fn in tqdm(filenames, desc=f"download/reuse {repo_id} parquet files", unit="file"):
+        path = hf_hub_download(
+            repo_id=repo_id,
+            repo_type="dataset",
+            filename=fn,
+            local_files_only=local_only,
+        )
+        paths.append(Path(path).resolve())
+    return paths
+
+
+def _arrow_2d_scalar_to_numpy(scalar: Any, dtype=np.float32) -> np.ndarray:
+    """Convert one Arrow scalar containing a 2D list/fixed-list to numpy."""
+    try:
+        arr = _nested_target_scalar_to_numpy(scalar)
+        return arr.astype(dtype, copy=False)
+    except Exception:
+        value = scalar.as_py() if hasattr(scalar, "as_py") else scalar
+        return np.asarray(value, dtype=dtype)
+
+
+def _direct_parquet_transcript_rows_from_files(files: List[Path], cfg: Dict[str, Any]) -> MaterializedRows:
+    import pyarrow.parquet as pq
+
+    genomes = set(_norm_id(x) for x in (cfg.get("genomes") or []))
+    chromosomes = set()
+    for x in (cfg.get("chromosomes") or []):
+        chromosomes |= _chrom_aliases(x)
+    statuses = cfg.get("statuses")
+    statuses = set(int(x) for x in statuses) if statuses is not None else None
+    batch_size = int(cfg.get("parquet_batch_size") or cfg.get("metadata_batch_size") or 64)
+
+    rows: List[Dict[str, Any]] = []
+    observed = []
+    total_rows = 0
+    total_selected = 0
+    disk_size = sum(p.stat().st_size for p in files if p.exists())
+    logger.info(
+        "[direct_parquet.location] files=%d disk_size=%s chromosomes=%s genomes=%s statuses=%s batch_size=%d",
+        len(files), _human_bytes(disk_size), sorted(chromosomes), sorted(genomes), statuses, batch_size,
+    )
+
+    pbar_files = tqdm(files, desc="scan/load selected transcript parquet files", unit="file")
+    for path in pbar_files:
+        pf = pq.ParquetFile(str(path))
+        # Read in bounded batches. This avoids building the HF Arrow cache and
+        # avoids holding unselected rows permanently.
+        for batch in pf.iter_batches(
+            batch_size=batch_size,
+            columns=["dna_sequence", "labels", "metadata", "status"],
+            use_threads=False,
+        ):
+            names = batch.schema.names
+            col_meta = batch.column(names.index("metadata"))
+            col_status = batch.column(names.index("status")) if "status" in names else None
+            col_dna = batch.column(names.index("dna_sequence"))
+            col_labels = batch.column(names.index("labels"))
+            total_rows += batch.num_rows
+            for i in range(batch.num_rows):
+                meta_value = col_meta[i].as_py()
+                meta = parse_metadata(meta_value)
+                if len(observed) < 2000:
+                    observed.append({"metadata": meta_value, "status": col_status[i].as_py() if col_status is not None else None})
+                if not _matches_any(meta.genome, genomes):
+                    continue
+                if not _matches_any(meta.chrom, chromosomes, is_chrom=True):
+                    continue
+                status_value = int(col_status[i].as_py()) if col_status is not None else None
+                if statuses is not None and status_value not in statuses:
+                    continue
+                dna = str(col_dna[i].as_py()).upper()
+                labels = _arrow_2d_scalar_to_numpy(col_labels[i], dtype=np.float32)
+                if len(dna) != labels.shape[0]:
+                    raise RuntimeError(
+                        f"DNA/labels length mismatch in {path}: row={i} dna={len(dna)} labels={labels.shape}"
+                    )
+                rows.append({
+                    "dna_sequence": dna,
+                    "labels": labels,
+                    "metadata": meta_value,
+                    "status": status_value,
+                    "source_parquet": str(path),
+                })
+                total_selected += 1
+            pbar_files.set_postfix(rows=total_rows, selected=total_selected)
+
+    if not rows:
+        summary = _metadata_summary_from_rows(observed)
+        raise RuntimeError(
+            "Direct parquet loader selected zero transcript rows. "
+            f"filters: genomes={cfg.get('genomes')} chromosomes={cfg.get('chromosomes')} statuses={cfg.get('statuses')}. "
+            f"Observed metadata summary from first {len(observed)} rows: {json.dumps(summary, ensure_ascii=False)}"
+        )
+    metas = [parse_metadata(r.get("metadata", {})) for r in rows]
+    chrom_counts: Dict[str, int] = {}
+    type_counts: Dict[str, int] = {}
+    total_nt = 0
+    for r, m in zip(rows, metas):
+        chrom_counts[m.chrom] = chrom_counts.get(m.chrom, 0) + 1
+        type_counts[m.transcript_type] = type_counts.get(m.transcript_type, 0) + 1
+        total_nt += len(str(r.get("dna_sequence", "")))
+    logger.info(
+        "[direct_parquet.selected] rows=%d source_rows=%d total_nt=%d expected_label_ram=%s chrom_counts=%s transcript_types=%s",
+        len(rows), total_rows, total_nt, _human_bytes(total_nt * 5 * 4), chrom_counts, type_counts,
+    )
+    return MaterializedRows(rows)
+
+
+def _load_segmentation_direct_parquet(cfg: Dict[str, Any]) -> MaterializedRows:
+    path = cfg["path"]
+    ref = local_or_remote(path)
+    if is_local(path):
+        files = _local_parquet_files(Path(ref).expanduser(), cfg)
+        if not files:
+            raise RuntimeError(f"No local parquet files found for direct parquet loader: {ref}")
+    else:
+        filenames = _repo_parquet_files(str(ref), cfg)
+        logger.info(
+            "[direct_parquet.remote] repo=%s config_name=%s parquet_files=%d first_files=%s",
+            ref, cfg.get("config_name"), len(filenames), filenames[:5],
+        )
+        files = _download_or_reuse_hf_parquets(str(ref), filenames, cfg)
+    return _direct_parquet_transcript_rows_from_files(files, cfg)
+
 def load_dataset_auto(cfg: Dict[str, Any]) -> HFDataset:
     path = cfg["path"]
     split = cfg.get("split", "train")
+    if _looks_like_segmentation_dataset_ref(str(path), cfg):
+        return _load_segmentation_direct_parquet(cfg)
     name = cfg.get("config_name")
     data_files = cfg.get("data_files")
     ref = local_or_remote(path)

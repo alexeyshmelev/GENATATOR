@@ -24,7 +24,9 @@
     "overlap": 0.5,
     "statuses": [
       1
-    ]
+    ],
+    "loader": "direct_parquet",
+    "parquet_batch_size": 64
   },
   "inference": {
     "device": "cuda",

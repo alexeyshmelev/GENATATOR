@@ -33,7 +33,9 @@
     "target_group": "primary",
     "statuses": [
       1
-    ]
+    ],
+    "loader": "direct_parquet",
+    "parquet_batch_size": 64
   },
   "eval_dataset": {
     "path": "AIRI-Institute/genatator-gene-segmentation-dataset",
@@ -49,7 +51,9 @@
     "target_group": "primary",
     "statuses": [
       1
-    ]
+    ],
+    "loader": "direct_parquet",
+    "parquet_batch_size": 64
   },
   "training": {
     "output_dir": "runs/segmentation_moderngena_base_rmt_unet_cycles3",

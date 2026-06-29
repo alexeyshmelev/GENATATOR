@@ -179,6 +179,18 @@ Important fields:
 
 Training does not run a test phase.  Test/inference commands are separate.
 
+
+### Direct parquet loading for transcript datasets
+
+The segmentation and transcript-type tasks use `AIRI-Institute/genatator-gene-segmentation-dataset`.  These parquet files contain long nested nucleotide-label arrays.  The training code does **not** use `datasets.load_dataset(...)` for this dataset, because preparing the Hugging Face Arrow cache can fail with PyArrow `List index overflow` on large nested lists.  Instead, configs use:
+
+```json
+"loader": "direct_parquet",
+"parquet_batch_size": 64
+```
+
+The direct loader resolves the requested `config_name` (`train-human`, `train-multi-specie`, or `val-human`), downloads or reuses the exact parquet files from the Hugging Face cache, scans them in bounded PyArrow batches, applies `genomes`, `chromosomes`, and `statuses` filters, and then materializes only the requested rows into CPU RAM before training starts.  For local parquet files or local dataset roots, the same direct loader is used when `loader` is set to `direct_parquet`.
+
 ## Normal training
 
 Run training commands from the repository root.  Either install the repository in editable mode or set `PYTHONPATH` to the repository root.  The most robust form is to run task scripts as modules.
