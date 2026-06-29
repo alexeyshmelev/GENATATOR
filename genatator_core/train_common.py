@@ -3,13 +3,29 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict
 import inspect
+import json
+import os
+import time
+from pathlib import Path
 
-from torch.utils.data import SequentialSampler
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, SequentialSampler
+from tqdm.auto import tqdm
 from transformers import Trainer, TrainingArguments
 
 from .config import load_json, save_json
 from .data import GenatatorCollator, GenatatorDataset, make_tokenizer
-from .metrics_training import metric_for_task, metric_names_for_task
+from .metrics_training import (
+    EDGE_CLASS_NAMES,
+    REGION_CLASS_NAMES,
+    SEGMENTATION_CLASS_INDEX,
+    _safe_binary_average_precision,
+    metric_for_task,
+    metric_names_for_task,
+    sigmoid,
+)
+from .intervals import f1_from_counts, interval_counts
 from .model_builders import build_model
 from .torch_compat import allow_transformers_torch_load_on_legacy_torch
 from .utils import ensure_dir, set_seed
@@ -31,10 +47,12 @@ class GenatatorTrainer(Trainer):
         *args,
         sequential_train: bool = False,
         allow_legacy_torch_load: bool = True,
+        genatator_task: str | None = None,
         **kwargs,
     ):
         self.sequential_train = bool(sequential_train)
         self.allow_legacy_torch_load = bool(allow_legacy_torch_load)
+        self.genatator_task = genatator_task or "unknown"
         super().__init__(*args, **kwargs)
 
     def _enable_trusted_checkpoint_loading(self, context: str) -> None:
@@ -56,6 +74,215 @@ class GenatatorTrainer(Trainer):
     def _load_from_checkpoint(self, *args, **kwargs):
         self._enable_trusted_checkpoint_loading("GenatatorTrainer._load_from_checkpoint")
         return super()._load_from_checkpoint(*args, **kwargs)
+
+    @staticmethod
+    def _output_value(outputs, name: str):
+        if isinstance(outputs, dict):
+            return outputs.get(name)
+        return getattr(outputs, name, None)
+
+    @staticmethod
+    def _batch_size_from_inputs(inputs: Dict[str, Any]) -> int:
+        for value in inputs.values():
+            if isinstance(value, torch.Tensor) and value.ndim > 0:
+                return int(value.shape[0])
+        return 1
+
+    @staticmethod
+    def _labels_and_mask_from_inputs(task: str, inputs: Dict[str, Any]) -> tuple[torch.Tensor, torch.Tensor]:
+        if task in {"finding_edge", "finding_region"}:
+            if "letter_level_labels" in inputs:
+                labels = inputs["letter_level_labels"]
+                mask = inputs["letter_level_labels_mask"]
+            else:
+                labels = inputs["labels"]
+                mask = inputs["labels_mask"]
+            return labels, mask.bool()
+        if task == "segmentation":
+            return inputs["letter_level_labels"], inputs["letter_level_labels_mask"].bool()
+        raise RuntimeError(f"No token labels for task={task}")
+
+    def _new_streaming_state(self) -> Dict[str, Any]:
+        task = self.genatator_task
+        state: Dict[str, Any] = {"loss_sum": 0.0, "loss_count": 0}
+        if task == "finding_edge":
+            state["class_names"] = EDGE_CLASS_NAMES
+            state["scores"] = [[] for _ in EDGE_CLASS_NAMES]
+            state["refs"] = [[] for _ in EDGE_CLASS_NAMES]
+        elif task == "finding_region":
+            state["class_names"] = REGION_CLASS_NAMES
+            state["scores"] = [[] for _ in REGION_CLASS_NAMES]
+            state["refs"] = [[] for _ in REGION_CLASS_NAMES]
+        elif task == "segmentation":
+            state["counts"] = {name: [0, 0, 0] for name in SEGMENTATION_CLASS_INDEX}
+        elif task == "transcript_type":
+            state["correct"] = 0
+            state["total"] = 0
+        else:
+            raise RuntimeError(f"Unsupported streaming evaluation task={task}")
+        return state
+
+    def _update_streaming_state(self, state: Dict[str, Any], inputs: Dict[str, Any], outputs: Any) -> None:
+        loss = self._output_value(outputs, "loss")
+        batch_size = self._batch_size_from_inputs(inputs)
+        if isinstance(loss, torch.Tensor):
+            state["loss_sum"] += float(loss.detach().float().cpu().item()) * batch_size
+            state["loss_count"] += batch_size
+        logits = self._output_value(outputs, "logits")
+        if logits is None:
+            return
+        task = self.genatator_task
+        if task in {"finding_edge", "finding_region"}:
+            labels_t, mask_t = self._labels_and_mask_from_inputs(task, inputs)
+            logits_np = logits.detach().float().cpu().numpy()
+            labels_np = labels_t.detach().float().cpu().numpy()
+            mask_np = mask_t.detach().cpu().numpy().astype(bool)
+            probs = sigmoid(logits_np)
+            for c in range(len(state["class_names"])):
+                refs = labels_np[:, :, c][mask_np]
+                scores = probs[:, :, c][mask_np]
+                if refs.size:
+                    state["refs"][c].append(refs.astype(np.float32, copy=False))
+                    state["scores"][c].append(scores.astype(np.float32, copy=False))
+        elif task == "segmentation":
+            labels_t, mask_t = self._labels_and_mask_from_inputs(task, inputs)
+            logits_np = logits.detach().float().cpu().numpy()
+            labels_np = labels_t.detach().float().cpu().numpy()
+            mask_np = mask_t.detach().cpu().numpy().astype(bool)
+            probs = sigmoid(logits_np)
+            for class_name, channel_index in SEGMENTATION_CLASS_INDEX.items():
+                tp = fp = fn = 0
+                for sample_index in range(labels_np.shape[0]):
+                    valid = mask_np[sample_index]
+                    if not np.any(valid):
+                        continue
+                    references = (labels_np[sample_index, valid, channel_index] >= 0.5).astype(np.int8)
+                    predictions = (probs[sample_index, valid, channel_index] >= 0.5).astype(np.int8)
+                    sample_tp, sample_fp, sample_fn = interval_counts(references, predictions)
+                    tp += sample_tp
+                    fp += sample_fp
+                    fn += sample_fn
+                state["counts"][class_name][0] += tp
+                state["counts"][class_name][1] += fp
+                state["counts"][class_name][2] += fn
+        elif task == "transcript_type":
+            refs = inputs["transcript_type"].detach().cpu().numpy().reshape(-1).astype(np.int64)
+            scores = sigmoid(logits.detach().float().cpu().numpy().reshape(-1))
+            preds = (scores >= 0.5).astype(np.int64)
+            state["correct"] += int((preds == refs).sum())
+            state["total"] += int(refs.size)
+
+    def _finalize_streaming_state(self, state: Dict[str, Any], metric_key_prefix: str) -> Dict[str, float]:
+        metrics: Dict[str, float] = {}
+        loss_count = max(1, int(state.get("loss_count", 0)))
+        metrics[f"{metric_key_prefix}_loss"] = float(state.get("loss_sum", 0.0) / loss_count)
+        task = self.genatator_task
+        if task in {"finding_edge", "finding_region"}:
+            defined_values = []
+            total_dropped = 0
+            for c, class_name in enumerate(state["class_names"]):
+                refs = np.concatenate(state["refs"][c], axis=0) if state["refs"][c] else np.asarray([], dtype=np.float32)
+                scores = np.concatenate(state["scores"][c], axis=0) if state["scores"][c] else np.asarray([], dtype=np.float32)
+                ap, defined, positives, negatives, dropped = _safe_binary_average_precision(refs, scores)
+                total_dropped += dropped
+                metrics[f"{metric_key_prefix}_pr_auc_{class_name}"] = float(ap)
+                metrics[f"{metric_key_prefix}_pr_auc_{class_name}_defined"] = float(defined)
+                metrics[f"{metric_key_prefix}_pr_auc_{class_name}_positives"] = float(positives)
+                metrics[f"{metric_key_prefix}_pr_auc_{class_name}_negatives"] = float(negatives)
+                metrics[f"{metric_key_prefix}_pr_auc_{class_name}_dropped_nonfinite"] = float(dropped)
+                if defined:
+                    defined_values.append(ap)
+            metrics[f"{metric_key_prefix}_pr_auc_defined_channels"] = float(len(defined_values))
+            metrics[f"{metric_key_prefix}_pr_auc_mean"] = float(np.mean(defined_values)) if defined_values else 0.0
+            metrics[f"{metric_key_prefix}_pr_auc_dropped_nonfinite_total"] = float(total_dropped)
+        elif task == "segmentation":
+            for class_name, (tp, fp, fn) in state["counts"].items():
+                metrics[f"{metric_key_prefix}_interval_f1_{class_name}"] = float(f1_from_counts(tp, fp, fn))
+                metrics[f"{metric_key_prefix}_interval_tp_{class_name}"] = float(tp)
+                metrics[f"{metric_key_prefix}_interval_fp_{class_name}"] = float(fp)
+                metrics[f"{metric_key_prefix}_interval_fn_{class_name}"] = float(fn)
+        elif task == "transcript_type":
+            total = max(1, int(state["total"]))
+            metrics[f"{metric_key_prefix}_accuracy"] = float(state["correct"] / total)
+        return metrics
+
+    def _streaming_evaluate_rank0(self, eval_dataset=None, metric_key_prefix: str = "eval") -> Dict[str, float]:
+        dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        if dataset is None:
+            return {}
+        dataloader = DataLoader(
+            dataset,
+            sampler=SequentialSampler(dataset),
+            batch_size=int(self.args.per_device_eval_batch_size),
+            collate_fn=self.data_collator,
+            num_workers=int(self.args.dataloader_num_workers),
+            pin_memory=bool(self.args.dataloader_pin_memory),
+        )
+        model = self.accelerator.unwrap_model(self.model) if hasattr(self, "accelerator") else self.model
+        model.eval()
+        state = self._new_streaming_state()
+        total = len(dataloader) if hasattr(dataloader, "__len__") else None
+        logger.info(
+            "[rank0_streaming_eval] task=%s batches=%s batch_size=%s no_ddp_allgather=true cpu_metric_accumulation=true",
+            self.genatator_task,
+            total,
+            self.args.per_device_eval_batch_size,
+        )
+        pbar = tqdm(total=total, desc=f"{metric_key_prefix}:{self.genatator_task}", disable=not self.is_world_process_zero())
+        with torch.no_grad():
+            for batch in dataloader:
+                inputs = self._prepare_inputs(batch)
+                outputs = model(**inputs)
+                self._update_streaming_state(state, inputs, outputs)
+                del outputs, inputs, batch
+                pbar.update(1)
+        pbar.close()
+        metrics = self._finalize_streaming_state(state, metric_key_prefix)
+        metrics[f"{metric_key_prefix}_samples"] = float(len(dataset)) if hasattr(dataset, "__len__") else 0.0
+        return metrics
+
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix: str = "eval"):
+        """Rank-0 streaming evaluation that avoids distributed all-gather of large tensors.
+
+        Hugging Face's default prediction loop all-gathers logits/labels across
+        all ranks. For nucleotide-level validation this can allocate huge GPU
+        tensors or hang in NCCL when one rank is a straggler. Here rank 0 runs a
+        sequential validation pass with the unwrapped model, moves every batch's
+        predictions to CPU immediately, writes the small metric dictionary to
+        disk, and the other ranks wait for that file without using NCCL.
+        """
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        rank = int(os.environ.get("RANK", "0"))
+        step = int(getattr(self.state, "global_step", 0))
+        sync_dir = Path(self.args.output_dir) / "rank0_eval_metrics"
+        sync_dir.mkdir(parents=True, exist_ok=True)
+        metrics_path = sync_dir / f"{metric_key_prefix}_step_{step}.json"
+        start_time = time.time()
+        if rank == 0:
+            if metrics_path.exists():
+                metrics_path.unlink()
+            metrics = self._streaming_evaluate_rank0(eval_dataset=eval_dataset, metric_key_prefix=metric_key_prefix)
+            with open(metrics_path, "w") as fh:
+                json.dump(metrics, fh, indent=2, sort_keys=True)
+            logger.info("[rank0_streaming_eval] wrote metrics=%s", metrics_path)
+        else:
+            timeout_s = float(getattr(self.args, "eval_rank0_timeout_seconds", 86400.0))
+            logger.info(
+                "[rank0_streaming_eval] rank=%d waiting for rank0 metrics file=%s without NCCL collectives",
+                rank,
+                metrics_path,
+            )
+            while True:
+                if metrics_path.exists() and metrics_path.stat().st_mtime >= start_time - 1.0:
+                    with open(metrics_path) as fh:
+                        metrics = json.load(fh)
+                    break
+                if time.time() - start_time > timeout_s:
+                    raise TimeoutError(f"Timed out waiting for rank0 evaluation metrics at {metrics_path}")
+                time.sleep(5.0)
+        if rank == 0:
+            self.log(metrics)
+        return metrics
 
     def _get_train_sampler(self, *args, **kwargs):
         if self.sequential_train:
@@ -222,6 +449,10 @@ def train_from_config(config_path: str, task: str) -> None:
         eval_interval,
         save_interval,
     )
+    logger.info(
+        "[training.evaluation_memory] eval_accumulation_steps=%s; validation logits/labels are flushed to CPU at this interval",
+        tr.get("eval_accumulation_steps", 1),
+    )
     ta_kwargs = dict(
         output_dir=str(output_dir),
         overwrite_output_dir=bool(tr.get("overwrite_output_dir", False)),
@@ -229,6 +460,14 @@ def train_from_config(config_path: str, task: str) -> None:
         num_train_epochs=float(tr.get("num_train_epochs", 1.0)),
         per_device_train_batch_size=int(tr.get("per_device_train_batch_size", 1)),
         per_device_eval_batch_size=int(tr.get("per_device_eval_batch_size", 1)),
+        # Critical for long nucleotide-level validation. Transformers otherwise
+        # keeps all prediction/label tensors on the GPU until the whole eval
+        # loop finishes; for transcript/chromosome tasks this can require tens
+        # of GiB. eval_accumulation_steps=1 moves each evaluated batch to CPU
+        # immediately before the next batch is processed. Metrics are still
+        # computed on the same predictions and labels; only the accumulation
+        # device changes.
+        eval_accumulation_steps=int(tr.get("eval_accumulation_steps", 1)),
         gradient_accumulation_steps=int(tr.get("gradient_accumulation_steps", 1)),
         learning_rate=float(tr.get("learning_rate", 5e-5)),
         weight_decay=float(tr.get("weight_decay", 1e-4)),
@@ -262,6 +501,8 @@ def train_from_config(config_path: str, task: str) -> None:
     else:
         raise RuntimeError("Installed transformers.TrainingArguments supports neither eval_strategy nor evaluation_strategy")
     args = TrainingArguments(**ta_kwargs)
+    args.eval_rank0_timeout_seconds = float(tr.get("eval_rank0_timeout_seconds", 86400.0))
+    logger.info("[training.evaluation_memory] rank0_streaming_evaluation=true; no distributed all-gather of validation logits/labels")
     trainer = GenatatorTrainer(
         model=model,
         args=args,
@@ -273,6 +514,7 @@ def train_from_config(config_path: str, task: str) -> None:
         allow_legacy_torch_load=bool(
             model_cfg.get("allow_unsafe_torch_load_with_torch_lt_2_6", True)
         ),
+        genatator_task=task,
     )
     resume = tr.get("resume_from_checkpoint") or None
     logger.info("[training] resume_from_checkpoint=%s", resume)

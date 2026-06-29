@@ -155,6 +155,7 @@ Important fields:
   "max_steps": -1,
   "per_device_train_batch_size": 1,
   "per_device_eval_batch_size": 1,
+  "eval_accumulation_steps": 1,
   "gradient_accumulation_steps": 1,
   "learning_rate": 5e-5,
   "weight_decay": 1e-4,
@@ -279,6 +280,14 @@ Leave it as `null` to start from the backbone checkpoint.
 
 All training configs expose `logging_interval`, which maps to TensorBoard logging steps.  `eval_interval` and `save_interval` control validation and checkpointing.  TensorBoard logs are written under `training.output_dir`.
 
+### Validation memory
+
+Validation uses a rank-0 streaming loop for all tasks.  Rank 0 evaluates the selected validation set sequentially with the unwrapped model, moves each batch of logits and labels to CPU immediately, updates task-specific metric accumulators, writes the small metric dictionary to `training.output_dir/rank0_eval_metrics/`, and the other ranks wait for that file without NCCL collectives.
+
+This avoids the default Transformers evaluation behavior where logits and labels are all-gathered across ranks.  That default behavior can exhaust GPU memory or trigger NCCL timeouts for long nucleotide-resolution validation examples.  The model forward pass, labels, loss, and metric definitions are unchanged; only validation accumulation is moved from distributed GPU all-gather to rank-0 CPU streaming.
+
+
+
 ## Gene-finding task
 
 ### Dataset
@@ -378,6 +387,12 @@ interval_f1_CDS
 ```
 
 UTR and intron training-time metrics are intentionally excluded.  Gene-level and MI metrics are computed only by `segmentation/infer.py` through the official Evaluate metric.
+
+### Validation and long transcripts
+
+Training-time validation uses the same model-context construction as training, but with deterministic cropping when `random_crop=false`.  If a transcript is longer than `max_nucleotides`, the validation dataset provides a model-length crop rather than feeding the whole transcript into one forward pass.  Full transcript-level reconstruction and gene-level scoring are handled by the separate inference command, where predictions are written in transcript coordinates and evaluated with the official metric.
+
+For memory safety, validation uses the rank-0 streaming loop described in the training section.  No validation logits or labels are gathered across GPUs.  Each evaluated batch is converted to CPU NumPy arrays immediately and only task-specific counters or CPU arrays required for the metric are retained.  This same evaluation rule is applied to gene finding, segmentation, and transcript-type training.
 
 ### Prediction GFF
 
