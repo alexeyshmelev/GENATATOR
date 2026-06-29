@@ -78,18 +78,44 @@ def _validate_token_metric_shapes(
         )
 
 
+def _safe_binary_average_precision(
+    references: np.ndarray,
+    scores: np.ndarray,
+) -> tuple[float, float, int, int, int]:
+    """Return AP and bookkeeping without ever propagating NaN/Inf to sklearn.
+
+    Some short smoke runs can produce non-finite logits for a channel, especially
+    when a freshly initialized head is attached to a large backbone. Training must
+    not crash during validation because of those values. We therefore compute AP
+    only on finite score/label pairs. Undefined channels are reported as 0.0 with
+    ``defined=0`` so TensorBoard and checkpoint selection always receive finite
+    metrics.
+    """
+    references = np.asarray(references)
+    scores = np.asarray(scores, dtype=np.float64)
+    finite = np.isfinite(scores) & np.isfinite(references.astype(np.float64, copy=False))
+    dropped = int(finite.size - int(finite.sum()))
+    references = (references[finite] > 0).astype(np.int8)
+    scores = scores[finite]
+    positives = int(references.sum())
+    negatives = int(references.size - positives)
+    if references.size == 0 or positives == 0 or negatives == 0:
+        return 0.0, 0.0, positives, negatives, dropped
+    return float(average_precision_score(references, scores)), 1.0, positives, negatives, dropped
+
+
 def finding_pr_auc_metrics(
     eval_pred: Any,
     *,
     class_names: Sequence[str],
     task_name: str,
 ) -> Dict[str, float]:
-    """Compute nucleotide/token-level PR-AUC independently for each finding class.
+    """Compute ordered PR-AUC independently for each finding class.
 
-    Boundary targets are smooth signals in the released dataset. For PR-AUC they
-    are treated as positive wherever the target signal is greater than zero, which
-    preserves the complete labeled boundary region rather than truncating all
-    fractional targets to zero.
+    Edge channel order is ``TSS+``, ``TSS-``, ``PolyA+``, ``PolyA-``. Region
+    channel order is ``intragenic+``, ``intragenic-``. Boundary targets are
+    smooth signals in the released dataset; for PR-AUC they are treated as
+    positive wherever the target signal is greater than zero.
     """
     logits = _pred_array(eval_pred.predictions)
     labels, mask = _labels_and_mask(eval_pred.label_ids)
@@ -97,19 +123,23 @@ def finding_pr_auc_metrics(
     probabilities = sigmoid(logits)
 
     metrics: Dict[str, float] = {}
+    defined_values = []
+    total_dropped = 0
     for channel_index, class_name in enumerate(class_names):
-        references = (labels[:, :, channel_index][mask] > 0.0).astype(np.int8)
+        references = labels[:, :, channel_index][mask]
         scores = probabilities[:, :, channel_index][mask]
-        positives = int(references.sum())
-        negatives = int(references.size - positives)
-        if positives == 0 or negatives == 0:
-            metrics[f"pr_auc_{class_name}"] = float("nan")
-            metrics[f"pr_auc_{class_name}_defined"] = 0.0
-        else:
-            metrics[f"pr_auc_{class_name}"] = float(
-                average_precision_score(references, scores)
-            )
-            metrics[f"pr_auc_{class_name}_defined"] = 1.0
+        ap, defined, positives, negatives, dropped = _safe_binary_average_precision(references, scores)
+        total_dropped += dropped
+        metrics[f"pr_auc_{class_name}"] = ap
+        metrics[f"pr_auc_{class_name}_defined"] = defined
+        metrics[f"pr_auc_{class_name}_positives"] = float(positives)
+        metrics[f"pr_auc_{class_name}_negatives"] = float(negatives)
+        metrics[f"pr_auc_{class_name}_dropped_nonfinite"] = float(dropped)
+        if defined:
+            defined_values.append(ap)
+    metrics["pr_auc_defined_channels"] = float(len(defined_values))
+    metrics["pr_auc_mean"] = float(np.mean(defined_values)) if defined_values else 0.0
+    metrics["pr_auc_dropped_nonfinite_total"] = float(total_dropped)
     return metrics
 
 

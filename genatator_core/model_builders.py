@@ -19,6 +19,13 @@ from .torch_compat import allow_transformers_torch_load_on_legacy_torch, trusted
 logger = logging.getLogger(__name__)
 
 
+def _nucleotide_vocab_size(model_cfg: Dict[str, Any]) -> int:
+    value = model_cfg.get("nucleotide_vocab_size")
+    if value in (None, "", "auto"):
+        raise RuntimeError("nucleotide_vocab_size was not inferred before build_model. Entry points must call prepare_nucleotide_tokenizer().")
+    return int(value)
+
+
 def build_model(cfg: Dict[str, Any], task: str):
     model_cfg = cfg["model"]
     family = model_cfg["family"]
@@ -58,7 +65,7 @@ def build_model(cfg: Dict[str, Any], task: str):
             backbone_kind,
             num_labels=num_labels,
             trust_remote_code=trust_remote_code,
-            nucleotide_vocab_size=int(model_cfg.get("nucleotide_vocab_size", 1000)),
+            nucleotide_vocab_size=_nucleotide_vocab_size(model_cfg),
             unet_cycles=int(model_cfg.get("unet_cycles", 1)),
             unet_channels=model_cfg.get("unet_channels"),
             allow_unsafe_torch_load=allow_unsafe_torch_load,
@@ -74,7 +81,7 @@ def build_model(cfg: Dict[str, Any], task: str):
         rmt_kwargs.update({
             "tokenizer": cfg["_tokenizer"],
             "num_labels": num_labels,
-            "nucleotide_vocab_size": int(model_cfg.get("nucleotide_vocab_size", 1000)),
+            "nucleotide_vocab_size": _nucleotide_vocab_size(model_cfg),
             "cycles": int(model_cfg.get("cycles", 3)),
             "unet_channels": model_cfg.get("unet_channels"),
         })
@@ -89,7 +96,7 @@ def build_model(cfg: Dict[str, Any], task: str):
             num_labels=num_labels,
             trust_remote_code=trust_remote_code,
             use_unet=bool(model_cfg.get("use_unet", False)),
-            nucleotide_vocab_size=int(model_cfg.get("nucleotide_vocab_size", 1000)),
+            nucleotide_vocab_size=_nucleotide_vocab_size(model_cfg),
             unet_cycles=int(model_cfg.get("unet_cycles", 1)),
             unet_channels=model_cfg.get("unet_channels"),
             allow_unsafe_torch_load=allow_unsafe_torch_load,

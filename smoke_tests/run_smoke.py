@@ -31,7 +31,6 @@ MODELS = {
     "moderngena_base": {"kind": "moderngena", "path": "AIRI-Institute/moderngena-base"},
     "moderngena_large": {"kind": "moderngena", "path": "AIRI-Institute/moderngena-large"},
 }
-NUC_TOKENIZER = "kuleshov-group/caduceus-ps_seqlen-131k_d_model-256_n_layer-16"
 DEFAULT_CHROMOSOME = "NC_060944.1"
 
 SMOKE_EPOCHS = 4
@@ -76,7 +75,10 @@ def model_cfg(model_name: str, family: str, extra: Optional[dict] = None) -> dic
         cfg["bidirectional_weight_tie"] = False
         cfg["padding_side"] = "left"
     if family in {"unet", "rmt"} or (family == "amt" and bool((extra or {}).get("use_unet", False))):
-        cfg.update({"nucleotide_tokenizer_path": NUC_TOKENIZER, "nucleotide_vocab_size": 1000})
+        # GENA and ModernGENA tokenizers contain single-nucleotide tokens.
+        # Use the same tokenizer for letter-level nucleotide IDs instead of
+        # borrowing Caduceus token IDs. The model builder detects vocab size.
+        cfg.update({"nucleotide_tokenizer_path": info["path"], "nucleotide_vocab_size": None})
     if extra:
         cfg.update(extra)
     return cfg

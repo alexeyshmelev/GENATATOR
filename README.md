@@ -82,12 +82,23 @@ Common fields:
 }
 ```
 
-For U-Net/RMT/AMT+U-Net models add:
+For U-Net/RMT/AMT+U-Net models add a nucleotide tokenizer.  For GENA and ModernGENA this must normally be the **same tokenizer as the backbone tokenizer**, because those tokenizers already contain single-nucleotide tokens (`A`, `C`, `G`, `T`).  Do not use the Caduceus tokenizer for GENA/ModernGENA nucleotide expansion.
 
 ```json
 {
-  "nucleotide_tokenizer_path": "kuleshov-group/caduceus-ps_seqlen-131k_d_model-256_n_layer-16",
-  "nucleotide_vocab_size": 1000
+  "tokenizer_path": "AIRI-Institute/moderngena-base",
+  "nucleotide_tokenizer_path": "AIRI-Institute/moderngena-base",
+  "nucleotide_vocab_size": null
+}
+```
+
+`nucleotide_vocab_size: null` means that the code infers the vocabulary size from the nucleotide tokenizer before constructing the nucleotide embedding table.  The same pattern is used for GENA:
+
+```json
+{
+  "tokenizer_path": "AIRI-Institute/gena-lm-bert-base-lastln-t2t",
+  "nucleotide_tokenizer_path": "AIRI-Institute/gena-lm-bert-base-lastln-t2t",
+  "nucleotide_vocab_size": null
 }
 ```
 
@@ -168,6 +179,94 @@ Important fields:
 
 Training does not run a test phase.  Test/inference commands are separate.
 
+## Normal training
+
+Run training commands from the repository root.  Either install the repository in editable mode or set `PYTHONPATH` to the repository root.  The most robust form is to run task scripts as modules.
+
+```bash
+cd /path/to/GENATATOR
+export PYTHONPATH=$PWD:$PYTHONPATH
+```
+
+### Two-GPU ModernGENA segmentation on the human dataset
+
+ModernGENA is BPE-based, while segmentation is evaluated at nucleotide resolution.  Therefore ModernGENA segmentation without RMT/AMT must use the U-Net wrapper:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 torchrun \
+  --nproc_per_node=2 \
+  -m segmentation.train \
+  --config segmentation/configs/moderngena_base_unet.json
+```
+
+The human segmentation config uses:
+
+```json
+"train_dataset": {
+  "path": "AIRI-Institute/genatator-gene-segmentation-dataset",
+  "config_name": "train-human",
+  "split": "train"
+},
+"eval_dataset": {
+  "path": "AIRI-Institute/genatator-gene-segmentation-dataset",
+  "config_name": "val-human",
+  "split": "validation"
+}
+```
+
+To train on multispecies data, set `train_dataset.config_name` to `train-multi-specie`.  To restrict training or validation to particular chromosomes, set `chromosomes`, for example:
+
+```json
+"chromosomes": ["NC_060944.1"]
+```
+
+For all chromosomes in the selected dataset/configuration, leave `chromosomes` as an empty list.
+
+### Gene-finding training
+
+Edge and region models are trained separately:
+
+```bash
+PYTHONPATH=$PWD CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 \
+  -m finding.train \
+  --task edge \
+  --config finding/configs/edge_moderngena_base_plain.json
+
+PYTHONPATH=$PWD CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 \
+  -m finding.train \
+  --task region \
+  --config finding/configs/region_moderngena_base_plain.json
+```
+
+Use `target_group` in the dataset config to choose the gene-finding target half:
+
+```json
+"target_group": "primary"  // combined mRNA + lncRNA channels
+"target_group": "mrna"     // mRNA/protein-coding-only channels
+```
+
+### Transcript-type training
+
+```bash
+PYTHONPATH=$PWD CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 \
+  -m transcript_type.train \
+  --config transcript_type/configs/moderngena_base_plain.json
+```
+
+### Resume training
+
+Set `training.resume_from_checkpoint` in the JSON config:
+
+```json
+"resume_from_checkpoint": "runs/segmentation_moderngena_base_unet/checkpoint-10000"
+```
+
+Leave it as `null` to start from the backbone checkpoint.
+
+### Logging
+
+All training configs expose `logging_interval`, which maps to TensorBoard logging steps.  `eval_interval` and `save_interval` control validation and checkpointing.  TensorBoard logs are written under `training.output_dir`.
+
 ## Gene-finding task
 
 ### Dataset
@@ -208,10 +307,12 @@ Before window generation, the requested dataset subset is loaded into CPU RAM.  
 
 ### Training metrics
 
-During training/validation only PR-AUC is computed:
+During training/validation only PR-AUC is computed.  The order is fixed and matches the HF dataset target layout:
 
 - edge: `pr_auc_TSS+`, `pr_auc_TSS-`, `pr_auc_PolyA+`, `pr_auc_PolyA-`
 - region: `pr_auc_intragenic+`, `pr_auc_intragenic-`
+
+Each class also logs `*_defined`, `*_positives`, `*_negatives`, and `*_dropped_nonfinite`.  Non-finite model scores are dropped before calling sklearn; an undefined channel is reported as `0.0` with `*_defined=0.0` so validation never crashes because a short smoke run emitted NaN/Inf logits.
 
 Gene-level, MI, boundary-tolerance, and GFF-based metrics are computed only by `finding/infer.py`.
 

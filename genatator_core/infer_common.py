@@ -11,7 +11,7 @@ from tqdm.auto import tqdm
 
 from .data import GenatatorCollator, GenatatorDataset, make_tokenizer
 from .model_builders import build_model, load_finetuned_weights
-from .train_common import dataset_family_from_model
+from .train_common import dataset_family_from_model, prepare_nucleotide_tokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -27,14 +27,10 @@ def prepare_tokenizers(model_cfg: Dict[str, Any]):
     elif model_cfg.get("backbone_kind") == "caduceus":
         tokenizer.padding_side = "left"
         logger.info("[infer.tokenizer] using Caduceus default padding_side=left")
-    nucleotide_tokenizer = None
-    if model_cfg.get("nucleotide_tokenizer_path"):
-        nucleotide_tokenizer = make_tokenizer(model_cfg["nucleotide_tokenizer_path"], trust_remote_code=bool(model_cfg.get("trust_remote_code", True)))
-        if model_cfg.get("nucleotide_padding_side"):
-            nucleotide_tokenizer.padding_side = model_cfg["nucleotide_padding_side"]
+    nucleotide_tokenizer = prepare_nucleotide_tokenizer(model_cfg, tokenizer)
     logger.info("[infer.tokenizer] main pad=%s cls=%s sep=%s side=%s", tokenizer.pad_token_id, tokenizer.cls_token_id, tokenizer.sep_token_id, tokenizer.padding_side)
     if nucleotide_tokenizer is not None:
-        logger.info("[infer.tokenizer] nucleotide pad=%s cls=%s sep=%s side=%s", nucleotide_tokenizer.pad_token_id, nucleotide_tokenizer.cls_token_id, nucleotide_tokenizer.sep_token_id, nucleotide_tokenizer.padding_side)
+        logger.info("[infer.tokenizer] nucleotide path=%s pad=%s cls=%s sep=%s side=%s vocab_size=%s", model_cfg["nucleotide_tokenizer_path"], nucleotide_tokenizer.pad_token_id, nucleotide_tokenizer.cls_token_id, nucleotide_tokenizer.sep_token_id, nucleotide_tokenizer.padding_side, model_cfg.get("nucleotide_vocab_size"))
     return tokenizer, nucleotide_tokenizer
 
 

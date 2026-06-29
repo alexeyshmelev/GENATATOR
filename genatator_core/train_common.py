@@ -91,6 +91,55 @@ def label_names_for(task: str, dataset_family: str):
     raise RuntimeError(task)
 
 
+
+
+def needs_nucleotide_tokenizer(model_cfg: Dict[str, Any]) -> bool:
+    family = model_cfg["family"]
+    return family in {"unet", "rmt"} or (family == "amt" and bool(model_cfg.get("use_unet", False)))
+
+
+def tokenizer_vocab_size(tokenizer) -> int:
+    try:
+        n = len(tokenizer)
+    except TypeError:
+        n = None
+    vocab_size = getattr(tokenizer, "vocab_size", None)
+    vals = [int(x) for x in (n, vocab_size) if x is not None]
+    if not vals:
+        raise RuntimeError("Could not infer tokenizer vocabulary size")
+    return max(vals)
+
+
+def prepare_nucleotide_tokenizer(model_cfg: Dict[str, Any], tokenizer):
+    if not needs_nucleotide_tokenizer(model_cfg):
+        return None
+    if not model_cfg.get("nucleotide_tokenizer_path"):
+        model_cfg["nucleotide_tokenizer_path"] = model_cfg["tokenizer_path"]
+        logger.info(
+            "[tokenizer.nucleotide] model.nucleotide_tokenizer_path not set; using tokenizer_path=%s",
+            model_cfg["tokenizer_path"],
+        )
+    nucleotide_tokenizer = make_tokenizer(
+        model_cfg["nucleotide_tokenizer_path"],
+        trust_remote_code=bool(model_cfg.get("trust_remote_code", True)),
+    )
+    if model_cfg.get("nucleotide_padding_side"):
+        nucleotide_tokenizer.padding_side = model_cfg["nucleotide_padding_side"]
+    vocab_size = tokenizer_vocab_size(nucleotide_tokenizer)
+    configured = model_cfg.get("nucleotide_vocab_size")
+    if configured in (None, "", "auto"):
+        model_cfg["nucleotide_vocab_size"] = int(vocab_size)
+        logger.info("[tokenizer.nucleotide] auto nucleotide_vocab_size=%d", vocab_size)
+    else:
+        configured_i = int(configured)
+        if configured_i < vocab_size:
+            raise RuntimeError(
+                f"model.nucleotide_vocab_size={configured_i} is smaller than nucleotide tokenizer vocab size {vocab_size}. "
+                "Set it to null/auto or to a value >= tokenizer vocab size."
+            )
+        model_cfg["nucleotide_vocab_size"] = configured_i
+    return nucleotide_tokenizer
+
 def validate_rules(cfg: Dict[str, Any], task: str) -> None:
     model_cfg = cfg["model"]
     family = model_cfg["family"]
@@ -108,9 +157,8 @@ def validate_rules(cfg: Dict[str, Any], task: str) -> None:
     if task == "segmentation" and backbone_kind in {"gena", "moderngena"}:
         if family not in {"unet", "rmt"} and not (family == "amt" and bool(model_cfg.get("use_unet", False))):
             raise RuntimeError("Segmentation with GENA/ModernGENA requires nucleotide resolution: family='unet', family='rmt', or family='amt' with use_unet=true")
-    if family in {"unet", "rmt"} or (family == "amt" and bool(model_cfg.get("use_unet", False))):
-        if not model_cfg.get("nucleotide_tokenizer_path"):
-            raise RuntimeError("UNET/RMT/AMT+UNET models require model.nucleotide_tokenizer_path")
+    if needs_nucleotide_tokenizer(model_cfg) and not model_cfg.get("nucleotide_tokenizer_path"):
+        logger.info("[rules] nucleotide_tokenizer_path not provided; it will default to tokenizer_path for this BPE-to-nucleotide model")
     if "freeze" in str(model_cfg).lower():
         raise RuntimeError("Freezing options are not supported: all parameters are always trainable")
     logger.info("[rules] task=%s family=%s backbone_kind=%s train_bs=%d eval_bs=%d dataset_family=%s", task, family, backbone_kind, train_bs, eval_bs, dataset_family_from_model(model_cfg))
@@ -132,14 +180,10 @@ def train_from_config(config_path: str, task: str) -> None:
     elif model_cfg.get("backbone_kind") == "caduceus":
         tokenizer.padding_side = "left"
         logger.info("[tokenizer.main] using Caduceus default padding_side=left")
-    nucleotide_tokenizer = None
-    if model_cfg.get("nucleotide_tokenizer_path"):
-        nucleotide_tokenizer = make_tokenizer(model_cfg["nucleotide_tokenizer_path"], trust_remote_code=bool(model_cfg.get("trust_remote_code", True)))
-        if model_cfg.get("nucleotide_padding_side"):
-            nucleotide_tokenizer.padding_side = model_cfg["nucleotide_padding_side"]
+    nucleotide_tokenizer = prepare_nucleotide_tokenizer(model_cfg, tokenizer)
     logger.info("[tokenizer.main] path=%s pad=%s cls=%s sep=%s padding_side=%s", model_cfg["tokenizer_path"], tokenizer.pad_token_id, tokenizer.cls_token_id, tokenizer.sep_token_id, tokenizer.padding_side)
     if nucleotide_tokenizer is not None:
-        logger.info("[tokenizer.nucleotide] path=%s pad=%s cls=%s sep=%s padding_side=%s", model_cfg["nucleotide_tokenizer_path"], nucleotide_tokenizer.pad_token_id, nucleotide_tokenizer.cls_token_id, nucleotide_tokenizer.sep_token_id, nucleotide_tokenizer.padding_side)
+        logger.info("[tokenizer.nucleotide] path=%s pad=%s cls=%s sep=%s padding_side=%s vocab_size=%s", model_cfg["nucleotide_tokenizer_path"], nucleotide_tokenizer.pad_token_id, nucleotide_tokenizer.cls_token_id, nucleotide_tokenizer.sep_token_id, nucleotide_tokenizer.padding_side, model_cfg.get("nucleotide_vocab_size"))
     cfg["_tokenizer"] = tokenizer
 
     train_data_cfg = dict(cfg["train_dataset"])

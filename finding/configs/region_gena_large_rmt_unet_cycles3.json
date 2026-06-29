@@ -7,8 +7,8 @@
     "tokenizer_path": "AIRI-Institute/gena-lm-bert-large-t2t",
     "trust_remote_code": true,
     "checkpoint_path": null,
-    "nucleotide_tokenizer_path": "kuleshov-group/caduceus-ps_seqlen-131k_d_model-256_n_layer-16",
-    "nucleotide_vocab_size": 1000,
+    "nucleotide_tokenizer_path": "AIRI-Institute/gena-lm-bert-large-t2t",
+    "nucleotide_vocab_size": null,
     "cycles": 3,
     "rmt": {
       "input_size": 512,
