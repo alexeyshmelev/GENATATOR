@@ -181,7 +181,10 @@ class AMTTokenClassifier(nn.Module):
         layers_attr = amt_kwargs.pop("layers_attr", default_layers_attr)
         act_on_value = bool(amt_kwargs.pop("act_on", False))
         attend_prev_value = bool(amt_kwargs.pop("attend_to_previous_input", False))
-        segment_size_value = int(amt_kwargs.pop("segment_size", 128))
+        default_segment_size = 512 if backbone_kind == "gena" else 1024
+        segment_size_value = int(amt_kwargs.pop("segment_size", default_segment_size))
+        if segment_size_value <= 0:
+            raise RuntimeError(f"AMT segment_size must be positive, got {segment_size_value}")
         segment_alignment_value = amt_kwargs.pop("segment_alignment", "left")
         sliding_window_value = bool(amt_kwargs.pop("sliding_window", False))
         time_penalty_value = float(amt_kwargs.pop("time_penalty", 0.0))

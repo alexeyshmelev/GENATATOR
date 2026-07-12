@@ -75,11 +75,8 @@ def model_cfg(model_name: str, family: str, extra: Optional[dict] = None) -> dic
         cfg["bidirectional_weight_tie"] = False
         cfg["padding_side"] = "left"
     if family in {"unet", "rmt"} or (family == "amt" and bool((extra or {}).get("use_unet", False))):
-        # GENA and ModernGENA tokenizers contain single-nucleotide tokens.
-        # Use the same tokenizer for letter-level nucleotide IDs instead of
-        # borrowing Caduceus token IDs. The model builder detects vocab size.
+        # Single-nucleotide IDs are read from the main model tokenizer.
         cfg.update({
-            "nucleotide_tokenizer_path": info["path"],
             "nucleotide_vocab_size": None,
             "unet_chunk_size": 8192,
         })
@@ -203,7 +200,7 @@ def make_finding_train_config(
         extra = {
             "cycles": 3,
             "rmt": {
-                    "input_size": 64,
+                    "segment_size": 64,
                     "max_n_segments": 8,
                     "num_mem_tokens": 4,
                     "bptt_depth": -1,
@@ -260,7 +257,7 @@ def make_seg_train_config(
             extra = {
                 "cycles": 3,
                 "rmt": {
-                    "input_size": 64,
+                    "segment_size": 64,
                     "max_n_segments": 8,
                     "num_mem_tokens": 4,
                     "bptt_depth": -1,

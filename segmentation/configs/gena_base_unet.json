@@ -7,7 +7,6 @@
     "tokenizer_path": "AIRI-Institute/gena-lm-bert-base-lastln-t2t",
     "trust_remote_code": true,
     "checkpoint_path": null,
-    "nucleotide_tokenizer_path": "AIRI-Institute/gena-lm-bert-base-lastln-t2t",
     "nucleotide_vocab_size": null,
     "unet_cycles": 1,
     "allow_unsafe_torch_load_with_torch_lt_2_6": true,
@@ -26,7 +25,7 @@
     ],
     "loader": "direct_parquet",
     "parquet_batch_size": 64,
-    "max_bpe_tokens": 512,
+    "max_bpe_tokens": 4096,
     "average_bpe_token_length": 9.0
   },
   "eval_dataset": {
@@ -42,7 +41,7 @@
     ],
     "loader": "direct_parquet",
     "parquet_batch_size": 64,
-    "max_bpe_tokens": 512,
+    "max_bpe_tokens": 4096,
     "average_bpe_token_length": 9.0
   },
   "training": {

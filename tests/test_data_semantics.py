@@ -7,6 +7,7 @@ import numpy as np
 try:
     from genatator_core.data import (
         GenatatorDataset,
+        nucleotide_ids,
         resolve_dataset_lengths,
         reverse_complement_task_labels,
     )
@@ -86,6 +87,66 @@ class DataSemanticsTests(unittest.TestCase):
             reverse_complement_task_labels("finding_region", region),
             region[::-1][:, [1, 0]],
         ))
+
+    def test_caduceus_uses_normal_tokenizer_special_tokens(self) -> None:
+        class FakeTokenizer:
+            pad_token_id = 0
+            unk_token_id = 999
+
+            def __init__(self):
+                self.last_kwargs = None
+
+            def num_special_tokens_to_add(self, pair=False):
+                return 2
+
+            def convert_tokens_to_ids(self, token):
+                return {"A": 1, "C": 2, "G": 3, "T": 4, "N": 5}.get(token, self.unk_token_id)
+
+            def __call__(self, **kwargs):
+                self.last_kwargs = kwargs
+                ids = [101] + [self.convert_tokens_to_ids(ch) for ch in kwargs["text"]] + [102]
+                ids = ids[: kwargs["max_length"]]
+                attention = [1] * len(ids)
+                special = [1] + [0] * max(0, len(ids) - 2) + ([1] if len(ids) > 1 else [])
+                while len(ids) < kwargs["max_length"]:
+                    ids.append(self.pad_token_id)
+                    attention.append(0)
+                    special.append(1)
+                return {
+                    "input_ids": ids,
+                    "attention_mask": attention,
+                    "token_type_ids": [0] * len(ids),
+                    "special_tokens_mask": special,
+                }
+
+        dataset = object.__new__(GenatatorDataset)
+        dataset.model_family = "nucleotide"
+        dataset.max_nucleotides = 4
+        dataset.tokenizer = FakeTokenizer()
+        item = dataset._tokenize_token_task(
+            "ACGT",
+            np.arange(4, dtype=np.float32).reshape(4, 1),
+            meta=None,
+            local_start=0,
+        )
+        self.assertTrue(dataset.tokenizer.last_kwargs["add_special_tokens"])
+        self.assertEqual(dataset.tokenizer.last_kwargs["max_length"], 6)
+        self.assertEqual(item["input_ids"].tolist(), [101, 1, 2, 3, 4, 102])
+        self.assertEqual(item["letter_level_labels_mask"].tolist(), [False, True, True, True, True, False])
+
+    def test_nucleotide_ids_are_read_directly_from_tokenizer_vocab(self) -> None:
+        class DirectTokenizer:
+            pad_token_id = 0
+            unk_token_id = 999
+
+            def convert_tokens_to_ids(self, token):
+                return {"A": 11, "C": 12, "G": 13, "T": 14, "N": 15}.get(token, self.unk_token_id)
+
+            def __call__(self, *args, **kwargs):
+                raise AssertionError("nucleotide_ids must not tokenize each nucleotide separately")
+
+        ids = nucleotide_ids("ACGT", DirectTokenizer(), 6)
+        self.assertEqual(ids.tolist(), [11, 12, 13, 14, 0, 0])
 
 
 if __name__ == "__main__":

@@ -99,13 +99,22 @@ class RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater(nn.Module
         self.rmt_config = rmt_config
         self.extract_special_tokens(tokenizer)
         self.extend_word_embeddings(int(num_mem_tokens))
-        self.segment_size = int(rmt_config["input_size"]) - self.num_mem_tokens - 3
-        if self.segment_size <= 0:
-            raise RuntimeError(f"RMT segment_size must be positive: input_size={rmt_config['input_size']} num_mem_tokens={self.num_mem_tokens}")
+        self.rmt_segment_size = int(rmt_config["segment_size"])
+        self.max_n_segments = int(rmt_config["max_n_segments"])
+        if self.rmt_segment_size <= 0:
+            raise RuntimeError(f"RMT segment_size must be positive, got {self.rmt_segment_size}")
+        if self.max_n_segments <= 0:
+            raise RuntimeError(f"RMT max_n_segments must be positive, got {self.max_n_segments}")
+        self.content_segment_size = self.rmt_segment_size - self.num_mem_tokens - 3
+        if self.content_segment_size <= 0:
+            raise RuntimeError(
+                "RMT segment_size must exceed num_mem_tokens + 3 special positions: "
+                f"segment_size={self.rmt_segment_size} num_mem_tokens={self.num_mem_tokens}"
+            )
         logger.info(
-            "[RMT] token ids: pad=%s cls=%s sep=%s mem_tokens=%d input_size=%d segment_size=%d max_n_segments=%d bptt_depth=%s",
+            "[RMT] token ids: pad=%s cls=%s sep=%s mem_tokens=%d segment_size=%d content_tokens_per_segment=%d max_n_segments=%d bptt_depth=%s",
             self.pad_token_id, int(self.cls_token.item()), int(self.sep_token.item()), self.num_mem_tokens,
-            int(rmt_config["input_size"]), self.segment_size, int(rmt_config["max_n_segments"]), rmt_config.get("bptt_depth", -1),
+            self.rmt_segment_size, self.content_segment_size, self.max_n_segments, rmt_config.get("bptt_depth", -1),
         )
 
     def extract_special_tokens(self, tokenizer):
@@ -176,28 +185,28 @@ class RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater(nn.Module
         for seq, y, ym in zip(input_ids, labels, labels_mask):
             content_tokens_mask = (seq != self.pad_token_id) & (seq != self.cls_token.item()) & (seq != self.sep_token.item())
             seq = seq[content_tokens_mask]
-            seq = seq[: self.segment_size * int(self.rmt_config["max_n_segments"])]
+            seq = seq[: self.content_segment_size * self.max_n_segments]
             if seq.numel() == 0:
                 raise RuntimeError("RMT received an empty content-token sequence after removing special tokens.")
             if y is not None:
-                y = y[content_tokens_mask][: self.segment_size * int(self.rmt_config["max_n_segments"])]
+                y = y[content_tokens_mask][: self.content_segment_size * self.max_n_segments]
             if ym is not None:
-                ym = ym[content_tokens_mask][: self.segment_size * int(self.rmt_config["max_n_segments"])]
-            n_seg = math.ceil(len(seq) / self.segment_size)
+                ym = ym[content_tokens_mask][: self.content_segment_size * self.max_n_segments]
+            n_seg = math.ceil(len(seq) / self.content_segment_size)
             input_segments = torch.chunk(seq, n_seg)
-            segmented_batch.append([self.pad_add_special_tokens(t, int(self.rmt_config["input_size"])) for t in input_segments])
+            segmented_batch.append([self.pad_add_special_tokens(t, self.rmt_segment_size) for t in input_segments])
             if y is not None:
                 y_segments = torch.chunk(y, n_seg)
-                segmented_batch_labels.append([self.pad_add_special_tokens(t, int(self.rmt_config["input_size"]), add_to="labels") for t in y_segments])
+                segmented_batch_labels.append([self.pad_add_special_tokens(t, self.rmt_segment_size, add_to="labels") for t in y_segments])
             if ym is not None:
                 ym_segments = torch.chunk(ym, n_seg)
-                segmented_batch_labels_mask.append([self.pad_add_special_tokens(t, int(self.rmt_config["input_size"]), add_to="labels_mask") for t in ym_segments])
-        max_n_segments = int(self.rmt_config["max_n_segments"])
-        segmented_batch = [[s[::-1][i] if len(s) > i else None for s in segmented_batch] for i in range(max_n_segments)][::-1]
+                segmented_batch_labels_mask.append([self.pad_add_special_tokens(t, self.rmt_segment_size, add_to="labels_mask") for t in ym_segments])
+        actual_n_segments = max(len(s) for s in segmented_batch)
+        segmented_batch = [[s[::-1][i] if len(s) > i else None for s in segmented_batch] for i in range(actual_n_segments)][::-1]
         if segmented_batch_labels:
-            segmented_batch_labels = [[s[::-1][i] if len(s) > i else None for s in segmented_batch_labels] for i in range(max_n_segments)][::-1]
+            segmented_batch_labels = [[s[::-1][i] if len(s) > i else None for s in segmented_batch_labels] for i in range(actual_n_segments)][::-1]
         if segmented_batch_labels_mask:
-            segmented_batch_labels_mask = [[s[::-1][i] if len(s) > i else None for s in segmented_batch_labels_mask] for i in range(max_n_segments)][::-1]
+            segmented_batch_labels_mask = [[s[::-1][i] if len(s) > i else None for s in segmented_batch_labels_mask] for i in range(actual_n_segments)][::-1]
         return segmented_batch, segmented_batch_labels, segmented_batch_labels_mask
 
     def _encode_rmt_tokens(self, input_ids, labels=None, labels_mask=None, token_type_ids=None, position_ids=None, head_mask=None, inputs_embeds=None, output_attentions=None, output_hidden_states=None, return_dict=None):

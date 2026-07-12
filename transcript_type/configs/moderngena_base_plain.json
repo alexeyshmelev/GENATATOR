@@ -22,7 +22,7 @@
     ],
     "loader": "direct_parquet",
     "parquet_batch_size": 64,
-    "max_bpe_tokens": 32768,
+    "max_bpe_tokens": 4096,
     "average_bpe_token_length": 9.0
   },
   "eval_dataset": {
@@ -38,7 +38,7 @@
     ],
     "loader": "direct_parquet",
     "parquet_batch_size": 64,
-    "max_bpe_tokens": 32768,
+    "max_bpe_tokens": 4096,
     "average_bpe_token_length": 9.0
   },
   "training": {

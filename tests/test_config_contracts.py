@@ -40,12 +40,30 @@ class StaticConfigContractsTest(unittest.TestCase):
                             self.assertGreater(int(dataset["max_bpe_tokens"]), 0)
                             self.assertGreater(float(dataset["average_bpe_token_length"]), 0.0)
                             self.assertNotIn("max_nucleotides", dataset)
-                            if model.get("backbone_kind") == "gena" and model.get("family") in {"plain", "unet"}:
-                                self.assertLessEqual(int(dataset["max_bpe_tokens"]), 512)
+                        resolved_nt = (
+                            int(dataset["max_nucleotides"])
+                            if model["family"] == "caduceus"
+                            else int(dataset["max_bpe_tokens"] * float(dataset["average_bpe_token_length"]))
+                        )
+                        self.assertGreaterEqual(resolved_nt, 30000)
+                        self.assertLessEqual(resolved_nt, 40000)
                         self.assertNotIn("max_tokens", dataset)
                         if task_dir != "finding":
                             self.assertNotIn("overlap", dataset)
                             self.assertNotIn("random_crop", dataset)
+                    self.assertNotIn("nucleotide_tokenizer_path", model)
+                    if model["family"] == "rmt":
+                        self.assertNotIn("input_size", model["rmt"])
+                        self.assertEqual(
+                            int(model["rmt"]["segment_size"]),
+                            512 if model["backbone_kind"] == "gena" else 1024,
+                        )
+                        self.assertGreater(int(model["rmt"]["max_n_segments"]), 0)
+                    if model["family"] == "amt":
+                        self.assertEqual(
+                            int(model["amt"]["segment_size"]),
+                            512 if model["backbone_kind"] == "gena" else 1024,
+                        )
 
     def test_training_segmentation_validation_stays_status_one(self) -> None:
         for path in sorted((ROOT / "segmentation" / "configs").glob("*.json")):

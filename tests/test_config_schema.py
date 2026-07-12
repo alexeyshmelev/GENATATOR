@@ -50,12 +50,25 @@ def test_all_shipped_configs_use_canonical_length_and_unet_fields() -> None:
                 assert "max_nucleotides" not in dataset, path
                 assert dataset["max_bpe_tokens"] > 0, path
                 assert dataset["average_bpe_token_length"] > 0, path
+            resolved_nt = (
+                int(dataset["max_nucleotides"])
+                if model["family"] == "caduceus"
+                else int(dataset["max_bpe_tokens"] * dataset["average_bpe_token_length"])
+            )
+            assert 30000 <= resolved_nt <= 40000, path
             if transcript_task:
                 assert "overlap" not in dataset, path
                 assert "random_crop" not in dataset, path
             if _uses_unet(model):
                 assert model["unet_chunk_size"] == 8192, path
                 assert "unet_sub_model_input_size" not in model.get("rmt", {}), path
+            assert "nucleotide_tokenizer_path" not in model, path
+            if model["family"] == "rmt":
+                assert "input_size" not in model["rmt"], path
+                assert model["rmt"]["segment_size"] == (512 if model["backbone_kind"] == "gena" else 1024), path
+                assert model["rmt"]["max_n_segments"] > 0, path
+            if model["family"] == "amt":
+                assert model["amt"]["segment_size"] == (512 if model["backbone_kind"] == "gena" else 1024), path
 
 
 def test_training_status_filter_and_full_segmentation_inference_are_distinct() -> None:

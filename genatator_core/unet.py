@@ -291,7 +291,11 @@ def run_samplewise_chunked_unet(
 
         if sample_logits is None:
             raise RuntimeError(f"{context}: UNET produced no logits")
-        full_logits[sample_index, unet_mask, :] = sample_logits[0]
+        # Accelerate may convert the backbone output to FP32 while autocast keeps
+        # the U-Net/classifier output in BF16/FP16. Advanced-index assignment
+        # requires identical dtypes, so cast only for the assembled output tensor.
+        # The loss above still uses the original mixed-precision logits.
+        full_logits[sample_index, unet_mask, :] = sample_logits[0].to(dtype=full_logits.dtype)
 
     loss = None
     if letter_level_labels is not None:

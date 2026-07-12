@@ -20,7 +20,7 @@
       "20"
     ],
     "crop_margin": 500,
-    "max_nucleotides": 131000,
+    "max_nucleotides": 32768,
     "loader": "direct_parquet",
     "parquet_batch_size": 64
   },

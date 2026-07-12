@@ -12,7 +12,7 @@
       "amt_repo_id": "irodkin/armt-neox-tiny",
       "num_mem_tokens": 16,
       "d_mem": 32,
-      "segment_size": 128
+      "segment_size": 1024
     },
     "allow_unsafe_torch_load_with_torch_lt_2_6": true
   },
@@ -23,7 +23,7 @@
     "chromosomes": [],
     "overlap": 0.5,
     "target_group": "primary",
-    "max_bpe_tokens": 8192,
+    "max_bpe_tokens": 4096,
     "average_bpe_token_length": 9.0
   },
   "eval_dataset": {
@@ -33,7 +33,7 @@
     "chromosomes": [],
     "overlap": 0.5,
     "target_group": "primary",
-    "max_bpe_tokens": 8192,
+    "max_bpe_tokens": 4096,
     "average_bpe_token_length": 9.0
   },
   "training": {

@@ -20,6 +20,14 @@ from .unet import DEFAULT_UNET_CHUNK_SIZE
 logger = logging.getLogger(__name__)
 
 
+def default_memory_segment_size(backbone_kind: str) -> int:
+    if backbone_kind == "gena":
+        return 512
+    if backbone_kind == "moderngena":
+        return 1024
+    raise RuntimeError(f"Memory segment defaults are defined only for GENA/ModernGENA, got {backbone_kind!r}")
+
+
 def model_uses_unet(model_cfg: Dict[str, Any]) -> bool:
     family = model_cfg.get("family")
     return family in {"unet", "rmt"} or (family == "amt" and bool(model_cfg.get("use_unet", False)))
@@ -110,6 +118,19 @@ def build_model(cfg: Dict[str, Any], task: str):
             raise RuntimeError("RMT build requires cfg['_tokenizer'] set by train/infer entrypoint")
         base_model = HiddenStateBackbone(backbone_path, backbone_kind, trust_remote_code=trust_remote_code, modernbert_num_labels=num_labels, allow_unsafe_torch_load=allow_unsafe_torch_load)
         rmt_kwargs = dict(model_cfg.get("rmt", {}))
+        legacy_input_size = rmt_kwargs.pop("input_size", None)
+        configured_segment_size = rmt_kwargs.get("segment_size")
+        if legacy_input_size is not None and configured_segment_size is not None and int(legacy_input_size) != int(configured_segment_size):
+            raise RuntimeError(
+                "Conflicting RMT segment sizes: model.rmt.input_size="
+                f"{legacy_input_size} and model.rmt.segment_size={configured_segment_size}"
+            )
+        rmt_kwargs["segment_size"] = int(
+            configured_segment_size
+            if configured_segment_size is not None
+            else (legacy_input_size if legacy_input_size is not None else default_memory_segment_size(backbone_kind))
+        )
+        rmt_kwargs.setdefault("max_n_segments", 10000)
         rmt_kwargs.update({
             "tokenizer": cfg["_tokenizer"],
             "num_labels": num_labels,
@@ -124,6 +145,8 @@ def build_model(cfg: Dict[str, Any], task: str):
         if backbone_kind not in {"gena", "moderngena"}:
             raise RuntimeError(f"AMT is allowed only for GENA/ModernGENA, got backbone_kind={backbone_kind}")
         use_unet = bool(model_cfg.get("use_unet", False))
+        amt_kwargs = dict(model_cfg.get("amt", {}))
+        amt_kwargs.setdefault("segment_size", default_memory_segment_size(backbone_kind))
         model = AMTTokenClassifier(
             backbone_path=backbone_path,
             backbone_kind=backbone_kind,
@@ -137,7 +160,7 @@ def build_model(cfg: Dict[str, Any], task: str):
             unet_channels=model_cfg.get("unet_channels"),
             unet_chunk_size=int(unet_chunk_size) if use_unet else DEFAULT_UNET_CHUNK_SIZE,
             allow_unsafe_torch_load=allow_unsafe_torch_load,
-            **model_cfg.get("amt", {}),
+            **amt_kwargs,
         )
     else:
         raise RuntimeError(f"Unsupported model family: {family}")

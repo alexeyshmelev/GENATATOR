@@ -15,7 +15,7 @@
     "split": "train",
     "genomes": [],
     "chromosomes": [],
-    "max_nucleotides": 73728,
+    "max_nucleotides": 32768,
     "overlap": 0.5,
     "target_group": "primary"
   },
@@ -24,7 +24,7 @@
     "split": "validation",
     "genomes": [],
     "chromosomes": [],
-    "max_nucleotides": 73728,
+    "max_nucleotides": 32768,
     "overlap": 0.5,
     "target_group": "primary"
   },

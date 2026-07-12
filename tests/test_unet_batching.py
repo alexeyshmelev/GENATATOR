@@ -14,6 +14,40 @@ except ImportError:
 
 @unittest.skipIf(torch is None, "torch/transformers are not installed")
 class SamplewiseUnetTests(unittest.TestCase):
+    def test_mixed_precision_logits_are_cast_for_output_assembly(self):
+        class IdentityUnet(nn.Module):
+            def forward(self, x):
+                return x
+
+        class BFloat16Classifier(nn.Module):
+            out_features = 1
+
+            def forward(self, x):
+                return x[..., -1:].to(torch.bfloat16)
+
+        token_hidden = torch.randn(1, 2, 2, dtype=torch.float32, requires_grad=True)
+        loss, logits = run_samplewise_chunked_unet(
+            token_hidden=token_hidden,
+            token_content_mask=torch.tensor([[1, 1]], dtype=torch.bool),
+            embedding_repeater=torch.tensor([[0, 1]], dtype=torch.long),
+            letter_level_tokens=torch.tensor([[1, 2]], dtype=torch.long),
+            letter_level_attention_mask=torch.tensor([[1, 1]], dtype=torch.bool),
+            letter_level_labels=None,
+            letter_level_labels_mask=None,
+            pos_weight=None,
+            nucleotide_embedding=nn.Embedding(4, 2),
+            unet=IdentityUnet(),
+            activation_fn=nn.Identity(),
+            classifier=BFloat16Classifier(),
+            cycles=1,
+            chunk_size=2,
+            context="mixed_precision_test",
+        )
+        self.assertIsNone(loss)
+        self.assertEqual(logits.dtype, torch.float32)
+        logits.sum().backward()
+        self.assertGreater(float(token_hidden.grad.abs().sum()), 0.0)
+
     def test_batched_states_use_only_single_sample_unpadded_chunks_and_global_loss(self):
         class RecordingEmbedding(nn.Embedding):
             def __init__(self):

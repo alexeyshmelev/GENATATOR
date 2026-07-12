@@ -96,22 +96,23 @@ Common fields:
 }
 ```
 
-For U-Net/RMT/AMT+U-Net models add a nucleotide tokenizer.  For GENA and ModernGENA this must normally be the **same tokenizer as the backbone tokenizer**, because those tokenizers already contain single-nucleotide tokens (`A`, `C`, `G`, `T`).  Do not use the Caduceus tokenizer for GENA/ModernGENA nucleotide expansion.
+For U-Net/RMT/AMT+U-Net models, single-nucleotide ids are read directly from the
+same Hugging Face tokenizer configured by `tokenizer_path`. GENA, ModernGENA,
+and Caduceus tokenizers already contain single-nucleotide tokens (`A`, `C`,
+`G`, `T`), so no second tokenizer is downloaded or configured.
 
 ```json
 {
   "tokenizer_path": "AIRI-Institute/moderngena-base",
-  "nucleotide_tokenizer_path": "AIRI-Institute/moderngena-base",
   "nucleotide_vocab_size": null
 }
 ```
 
-`nucleotide_vocab_size: null` means that the code infers the vocabulary size from the nucleotide tokenizer before constructing the nucleotide embedding table.  The same pattern is used for GENA:
+`nucleotide_vocab_size: null` means that the code infers the vocabulary size from the main tokenizer before constructing the nucleotide embedding table. The same pattern is used for GENA:
 
 ```json
 {
   "tokenizer_path": "AIRI-Institute/gena-lm-bert-base-lastln-t2t",
-  "nucleotide_tokenizer_path": "AIRI-Institute/gena-lm-bert-base-lastln-t2t",
   "nucleotide_vocab_size": null
 }
 ```
@@ -124,13 +125,19 @@ For RMT:
   "cycles": 3,
   "unet_chunk_size": 8192,
   "rmt": {
-    "input_size": 512,
+    "segment_size": 512,
     "max_n_segments": 10000,
     "num_mem_tokens": 10,
     "bptt_depth": -1
   }
 }
 ```
+
+`segment_size` is the total number of BPE positions supplied to the backbone
+for each recurrent segment, including RMT memory and special-token positions.
+Its default is `512` for GENA and `1024` for ModernGENA. `max_n_segments`
+controls the maximum number of recurrent segments and may be changed in the
+configuration.
 
 For AMT:
 
@@ -142,7 +149,7 @@ For AMT:
     "amt_repo_id": "irodkin/armt-neox-tiny",
     "num_mem_tokens": 5,
     "d_mem": 64,
-    "segment_size": 1019,
+    "segment_size": 1024,
     "segment_alignment": "left",
     "sliding_window": false,
     "layers_attr": "layers",
@@ -155,6 +162,9 @@ For AMT:
   }
 }
 ```
+
+AMT `segment_size` is also configurable in BPE tokens. Its default is `512`
+for GENA and `1024` for ModernGENA.
 
 For old GENA backbones the AMT layer path is normally `bert.encoder.layer`; for ModernGENA it is normally `layers`.
 
@@ -169,24 +179,31 @@ For `family: "unet"` and for AMT with `use_unet: true`, also set:
 Caduceus is nucleotide-tokenized, so its dataset length is configured directly in nucleotides:
 
 ```json
-"max_nucleotides": 131000
+"max_nucleotides": 32768
 ```
+
+Caduceus sequences are tokenized by the downloaded Hugging Face tokenizer with
+its normal special tokens; labels are applied only to nucleotide-token positions.
 
 GENA and ModernGENA are BPE-tokenized. Their configs must not define a fixed nucleotide context as the primary length. Instead they define both the maximum BPE-token count and the tokenizer's average nucleotide span per BPE token:
 
 ```json
-"max_bpe_tokens": 32768,
+"max_bpe_tokens": 4096,
 "average_bpe_token_length": 9.0
 ```
 
-The nucleotide slice length is derived from these two values. Gene-finding overlap is then calculated in nucleotide coordinates from that derived length. Tokenization may produce fewer tokens, in which case the model input is padded, or more tokens, in which case it is truncated to `max_bpe_tokens`.
+The shipped defaults therefore resolve to approximately 36.9 kb, i.e. a ~32 kb context. The nucleotide
+slice length is derived from these two values. Gene-finding overlap is then
+calculated in nucleotide coordinates from that derived length. Tokenization may
+produce fewer tokens, in which case the model input is padded, or more tokens,
+in which case it is truncated to `max_bpe_tokens`.
 
 Direct GENA plain/U-Net models use absolute position embeddings and the released
-backbones support at most 512 BPE positions. Their shipped configs therefore use
-`max_bpe_tokens: 512`, and the code raises a clear error if a custom direct-GENA
-config exceeds the backbone limit. RMT and AMT may accept longer outer sequences
-because they segment tokens before each GENA backbone call. ModernGENA uses its
-own long-context mechanism and is configured separately.
+backbones support at most 512 BPE positions per backbone call. When the outer
+input is longer, the adapter processes it in independent 512-token backbone
+chunks and concatenates their hidden states. RMT and AMT instead use their own
+recurrent memory segmentation. ModernGENA uses 1024-token memory segments by
+default for RMT/AMT.
 
 ### `training`
 
@@ -417,7 +434,7 @@ Before launching a long evaluation, verify:
 1. `checkpoint_path` points to the automatically selected best checkpoint and exists locally.
 2. The dataset split, assembly, chromosomes, and transcript-status policy match the intended benchmark.
 3. BPE models retain the training run's `max_bpe_tokens` and `average_bpe_token_length`; nucleotide models retain their nucleotide context length.
-4. Models containing a U-Net retain `model.unet_chunk_size` and their nucleotide tokenizer settings.
+4. Models containing a U-Net retain `model.unet_chunk_size`, `nucleotide_vocab_size`, and the same main tokenizer used during training.
 5. Prediction and metric output paths are unique if several evaluations will run concurrently.
 6. A reference GFF is restricted to the same sequences being predicted.
 

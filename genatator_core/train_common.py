@@ -15,7 +15,7 @@ from tqdm.auto import tqdm
 from transformers import Trainer, TrainingArguments
 
 from .config import load_json
-from .data import GenatatorCollator, GenatatorDataset, make_tokenizer
+from .data import GenatatorCollator, GenatatorDataset, make_tokenizer, nucleotide_token_ids
 from .metrics_training import (
     EDGE_CLASS_NAMES,
     REGION_CLASS_NAMES,
@@ -346,32 +346,37 @@ def tokenizer_vocab_size(tokenizer) -> int:
 def prepare_nucleotide_tokenizer(model_cfg: Dict[str, Any], tokenizer):
     if not needs_nucleotide_tokenizer(model_cfg):
         return None
-    if not model_cfg.get("nucleotide_tokenizer_path"):
-        model_cfg["nucleotide_tokenizer_path"] = model_cfg["tokenizer_path"]
-        logger.info(
-            "[tokenizer.nucleotide] model.nucleotide_tokenizer_path not set; using tokenizer_path=%s",
+    legacy_path = model_cfg.pop("nucleotide_tokenizer_path", None)
+    if legacy_path and str(legacy_path) != str(model_cfg["tokenizer_path"]):
+        logger.warning(
+            "[tokenizer.nucleotide_ids] ignoring legacy nucleotide_tokenizer_path=%s; "
+            "single-nucleotide ids are always read from tokenizer_path=%s",
+            legacy_path,
             model_cfg["tokenizer_path"],
         )
-    nucleotide_tokenizer = make_tokenizer(
-        model_cfg["nucleotide_tokenizer_path"],
-        trust_remote_code=bool(model_cfg.get("trust_remote_code", True)),
-    )
-    if model_cfg.get("nucleotide_padding_side"):
-        nucleotide_tokenizer.padding_side = model_cfg["nucleotide_padding_side"]
-    vocab_size = tokenizer_vocab_size(nucleotide_tokenizer)
+    if model_cfg.pop("nucleotide_padding_side", None) is not None:
+        logger.warning(
+            "[tokenizer.nucleotide_ids] nucleotide_padding_side is ignored because the main tokenizer is reused"
+        )
+    ids = nucleotide_token_ids(tokenizer)
+    vocab_size = tokenizer_vocab_size(tokenizer)
     configured = model_cfg.get("nucleotide_vocab_size")
     if configured in (None, "", "auto"):
         model_cfg["nucleotide_vocab_size"] = int(vocab_size)
-        logger.info("[tokenizer.nucleotide] auto nucleotide_vocab_size=%d", vocab_size)
+        logger.info(
+            "[tokenizer.nucleotide_ids] source=main tokenizer ids=%s auto nucleotide_vocab_size=%d",
+            ids,
+            vocab_size,
+        )
     else:
         configured_i = int(configured)
         if configured_i < vocab_size:
             raise RuntimeError(
-                f"model.nucleotide_vocab_size={configured_i} is smaller than nucleotide tokenizer vocab size {vocab_size}. "
+                f"model.nucleotide_vocab_size={configured_i} is smaller than main tokenizer vocab size {vocab_size}. "
                 "Set it to null/auto or to a value >= tokenizer vocab size."
             )
         model_cfg["nucleotide_vocab_size"] = configured_i
-    return nucleotide_tokenizer
+    return tokenizer
 
 def validate_rules(cfg: Dict[str, Any], task: str) -> None:
     model_cfg = cfg["model"]
@@ -395,8 +400,8 @@ def validate_rules(cfg: Dict[str, Any], task: str) -> None:
     if task == "segmentation" and backbone_kind in {"gena", "moderngena"}:
         if family not in {"unet", "rmt"} and not (family == "amt" and bool(model_cfg.get("use_unet", False))):
             raise RuntimeError("Segmentation with GENA/ModernGENA requires nucleotide resolution: family='unet', family='rmt', or family='amt' with use_unet=true")
-    if needs_nucleotide_tokenizer(model_cfg) and not model_cfg.get("nucleotide_tokenizer_path"):
-        logger.info("[rules] nucleotide_tokenizer_path not provided; it will default to tokenizer_path for this BPE-to-nucleotide model")
+    if needs_nucleotide_tokenizer(model_cfg):
+        logger.info("[rules] BPE-to-nucleotide ids will be read from model.tokenizer_path")
     if "freeze" in str(model_cfg).lower():
         raise RuntimeError("Freezing options are not supported: all parameters are always trainable")
     logger.info(
@@ -440,7 +445,7 @@ def train_from_config(config_path: str, task: str) -> None:
     nucleotide_tokenizer = prepare_nucleotide_tokenizer(model_cfg, tokenizer)
     logger.info("[tokenizer.main] path=%s pad=%s cls=%s sep=%s padding_side=%s", model_cfg["tokenizer_path"], tokenizer.pad_token_id, tokenizer.cls_token_id, tokenizer.sep_token_id, tokenizer.padding_side)
     if nucleotide_tokenizer is not None:
-        logger.info("[tokenizer.nucleotide] path=%s pad=%s cls=%s sep=%s padding_side=%s vocab_size=%s", model_cfg["nucleotide_tokenizer_path"], nucleotide_tokenizer.pad_token_id, nucleotide_tokenizer.cls_token_id, nucleotide_tokenizer.sep_token_id, nucleotide_tokenizer.padding_side, model_cfg.get("nucleotide_vocab_size"))
+        logger.info("[tokenizer.nucleotide_ids] source=main path=%s vocab_size=%s", model_cfg["tokenizer_path"], model_cfg.get("nucleotide_vocab_size"))
 
     # At this point tokenizer-dependent values such as nucleotide_vocab_size
     # are resolved, while runtime-only objects have not yet entered cfg.

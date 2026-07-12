@@ -842,16 +842,35 @@ def reverse_complement_task_labels(task: str, labels: np.ndarray) -> np.ndarray:
     return reversed_labels[:, channel_order].copy()
 
 
+def nucleotide_token_ids(tokenizer: PreTrainedTokenizerBase) -> Dict[str, int]:
+    """Read the single-nucleotide token ids directly from one model tokenizer."""
+
+    result: Dict[str, int] = {}
+    unk = getattr(tokenizer, "unk_token_id", None)
+    for nucleotide in ("A", "C", "G", "T", "N"):
+        token_id = tokenizer.convert_tokens_to_ids(nucleotide)
+        if token_id is None or (unk is not None and int(token_id) == int(unk)):
+            if nucleotide == "N":
+                # N is optional because the released training datasets normally
+                # exclude ambiguous sequence. Fail only when it is actually used.
+                continue
+            raise RuntimeError(
+                f"Tokenizer {type(tokenizer).__name__} does not expose a direct "
+                f"single-nucleotide token for {nucleotide!r}."
+            )
+        result[nucleotide] = int(token_id)
+    return result
+
+
 def nucleotide_ids(seq: str, tokenizer: PreTrainedTokenizerBase, max_len: int) -> np.ndarray:
+    token_ids = nucleotide_token_ids(tokenizer)
     ids: List[int] = []
-    for ch in seq[:max_len]:
-        token_id = tokenizer.convert_tokens_to_ids(ch)
-        if token_id is None or token_id == tokenizer.unk_token_id:
-            tokenized = tokenizer(ch, add_special_tokens=False)["input_ids"]
-            if len(tokenized) != 1:
-                raise RuntimeError(f"Nucleotide tokenizer must map {ch!r} to exactly one token, got {tokenized}")
-            token_id = tokenized[0]
-        ids.append(int(token_id))
+    for ch in seq[:max_len].upper():
+        if ch not in token_ids:
+            raise RuntimeError(
+                f"Tokenizer {type(tokenizer).__name__} has no direct single-nucleotide token id for {ch!r}."
+            )
+        ids.append(token_ids[ch])
     pad = int(tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0)
     if len(ids) < max_len:
         ids += [pad] * (max_len - len(ids))
@@ -1210,11 +1229,12 @@ class GenatatorDataset(torch.utils.data.Dataset):
 
     def _tokenize_transcript_type(self, dna: str, meta: ParsedMetadata, local_start: int) -> Dict[str, Any]:
         is_nucleotide = self.model_family == "nucleotide"
+        nucleotide_special_tokens = int(self.tokenizer.num_special_tokens_to_add(pair=False)) if is_nucleotide else 0
         enc = self._tokenize_basic(
             dna,
-            self.max_nucleotides if is_nucleotide else self.max_tokens,
+            self.max_nucleotides + nucleotide_special_tokens if is_nucleotide else self.max_tokens,
             return_offsets=not is_nucleotide,
-            add_special_tokens=not is_nucleotide,
+            add_special_tokens=True,
         )
         item = {
             "input_ids": torch.tensor(enc["input_ids"], dtype=torch.long),
@@ -1241,11 +1261,12 @@ class GenatatorDataset(torch.utils.data.Dataset):
 
     def _tokenize_token_task(self, dna: str, labels: np.ndarray, meta: ParsedMetadata, local_start: int) -> Dict[str, Any]:
         if self.model_family == "nucleotide":
+            nucleotide_special_tokens = int(self.tokenizer.num_special_tokens_to_add(pair=False))
             enc = self._tokenize_basic(
                 dna,
-                self.max_nucleotides,
+                self.max_nucleotides + nucleotide_special_tokens,
                 return_offsets=False,
-                add_special_tokens=False,
+                add_special_tokens=True,
             )
             attn = np.asarray(enc["attention_mask"], dtype=np.int64)
             special = np.asarray(enc.get("special_tokens_mask", [0] * len(attn)), dtype=np.int64)
