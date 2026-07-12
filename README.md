@@ -54,7 +54,37 @@ Rules enforced by the code:
 - GENA/ModernGENA segmentation must be nucleotide-resolution: use `unet`, `rmt`, or `amt` with `use_unet=true`.
 - Every model that contains a U-Net exposes `model.unet_chunk_size`, in nucleotides, with a default of `8192`.
 - Transformer batches may contain multiple samples, but padding left by the Transformer is removed before the U-Net. Each unpadded sample is sent through the U-Net separately with U-Net batch size 1, then the per-sample results are assembled back into the model batch.
+- Nucleotide positions not covered after BPE truncation are excluded silently from the U-Net input, labels, loss, and output assembly. They are not printed per sample, so normal training output remains the Trainer/TQDM progress bar.
+- The training entry point configures console logging at `WARNING`; routine `INFO` diagnostics are suppressed, leaving the Trainer/TQDM progress bar as the normal training output while warnings and errors remain visible.
 - All parameters must remain trainable.
+
+### U-Net mixed-precision output assembly
+
+With BF16 or FP16 training, `accelerate` may return the backbone hidden states as
+FP32 while PyTorch autocast keeps the U-Net classifier output in BF16/FP16. The
+full nucleotide-logit buffer is created from the backbone tensor and therefore
+inherits FP32. PyTorch advanced-index assignment requires the source and
+destination dtypes to match exactly, which previously caused an error such as:
+
+```text
+RuntimeError: Index put requires the source and destination dtypes match,
+got Float for the destination and BFloat16 for the source.
+```
+
+The implementation now casts only the per-sample U-Net logits used for output
+assembly to the destination buffer dtype:
+
+```python
+full_logits[sample_index, unet_mask, :] = sample_logits[0].to(
+    dtype=full_logits.dtype
+)
+```
+
+This does **not** disable mixed-precision U-Net execution. The nucleotide BCE
+loss is still computed from the original autocast logits (converted to FP32 only
+inside the loss calculation for numerical stability), and the assignment cast
+remains differentiable, so gradients continue to flow through the classifier,
+U-Net, nucleotide embeddings, and backbone.
 
 The supplied task/model combinations are:
 

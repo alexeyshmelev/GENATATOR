@@ -231,14 +231,9 @@ def run_samplewise_chunked_unet(
         repeater_full = embedding_repeater[sample_index].long()
         nucleotide_input_mask = letter_level_attention_mask[sample_index].bool()
         unet_mask = nucleotide_input_mask & (repeater_full >= 0)
-        dropped = int((nucleotide_input_mask & (repeater_full < 0)).sum().item())
-        if dropped:
-            logger.info(
-                "[%s] sample=%d dropped %d real nucleotide positions not covered by retained BPE tokens",
-                context,
-                sample_index,
-                dropped,
-            )
+        # Positions with repeater < 0 were truncated away by BPE tokenization.
+        # Exclude them silently from the U-Net input, labels, loss, and output
+        # assembly; per-sample logging here would flood the training progress bar.
         repeater = repeater_full[unet_mask]
         if repeater.numel() == 0:
             raise RuntimeError(f"{context}: sample {sample_index} has no nucleotide positions covered by BPE tokens")

@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 
 try:
@@ -14,6 +15,34 @@ except ImportError:
 
 @unittest.skipIf(torch is None, "torch/transformers are not installed")
 class SamplewiseUnetTests(unittest.TestCase):
+    def test_uncovered_nucleotide_positions_are_dropped_without_info_logging(self):
+        class IdentityUnet(nn.Module):
+            def forward(self, x):
+                return x
+
+        with patch("genatator_core.unet.logger.info") as info_log:
+            _, logits = run_samplewise_chunked_unet(
+                token_hidden=torch.randn(1, 1, 2),
+                token_content_mask=torch.tensor([[1]], dtype=torch.bool),
+                embedding_repeater=torch.tensor([[0, -100]], dtype=torch.long),
+                letter_level_tokens=torch.tensor([[1, 2]], dtype=torch.long),
+                letter_level_attention_mask=torch.tensor([[1, 1]], dtype=torch.bool),
+                letter_level_labels=None,
+                letter_level_labels_mask=None,
+                pos_weight=None,
+                nucleotide_embedding=nn.Embedding(4, 2),
+                unet=IdentityUnet(),
+                activation_fn=nn.Identity(),
+                classifier=nn.Linear(4, 1),
+                cycles=1,
+                chunk_size=2,
+                context="silent_truncation_test",
+            )
+
+        info_log.assert_not_called()
+        self.assertEqual(tuple(logits.shape), (1, 2, 1))
+        self.assertTrue(bool((logits[:, 1:, :] == 0).all()))
+
     def test_mixed_precision_logits_are_cast_for_output_assembly(self):
         class IdentityUnet(nn.Module):
             def forward(self, x):

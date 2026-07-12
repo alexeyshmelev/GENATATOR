@@ -417,7 +417,11 @@ def validate_rules(cfg: Dict[str, Any], task: str) -> None:
 
 
 def train_from_config(config_path: str, task: str) -> None:
-    logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+    # Keep routine training output limited to the Trainer/TQDM progress bar.
+    # Warnings and errors remain visible, while per-module INFO diagnostics are
+    # suppressed during training.
+    logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.WARNING)
+    logging.getLogger().setLevel(logging.WARNING)
     cfg = load_json(config_path)
     validate_rules(cfg, task)
     set_seed(int(cfg.get("seed", 42)))
