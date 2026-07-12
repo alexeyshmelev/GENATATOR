@@ -78,7 +78,11 @@ def model_cfg(model_name: str, family: str, extra: Optional[dict] = None) -> dic
         # GENA and ModernGENA tokenizers contain single-nucleotide tokens.
         # Use the same tokenizer for letter-level nucleotide IDs instead of
         # borrowing Caduceus token IDs. The model builder detects vocab size.
-        cfg.update({"nucleotide_tokenizer_path": info["path"], "nucleotide_vocab_size": None})
+        cfg.update({
+            "nucleotide_tokenizer_path": info["path"],
+            "nucleotide_vocab_size": None,
+            "unet_chunk_size": 8192,
+        })
     if extra:
         cfg.update(extra)
     return cfg
@@ -104,6 +108,7 @@ def smoke_training(
         raise RuntimeError(f"Unsupported smoke training task: {task}")
     return {
         "output_dir": str(output_dir),
+        "custom_prefix": "smoke",
         "overwrite_output_dir": True,
         "max_steps": -1,
         "num_train_epochs": float(epochs),
@@ -134,14 +139,23 @@ def smoke_training(
     }
 
 
-def finding_data(path: Path, aliases: List[str], max_nt: int, max_tok: int) -> dict:
+def _length_fields(family: str, max_nt: int, max_tok: int) -> dict:
+    if family == "caduceus":
+        return {"max_nucleotides": int(max_nt)}
+    if max_tok <= 0:
+        raise RuntimeError(f"Smoke max_tok must be positive, got {max_tok}")
     return {
+        "max_bpe_tokens": int(max_tok),
+        "average_bpe_token_length": float(max_nt) / float(max_tok),
+    }
+
+
+def finding_data(path: Path, aliases: List[str], family: str, max_nt: int, max_tok: int) -> dict:
+    cfg = {
         "path": str(path),
         "split": "test",
         "genomes": None,
         "chromosomes": aliases,
-        "max_nucleotides": int(max_nt),
-        "max_tokens": int(max_tok),
         "overlap": 0.5,
         "target_group": "primary",
         "prewindowed": False,
@@ -149,25 +163,25 @@ def finding_data(path: Path, aliases: List[str], max_nt: int, max_tok: int) -> d
         "max_windows": None,
         "streaming": False,
     }
+    cfg.update(_length_fields(family, max_nt, max_tok))
+    return cfg
 
 
-def transcript_data(path: Path, aliases: List[str], max_nt: int, max_tok: int) -> dict:
-    return {
+def transcript_data(path: Path, aliases: List[str], family: str, max_nt: int, max_tok: int) -> dict:
+    cfg = {
         "path": str(path),
         "split": "test",
         "genomes": None,
         "chromosomes": aliases,
-        "max_nucleotides": int(max_nt),
-        "max_tokens": int(max_tok),
-        "overlap": 0.5,
         "crop_margin": 500,
-        "random_crop": False,
         "statuses": None,
         "max_rows": None,
         "streaming": False,
         "loader": "direct_parquet",
         "parquet_batch_size": 64,
     }
+    cfg.update(_length_fields(family, max_nt, max_tok))
+    return cfg
 
 
 def make_finding_train_config(
@@ -189,12 +203,11 @@ def make_finding_train_config(
         extra = {
             "cycles": 3,
             "rmt": {
-                "input_size": 64,
-                "max_n_segments": 8,
-                "num_mem_tokens": 4,
-                "bptt_depth": -1,
-                "unet_sub_model_input_size": max_nt,
-            },
+                    "input_size": 64,
+                    "max_n_segments": 8,
+                    "num_mem_tokens": 4,
+                    "bptt_depth": -1,
+                },
         }
     elif family == "amt":
         extra = {
@@ -216,7 +229,7 @@ def make_finding_train_config(
         }
     name = f"finding_{task}_{model_name}_{family}"
     bs = 1 if family in {"unet", "rmt"} else 2
-    dataset = finding_data(data_path, aliases, max_nt, max_tok)
+    dataset = finding_data(data_path, aliases, family, max_nt, max_tok)
     cfg = {
         "seed": 42,
         "model": model_cfg(model_name, family, extra),
@@ -251,7 +264,6 @@ def make_seg_train_config(
                     "max_n_segments": 8,
                     "num_mem_tokens": 4,
                     "bptt_depth": -1,
-                    "unet_sub_model_input_size": 512,
                 },
             }
         elif family == "amt":
@@ -276,7 +288,7 @@ def make_seg_train_config(
         else:
             raise RuntimeError(f"Unsupported segmentation family={family}")
     name = f"segmentation_{model_name}_{family}"
-    dataset = transcript_data(selection.selected_parquet_path, aliases, max_nt, max_tok)
+    dataset = transcript_data(selection.selected_parquet_path, aliases, family, max_nt, max_tok)
     cfg = {
         "seed": 42,
         "model": model_cfg(model_name, family, extra),
@@ -299,7 +311,7 @@ def make_tt_train_config(
     max_tok = 512 if kind == "caduceus" else 64
     bs = 2
     name = f"transcript_type_{model_name}_{family}"
-    dataset = transcript_data(selection.selected_parquet_path, aliases, max_nt, max_tok)
+    dataset = transcript_data(selection.selected_parquet_path, aliases, family, max_nt, max_tok)
     cfg = {
         "seed": 42,
         "model": model_cfg(model_name, family),
@@ -324,12 +336,24 @@ def make_finding_infer_config(
     region_train_cfg = json.loads((work / "configs" / f"finding_region_{model_name}_{variant}.json").read_text())
     edge_cfg = {
         "model": edge_train_cfg["model"],
-        "dataset": finding_data(selection.selected_index_path, aliases, 512, 64),
+        "dataset": finding_data(
+            selection.selected_index_path,
+            aliases,
+            edge_train_cfg["model"]["family"],
+            512,
+            64,
+        ),
         "inference": {"checkpoint_path": str(edge_train / "final_model"), "batch_size": 1},
     }
     region_cfg = {
         "model": region_train_cfg["model"],
-        "dataset": finding_data(selection.selected_index_path, aliases, 1024, 128),
+        "dataset": finding_data(
+            selection.selected_index_path,
+            aliases,
+            region_train_cfg["model"]["family"],
+            1024,
+            128,
+        ),
         "inference": {"checkpoint_path": str(region_train / "final_model"), "batch_size": 1},
     }
     cfg = {
@@ -375,12 +399,19 @@ def make_seg_infer_config(
     train_cfg = json.loads((work / "configs" / f"segmentation_{model_name}_{family}.json").read_text())
     cfg = {
         "model": train_cfg["model"],
-        "dataset": transcript_data(selection.selected_parquet_path, aliases, 512, 512 if family == "caduceus" else 64),
+        "dataset": transcript_data(
+            selection.selected_parquet_path,
+            aliases,
+            family,
+            512,
+            512 if family == "caduceus" else 64,
+        ),
         "inference": {
             "device": "cuda",
             "checkpoint_path": str(train_dir / "final_model"),
             "batch_size": 1,
             "use_reverse_complement": False,
+            "use_cds_heuristic": True,
             "threshold": 0.5,
             "empty_segment_policy": "best_interval",
             "coordinate_mode": "transcript",
@@ -403,7 +434,13 @@ def make_tt_infer_config(
     train_cfg = json.loads((work / "configs" / f"transcript_type_{model_name}_{family}.json").read_text())
     cfg = {
         "model": train_cfg["model"],
-        "dataset": transcript_data(selection.selected_parquet_path, aliases, 512, 512 if family == "caduceus" else 64),
+        "dataset": transcript_data(
+            selection.selected_parquet_path,
+            aliases,
+            family,
+            512,
+            512 if family == "caduceus" else 64,
+        ),
         "inference": {
             "device": "cuda",
             "checkpoint_path": str(train_dir / "final_model"),
@@ -506,8 +543,57 @@ def build_jobs(
     return jobs
 
 
-def _training_loss_summary(output_dir: Path) -> dict:
-    state_path = output_dir / "trainer_state.json"
+def _latest_run_dir(output_base: Path) -> Path:
+    manifest = output_base / "latest_run.json"
+    if manifest.exists():
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        run_dir = Path(str(payload["run_dir"])).expanduser()
+        if not run_dir.is_absolute():
+            run_dir = output_base / run_dir
+        if run_dir.exists():
+            return run_dir.resolve()
+    candidates = [
+        p for p in output_base.iterdir()
+        if p.is_dir() and ((p / "trainer_state.json").exists() or (p / "final_model").exists())
+    ] if output_base.exists() else []
+    if not candidates:
+        raise RuntimeError(
+            f"Could not discover timestamped training run under {output_base}; "
+            f"missing/invalid {manifest}"
+        )
+    return max(candidates, key=lambda p: p.stat().st_mtime).resolve()
+
+
+def _refresh_inference_checkpoint_paths(config_path: Path) -> None:
+    cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    changed = False
+
+    def visit(node):
+        nonlocal changed
+        if isinstance(node, dict):
+            inference = node.get("inference")
+            if isinstance(inference, dict) and inference.get("checkpoint_path"):
+                configured = Path(str(inference["checkpoint_path"])).expanduser()
+                if configured.name == "final_model":
+                    run_dir = _latest_run_dir(configured.parent)
+                    resolved = run_dir / "final_model"
+                    if not resolved.exists():
+                        raise RuntimeError(f"Timestamped smoke run has no final_model: {resolved}")
+                    inference["checkpoint_path"] = str(resolved)
+                    changed = True
+            for value in node.values():
+                visit(value)
+        elif isinstance(node, list):
+            for value in node:
+                visit(value)
+
+    visit(cfg)
+    if changed:
+        write_json(config_path, cfg)
+
+
+def _training_loss_summary(run_dir: Path) -> dict:
+    state_path = run_dir / "trainer_state.json"
     if not state_path.exists():
         raise RuntimeError(f"Training job did not write trainer_state.json: {state_path}")
     state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -548,6 +634,9 @@ def run_scheduler(jobs: List[dict], gpus: List[str], work: Path) -> dict:
                 launched = False
                 for name, job in list(pending.items()):
                     if all(dep in done for dep in job["deps"]):
+                        if job["kind"] == "infer" and "--config" in job["cmd"]:
+                            config_i = job["cmd"].index("--config") + 1
+                            _refresh_inference_checkpoint_paths(Path(job["cmd"][config_i]))
                         gpu = free_gpus.pop(0)
                         env = os.environ.copy()
                         env["CUDA_VISIBLE_DEVICES"] = gpu
@@ -591,7 +680,9 @@ def run_scheduler(jobs: List[dict], gpus: List[str], work: Path) -> dict:
                     )
                 result = {"duration_s": duration, "log": str(state["log"]), "kind": state["job"]["kind"]}
                 if state["job"]["kind"] == "train":
-                    result["training_loss_summary"] = _training_loss_summary(Path(state["job"]["output_dir"]))
+                    run_dir = _latest_run_dir(Path(state["job"]["output_dir"]))
+                    result["run_dir"] = str(run_dir)
+                    result["training_loss_summary"] = _training_loss_summary(run_dir)
                 done[name] = result
                 free_gpus.append(state["gpu"])
                 del running[name]

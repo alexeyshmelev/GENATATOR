@@ -15,8 +15,33 @@ from .legacy_caduceus import CaduceusMiddleLossTokenClassifier, CaduceusTranscri
 from .legacy_rmt import RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater
 from .token_models import PlainTokenClassifier, TokenClassifierWithUNet, TranscriptTypeClassifier
 from .torch_compat import allow_transformers_torch_load_on_legacy_torch, trusted_torch_load
+from .unet import DEFAULT_UNET_CHUNK_SIZE
 
 logger = logging.getLogger(__name__)
+
+
+def model_uses_unet(model_cfg: Dict[str, Any]) -> bool:
+    family = model_cfg.get("family")
+    return family in {"unet", "rmt"} or (family == "amt" and bool(model_cfg.get("use_unet", False)))
+
+
+def normalize_unet_chunk_size(model_cfg: Dict[str, Any]) -> int | None:
+    """Materialize one uniform UNET chunk-size field in the model config."""
+
+    if not model_uses_unet(model_cfg):
+        return None
+    configured = model_cfg.get("unet_chunk_size")
+    legacy = model_cfg.get("rmt", {}).get("unet_sub_model_input_size") if model_cfg.get("family") == "rmt" else None
+    if configured is not None and legacy is not None and int(configured) != int(legacy):
+        raise RuntimeError(
+            "Conflicting UNET chunk sizes: model.unet_chunk_size="
+            f"{configured} and model.rmt.unet_sub_model_input_size={legacy}"
+        )
+    value = int(configured if configured is not None else (legacy if legacy is not None else DEFAULT_UNET_CHUNK_SIZE))
+    if value <= 0:
+        raise RuntimeError(f"model.unet_chunk_size must be positive, got {value}")
+    model_cfg["unet_chunk_size"] = value
+    return value
 
 
 def _nucleotide_vocab_size(model_cfg: Dict[str, Any]) -> int:
@@ -29,6 +54,12 @@ def _nucleotide_vocab_size(model_cfg: Dict[str, Any]) -> int:
 def build_model(cfg: Dict[str, Any], task: str):
     model_cfg = cfg["model"]
     family = model_cfg["family"]
+    if task == "transcript_type" and family not in {"plain", "caduceus"}:
+        raise RuntimeError(
+            "Transcript-type classification is implemented only for family='plain' and family='caduceus'; "
+            f"got family={family!r}"
+        )
+    unet_chunk_size = normalize_unet_chunk_size(model_cfg)
     backbone_kind = model_cfg.get("backbone_kind", family)
     backbone_path = local_or_remote(model_cfg["backbone_path"])
     trust_remote_code = bool(model_cfg.get("trust_remote_code", True))
@@ -68,6 +99,7 @@ def build_model(cfg: Dict[str, Any], task: str):
             nucleotide_vocab_size=_nucleotide_vocab_size(model_cfg),
             unet_cycles=int(model_cfg.get("unet_cycles", 1)),
             unet_channels=model_cfg.get("unet_channels"),
+            unet_chunk_size=int(unet_chunk_size),
             allow_unsafe_torch_load=allow_unsafe_torch_load,
         )
 
@@ -84,21 +116,26 @@ def build_model(cfg: Dict[str, Any], task: str):
             "nucleotide_vocab_size": _nucleotide_vocab_size(model_cfg),
             "cycles": int(model_cfg.get("cycles", 3)),
             "unet_channels": model_cfg.get("unet_channels"),
+            "unet_chunk_size": int(unet_chunk_size),
         })
         model = RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater(base_model, **rmt_kwargs)
 
     elif family == "amt":
         if backbone_kind not in {"gena", "moderngena"}:
             raise RuntimeError(f"AMT is allowed only for GENA/ModernGENA, got backbone_kind={backbone_kind}")
+        use_unet = bool(model_cfg.get("use_unet", False))
         model = AMTTokenClassifier(
             backbone_path=backbone_path,
             backbone_kind=backbone_kind,
             num_labels=num_labels,
             trust_remote_code=trust_remote_code,
-            use_unet=bool(model_cfg.get("use_unet", False)),
-            nucleotide_vocab_size=_nucleotide_vocab_size(model_cfg),
+            use_unet=use_unet,
+            # This value is unused by plain AMT.  Do not require a nucleotide
+            # tokenizer/vocabulary unless a UNET is actually present.
+            nucleotide_vocab_size=_nucleotide_vocab_size(model_cfg) if use_unet else 1,
             unet_cycles=int(model_cfg.get("unet_cycles", 1)),
             unet_channels=model_cfg.get("unet_channels"),
+            unet_chunk_size=int(unet_chunk_size) if use_unet else DEFAULT_UNET_CHUNK_SIZE,
             allow_unsafe_torch_load=allow_unsafe_torch_load,
             **model_cfg.get("amt", {}),
         )
@@ -144,10 +181,31 @@ def load_finetuned_weights(model, checkpoint_path: str) -> None:
     clean = {k[7:] if k.startswith("module.") else k: v for k, v in state.items()}
     missing, unexpected = model.load_state_dict(clean, strict=False)
     logger.info("[checkpoint] missing_keys=%d unexpected_keys=%d", len(missing), len(unexpected))
-    if missing:
-        logger.info("[checkpoint] missing=%s", missing)
-    if unexpected:
-        logger.info("[checkpoint] unexpected=%s", unexpected)
+    compatibility_buffer_suffixes = ("position_ids", "token_type_ids")
+
+    def is_compatibility_buffer(name: str) -> bool:
+        return any(name == suffix or name.endswith(f".{suffix}") for suffix in compatibility_buffer_suffixes)
+
+    trainable_names = {name for name, parameter in model.named_parameters() if parameter.requires_grad}
+    missing_trainable = [name for name in missing if name in trainable_names]
+    disallowed_missing = [name for name in missing if not is_compatibility_buffer(name)]
+    disallowed_unexpected = [name for name in unexpected if not is_compatibility_buffer(name)]
+    if missing_trainable or disallowed_missing or disallowed_unexpected:
+        raise RuntimeError(
+            "Finetuned checkpoint is incompatible with the requested model; refusing a partial load. "
+            f"missing_trainable={missing_trainable[:20]} (total={len(missing_trainable)}), "
+            f"missing_keys={disallowed_missing[:20]} (total={len(disallowed_missing)}), "
+            f"unexpected_keys={disallowed_unexpected[:20]} (total={len(disallowed_unexpected)}). "
+            "Only non-trainable position_ids/token_type_ids compatibility buffers may differ."
+        )
+    allowed_missing = [name for name in missing if is_compatibility_buffer(name)]
+    allowed_unexpected = [name for name in unexpected if is_compatibility_buffer(name)]
+    if allowed_missing or allowed_unexpected:
+        logger.info(
+            "[checkpoint] allowed compatibility-buffer differences missing=%s unexpected=%s",
+            allowed_missing,
+            allowed_unexpected,
+        )
 
 
 def _assert_all_trainable(model) -> None:

@@ -16,7 +16,13 @@ from genatator_core.config import load_json
 from genatator_core.data import GenatatorCollator, GenatatorDataset
 from genatator_core.evaluate_gff import evaluate_annotation
 from genatator_core.gff import write_finding_gff
-from genatator_core.infer_common import prepare_model, sigmoid, undo_reverse_complement_logits
+from genatator_core.infer_common import (
+    prepare_model,
+    project_bpe_token_logits_to_nucleotides,
+    project_masked_letter_logits_to_nucleotides,
+    sigmoid,
+    undo_reverse_complement_logits,
+)
 from genatator_core.postprocess import (
     best_interval_records,
     filter_intervals_by_intragenic_bool,
@@ -42,30 +48,26 @@ def ensure_tracks(store: TrackStore, chrom: str, length: int, n_channels: int) -
 
 
 def project_sample_logits(probs: np.ndarray, model_family: str, batch: dict, b: int, task: str, is_rc: bool) -> np.ndarray:
+    """Project one sample to its full nucleotide crop, leaving uncovered bases NaN."""
+    dna_len = len(batch["dna_sequence"][b])
     if model_family in {"nucleotide", "bpe_unet", "rmt_unet", "amt_unet"}:
         mask = batch["letter_level_labels_mask"][b].detach().cpu().numpy().astype(bool)
-        arr = probs[b][mask]
+        arr = project_masked_letter_logits_to_nucleotides(probs[b], mask, dna_len)
         return undo_reverse_complement_logits(arr, task) if is_rc else arr
-    dna_len = len(batch["dna_sequence"][b])
-    n_ch = probs.shape[-1]
-    tmp = np.zeros((dna_len, n_ch), dtype=np.float32)
-    cnt = np.zeros((dna_len, n_ch), dtype=np.float32)
     attn = batch["attention_mask"][b].detach().cpu().numpy()
-    for tok_i, ((s, e), a) in enumerate(zip(batch["offset_mapping"][b], attn)):
-        if int(a) == 0 or e <= s:
-            continue
-        s = max(0, min(dna_len, int(s)))
-        e = max(0, min(dna_len, int(e)))
-        if e <= s:
-            continue
-        tmp[s:e] += probs[b, tok_i]
-        cnt[s:e] += 1.0
-    arr = tmp / np.maximum(cnt, 1.0)
+    arr = project_bpe_token_logits_to_nucleotides(
+        probs[b], batch["offset_mapping"][b], attn, dna_len
+    )
     return undo_reverse_complement_logits(arr, task) if is_rc else arr
 
 
 def _finalize_store(store: TrackStore) -> Dict[str, np.ndarray]:
-    return {chrom: sums / np.maximum(counts, 1.0) for chrom, (sums, counts) in store.items()}
+    finalized: Dict[str, np.ndarray] = {}
+    for chrom, (sums, counts) in store.items():
+        values = np.full_like(sums, np.nan, dtype=np.float32)
+        np.divide(sums, counts, out=values, where=counts > 0)
+        finalized[chrom] = values
+    return finalized
 
 
 def predict_tracks(stage_cfg, task: str, device: str, use_reverse_complement: bool) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
@@ -97,8 +99,10 @@ def predict_tracks(stage_cfg, task: str, device: str, use_reverse_complement: bo
                     ensure_tracks(pred_tracks, chrom, base_start + vals.shape[0], n_ch)
                     sums, counts = pred_tracks[chrom]
                     end = base_start + vals.shape[0]
-                    sums[:, base_start:end] += vals.T
-                    counts[:, base_start:end] += 1.0
+                    projected = vals.T
+                    finite = np.isfinite(projected)
+                    sums[:, base_start:end] += np.where(finite, projected, 0.0)
+                    counts[:, base_start:end] += finite.astype(np.float32)
 
                     # Truth labels are gathered only once, in the forward-orientation pass.
                     # They are nucleotide-resolution and are used for whole-chromosome PR-AUC.
@@ -196,8 +200,10 @@ logger.info(
 for chrom in sorted(edge_tracks):
     if chrom not in region_tracks:
         raise RuntimeError(f"Region tracks missing chromosome {chrom}")
-    edge = edge_tracks[chrom]
-    region = region_tracks[chrom]
+    # Missing BPE coverage remains NaN for PR-AUC exclusion, but postprocessing
+    # needs finite tracks. Treat genuinely uncovered bases as no signal here.
+    edge = np.nan_to_num(edge_tracks[chrom], nan=0.0)
+    region = np.nan_to_num(region_tracks[chrom], nan=0.0)
     if edge.shape[0] != 4:
         raise RuntimeError(f"Edge tracks must have 4 channels in model order TSS+,TSS-,PolyA+,PolyA-, got {edge.shape}")
     if region.shape[0] != 2:

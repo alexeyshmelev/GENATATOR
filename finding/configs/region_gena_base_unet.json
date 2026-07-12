@@ -10,30 +10,32 @@
     "nucleotide_tokenizer_path": "AIRI-Institute/gena-lm-bert-base-lastln-t2t",
     "nucleotide_vocab_size": null,
     "unet_cycles": 1,
-    "allow_unsafe_torch_load_with_torch_lt_2_6": true
+    "allow_unsafe_torch_load_with_torch_lt_2_6": true,
+    "unet_chunk_size": 8192
   },
   "train_dataset": {
     "path": "AIRI-Institute/genatator-gene-finding-dataset",
     "split": "train",
     "genomes": [],
     "chromosomes": [],
-    "max_nucleotides": 73728,
-    "max_tokens": 8192,
     "overlap": 0.5,
-    "target_group": "primary"
+    "target_group": "primary",
+    "max_bpe_tokens": 512,
+    "average_bpe_token_length": 9.0
   },
   "eval_dataset": {
     "path": "AIRI-Institute/genatator-gene-finding-dataset",
     "split": "validation",
     "genomes": [],
     "chromosomes": [],
-    "max_nucleotides": 73728,
-    "max_tokens": 8192,
     "overlap": 0.5,
-    "target_group": "primary"
+    "target_group": "primary",
+    "max_bpe_tokens": 512,
+    "average_bpe_token_length": 9.0
   },
   "training": {
     "output_dir": "runs/finding_region_gena_base_unet",
+    "custom_prefix": "",
     "overwrite_output_dir": false,
     "max_steps": 500000,
     "per_device_train_batch_size": 1,

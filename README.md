@@ -12,6 +12,9 @@ smoke_tests/         # end-to-end real-data smoke tests
 
 The repository is for **fine-tuning**, not pretraining.  All model parameters are trainable; there is no freezing option.
 
+See [`AUDIT_REPORT.md`](AUDIT_REPORT.md) for the requirement-by-requirement
+change map, additional defects found, and verification limits.
+
 ## Installation
 
 Install the package in an environment that already contains the desired PyTorch build:
@@ -23,9 +26,9 @@ pip install -r requirements.txt
 
 `requirements.txt` intentionally does not install or upgrade PyTorch.  The code supports older trusted environments such as `torch==2.2.2+cu121` by enabling an explicit Transformers checkpoint-load compatibility patch for trusted GENA / ModernGENA / AMT checkpoints.
 
-## Local path vs Hugging Face repository
+## Local paths and Hugging Face repositories
 
-There is no `source` field.  Any dataset, tokenizer, backbone, or checkpoint value is interpreted as local if the path exists; otherwise it is passed to Hugging Face as a repo ID/path.  This applies to:
+There is no `source` field. Dataset, tokenizer, and backbone values are interpreted as local when the path exists; otherwise they are passed to Hugging Face as repository IDs. Fine-tuned checkpoint values used by the evaluation scripts must currently point to a local checkpoint directory or weight file.
 
 ```json
 "path": "AIRI-Institute/genatator-gene-finding-dataset"
@@ -49,8 +52,19 @@ Rules enforced by the code:
 - RMT and AMT are only valid for GENA/ModernGENA, never for Caduceus.
 - Caduceus is always nucleotide-level and uses the middle-loss wrapper.
 - GENA/ModernGENA segmentation must be nucleotide-resolution: use `unet`, `rmt`, or `amt` with `use_unet=true`.
-- Any U-Net/RMT/AMT+U-Net path requires batch size 1 because nucleotide expansion is sample-specific.
+- Every model that contains a U-Net exposes `model.unet_chunk_size`, in nucleotides, with a default of `8192`.
+- Transformer batches may contain multiple samples, but padding left by the Transformer is removed before the U-Net. Each unpadded sample is sent through the U-Net separately with U-Net batch size 1, then the per-sample results are assembled back into the model batch.
 - All parameters must remain trainable.
+
+The supplied task/model combinations are:
+
+| Task | Supplied model variants |
+| --- | --- |
+| Gene-finding edge and region | Caduceus PH/PS; GENA base/large plain and U-Net; GENA large RMT+U-Net; ModernGENA base plain, U-Net, RMT+U-Net, AMT plain, and AMT+U-Net; ModernGENA large plain and U-Net |
+| Segmentation | Caduceus PH/PS; GENA base/large U-Net; GENA large RMT+U-Net; ModernGENA base U-Net, RMT+U-Net, and AMT+U-Net; ModernGENA large U-Net |
+| Transcript type | Caduceus PH/PS; GENA base/large plain; ModernGENA base/large plain |
+
+Use the matching JSON under the task's `configs/` directory. The generated evaluation config copies the complete model block, so evaluation uses the same backbone, tokenizer, memory wrapper, U-Net settings, and head shape as training.
 
 ## JSON config structure
 
@@ -108,12 +122,12 @@ For RMT:
 {
   "family": "rmt",
   "cycles": 3,
+  "unet_chunk_size": 8192,
   "rmt": {
     "input_size": 512,
     "max_n_segments": 10000,
     "num_mem_tokens": 10,
-    "bptt_depth": -1,
-    "unet_sub_model_input_size": 8192
+    "bptt_depth": -1
   }
 }
 ```
@@ -144,13 +158,44 @@ For AMT:
 
 For old GENA backbones the AMT layer path is normally `bert.encoder.layer`; for ModernGENA it is normally `layers`.
 
+For `family: "unet"` and for AMT with `use_unet: true`, also set:
+
+```json
+"unet_chunk_size": 8192
+```
+
+### Sequence-length fields
+
+Caduceus is nucleotide-tokenized, so its dataset length is configured directly in nucleotides:
+
+```json
+"max_nucleotides": 131000
+```
+
+GENA and ModernGENA are BPE-tokenized. Their configs must not define a fixed nucleotide context as the primary length. Instead they define both the maximum BPE-token count and the tokenizer's average nucleotide span per BPE token:
+
+```json
+"max_bpe_tokens": 32768,
+"average_bpe_token_length": 9.0
+```
+
+The nucleotide slice length is derived from these two values. Gene-finding overlap is then calculated in nucleotide coordinates from that derived length. Tokenization may produce fewer tokens, in which case the model input is padded, or more tokens, in which case it is truncated to `max_bpe_tokens`.
+
+Direct GENA plain/U-Net models use absolute position embeddings and the released
+backbones support at most 512 BPE positions. Their shipped configs therefore use
+`max_bpe_tokens: 512`, and the code raises a clear error if a custom direct-GENA
+config exceeds the backbone limit. RMT and AMT may accept longer outer sequences
+because they segment tokens before each GENA backbone call. ModernGENA uses its
+own long-context mechanism and is configured separately.
+
 ### `training`
 
 Important fields:
 
 ```json
 {
-  "output_dir": "runs/my_run",
+  "output_dir": "runs/segmentation_moderngena_base_unet",
+  "custom_prefix": "experiment_a",
   "num_train_epochs": 4,
   "max_steps": -1,
   "per_device_train_batch_size": 1,
@@ -176,9 +221,11 @@ Important fields:
 }
 ```
 
+Every new training invocation treats `output_dir` as the base/run-family directory and creates a new timestamped child directory beneath it; it does not reuse or overwrite an earlier run. `custom_prefix` is an optional string prepended to the timestamped run name. Leave it empty when no extra label is needed. Resume paths still point to the exact checkpoint directory from the run being resumed.
+
 `logging_interval` is the primary interval field.  It is mapped to `TrainingArguments.logging_steps`.  If `eval_interval` or `save_interval` are omitted, they default to `logging_interval` and `eval_interval`, respectively.
 
-Training does not run a test phase.  Test/inference commands are separate.
+Training does not run a test phase. Validation during training and post-training evaluation are separate operations.
 
 
 ### Direct parquet loading for transcript datasets
@@ -190,7 +237,7 @@ The segmentation and transcript-type tasks use `AIRI-Institute/genatator-gene-se
 "parquet_batch_size": 64
 ```
 
-The direct loader resolves the requested `config_name` (`train-human`, `train-multi-specie`, or `val-human`), downloads or reuses the exact parquet files from the Hugging Face cache, scans them in bounded PyArrow batches, applies `genomes`, `chromosomes`, and `statuses` filters, and then materializes only the requested rows into CPU RAM before training starts.  For local parquet files or local dataset roots, the same direct loader is used when `loader` is set to `direct_parquet`.
+The direct loader resolves the requested `config_name` (`train-human`, `train-multi-specie`, or `val-human`), downloads or reuses the exact parquet files from the Hugging Face cache, scans them in bounded PyArrow batches, applies the requested genome, chromosome, and status filters, and then materializes only the selected rows into CPU RAM before training starts. For local parquet files or local dataset roots, the same direct loader is used when `loader` is set to `direct_parquet`.
 
 ## Normal training
 
@@ -271,20 +318,108 @@ PYTHONPATH=$PWD CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 \
 Set `training.resume_from_checkpoint` in the JSON config:
 
 ```json
-"resume_from_checkpoint": "runs/segmentation_moderngena_base_unet/checkpoint-10000"
+"resume_from_checkpoint": "runs/segmentation_moderngena_base_unet/<timestamped-run>/checkpoint-10000"
 ```
 
 Leave it as `null` to start from the backbone checkpoint.
 
 ### Logging
 
-All training configs expose `logging_interval`, which maps to TensorBoard logging steps.  `eval_interval` and `save_interval` control validation and checkpointing.  TensorBoard logs are written under `training.output_dir`.
+All training configs expose `logging_interval`, which maps to TensorBoard logging steps. `eval_interval` and `save_interval` control validation and checkpointing. TensorBoard logs are written inside the timestamped run directory.
 
 ### Validation memory
 
-Validation uses a rank-0 streaming loop for all tasks.  Rank 0 evaluates the selected validation set sequentially with the unwrapped model, moves each batch of logits and labels to CPU immediately, updates task-specific metric accumulators, writes the small metric dictionary to `training.output_dir/rank0_eval_metrics/`, and the other ranks wait for that file without NCCL collectives.
+Validation uses a rank-0 streaming loop for all tasks. Rank 0 evaluates the selected validation set sequentially with the unwrapped model, moves each batch of logits and labels to CPU immediately, updates task-specific metric accumulators, writes the small metric dictionary under the run's `rank0_eval_metrics/` directory, and the other ranks wait for that file without NCCL collectives.
 
 This avoids the default Transformers evaluation behavior where logits and labels are all-gathered across ranks.  That default behavior can exhaust GPU memory or trigger NCCL timeouts for long nucleotide-resolution validation examples.  The model forward pass, labels, loss, and metric definitions are unchanged; only validation accumulation is moved from distributed GPU all-gather to rank-0 CPU streaming.
+
+## Post-training evaluation
+
+### Generated evaluation configs
+
+Every training run creates:
+
+```text
+<run-directory>/evaluation_config.json
+```
+
+The file contains the complete model definition and the held-out dataset definition needed by that task. Its checkpoint path is updated automatically whenever the best checkpoint changes. A copy is also stored in checkpoint directories, so the architecture and evaluation settings remain next to the saved weights. Do not replace the copied model block with a generic inference example: U-Net, RMT, AMT, tokenizer, and Caduceus settings are architecture-critical.
+
+Run post-training evaluation on one GPU from the repository root. It does not require `torchrun`.
+
+### Evaluate one gene-finding stage
+
+Edge and region models are trained and scored independently. Run the generated config from either run with:
+
+```bash
+PYTHONPATH=$PWD CUDA_VISIBLE_DEVICES=0 \
+  python -m finding.evaluate \
+  --config runs/<edge-or-region-run>/evaluation_config.json
+```
+
+This evaluates the trained stage on its held-out chromosome data and writes its PR-AUC metrics. It does not create transcript intervals because interval construction requires both a trained edge model and a trained region model.
+
+### Run complete gene-finding inference
+
+To evaluate a complete gene model, put the matching trained edge and region checkpoints into the two stage blocks of a paired inference config, then run:
+
+```bash
+PYTHONPATH=$PWD CUDA_VISIBLE_DEVICES=0 \
+  python -m finding.infer \
+  --config finding/configs/infer_moderngena_base_plain.json
+```
+
+The paired models must use compatible backbones/tokenizers, the same target group, and the same chromosome subset. The command writes a genome-coordinate GFF and whole-chromosome PR-AUC for all edge and region channels. When `inference.true_gff` is set, it also runs the official annotation metric with the configured boundary tolerances. The reference GFF must cover the same assembly and chromosome subset as the prediction; passing a whole-genome reference while predicting one chromosome gives a misleading score.
+
+### Evaluate segmentation
+
+Run the generated config from a segmentation run with:
+
+```bash
+PYTHONPATH=$PWD CUDA_VISIBLE_DEVICES=0 \
+  python -m segmentation.infer \
+  --config runs/<segmentation-run>/evaluation_config.json
+```
+
+Training-time human validation deliberately keeps representative rows with status 1. On `NC_060944.1`, that is 963 transcript rows representing 963 genes; the dataset contains 980 genes in total, but 17 have no status-1 row. This is expected and is not a loader loss. Separate final segmentation evaluation removes the status filter and evaluates all 3,998 transcripts from all 980 genes on that chromosome.
+
+Segmentation inference writes a transcript-coordinate GFF (`seqid = transcript_id`). If a model-length crop starts after transcript position zero, exon and CDS intervals are shifted back by the crop's `local_start` before writing, so they remain aligned to the original transcript coordinate system. A transcript longer than the selected model context contributes one deterministic slice; segmentation and transcript-type tasks do not create overlapping windows or stitch multiple predictions.
+
+Set `inference.true_gff` to run the official gene-level segmentation metric and write `inference.metrics_json`. If it is `null`, inference still writes predictions but does not run the remote official metric.
+
+Segmentation evaluation has a switchable CDS decoder:
+
+```json
+"use_cds_heuristic": true
+```
+
+- `true` matches GENATATOR-PIPELINE: predicted exons are spliced, all three reading frames are translated, and the longest complete methionine-to-stop ORF is mapped back to the exon intervals. Only mRNA records receive CDS intervals; no partial ORF is invented when a complete ORF is absent.
+- `false` keeps CDS intervals decoded directly from the model's CDS channel.
+
+The default is `true`, matching the pipeline. The benchmark heuristic has no minimum-length or partial-ORF tuning knobs.
+
+### Evaluate transcript type
+
+Run the generated config from a transcript-type run with:
+
+```bash
+PYTHONPATH=$PWD CUDA_VISIBLE_DEVICES=0 \
+  python -m transcript_type.infer \
+  --config runs/<transcript-type-run>/evaluation_config.json
+```
+
+The command writes one TSV row per selected transcript with the true type, lncRNA probability, and predicted type, plus a JSON file containing accuracy. Its threshold is applied to the lncRNA probability. As with segmentation, each long transcript contributes one deterministic, non-overlapping model-length slice.
+
+### Evaluation checklist
+
+Before launching a long evaluation, verify:
+
+1. `checkpoint_path` points to the automatically selected best checkpoint and exists locally.
+2. The dataset split, assembly, chromosomes, and transcript-status policy match the intended benchmark.
+3. BPE models retain the training run's `max_bpe_tokens` and `average_bpe_token_length`; nucleotide models retain their nucleotide context length.
+4. Models containing a U-Net retain `model.unet_chunk_size` and their nucleotide tokenizer settings.
+5. Prediction and metric output paths are unique if several evaluations will run concurrently.
+6. A reference GFF is restricted to the same sequences being predicted.
 
 
 
@@ -315,7 +450,7 @@ intragenic+, intragenic-
 
 ### Sampling and BPE handling
 
-Training windows are produced per chromosome with 50% overlap.  For BPE models, targets are projected to token resolution by taking the maximum label value over the nucleotide span covered by each token.  For U-Net/RMT/AMT+U-Net models, BPE hidden states are expanded back to nucleotide positions with `embedding_repeater`; positions truncated away by the BPE tokenizer are masked out.
+Gene finding is the only task that uses overlapping training windows. Windows are produced independently within each chromosome, normally with 50% overlap measured in nucleotides. For BPE models, the nucleotide window length is derived from `max_bpe_tokens` and `average_bpe_token_length`, and targets are projected to token resolution by taking the maximum label value over the nucleotide span covered by each token. For U-Net/RMT/AMT+U-Net models, BPE hidden states are expanded back to nucleotide positions with `embedding_repeater`; positions truncated away by the BPE tokenizer are masked out.
 
 Before window generation, the requested dataset subset is loaded into CPU RAM.  The code logs:
 
@@ -369,11 +504,11 @@ Each sample is one complete transcript sequence.  The labels are nucleotide-reso
 5UTR, exon, intron, 3UTR, CDS
 ```
 
-The dataset retains all annotated transcripts.  You may filter representative transcripts by `statuses: [1]`; for final chromosome-20 evaluation, leave `statuses` unset when all isoforms are desired.
+The dataset retains all annotated transcripts. Training-time validation uses status-1 representative rows. Final segmentation evaluation intentionally removes the status filter so all isoforms in the selected validation subset are scored.
 
 ### Sampling and BPE handling
 
-The model input is only the transcript DNA sequence.  It must not include intergenic regions, neighboring genes, or other chromosome context.  Training crops transcripts to `max_nucleotides`; by default the crop starts at least `crop_margin=500` bp away from transcript ends when possible.  For inference, transcript-coordinate predictions are written.
+The model input is only the transcript DNA sequence. It must not include intergenic regions, neighboring genes, or other chromosome context. Each selected transcript contributes exactly one model-length slice. The crop keeps the configured left margin (normally about 500 nt) when the transcript is long enough; it is never expanded into overlapping windows. Caduceus slice length is defined in nucleotides, while GENA/ModernGENA slice length is derived from the BPE fields described above. Inference writes transcript-coordinate predictions.
 
 GENA/ModernGENA segmentation must use U-Net/RMT/AMT+U-Net so that BPE states are expanded to nucleotide resolution before loss and metrics are computed.
 
@@ -390,7 +525,7 @@ UTR and intron training-time metrics are intentionally excluded.  Gene-level and
 
 ### Validation and long transcripts
 
-Training-time validation uses the same model-context construction as training, but with deterministic cropping when `random_crop=false`.  If a transcript is longer than `max_nucleotides`, the validation dataset provides a model-length crop rather than feeding the whole transcript into one forward pass.  Full transcript-level reconstruction and gene-level scoring are handled by the separate inference command, where predictions are written in transcript coordinates and evaluated with the official metric.
+Training-time validation uses the same one-slice model-context construction as training, with deterministic cropping. If a transcript is longer than the model context, validation and standalone inference evaluate one deterministic model-length slice rather than feeding the whole transcript or reconstructing it from overlapping windows. Standalone inference restores the crop offset in the transcript-coordinate GFF before the official metric is called.
 
 For memory safety, validation uses the rank-0 streaming loop described in the training section.  No validation logits or labels are gathered across GPUs.  Each evaluated batch is converted to CPU NumPy arrays immediately and only task-specific counters or CPU arrays required for the metric are retained.  This same evaluation rule is applied to gene finding, segmentation, and transcript-type training.
 
@@ -416,6 +551,16 @@ Transcript type uses the same transcript rows as segmentation, but the model pre
 Training/validation/inference report only accuracy.
 
 ## Smoke tests
+
+Run the focused regression suite after installing the project dependencies:
+
+```bash
+python -m unittest discover -s tests -p 'test_*.py' -v
+```
+
+The focused tests cover config contracts, BPE length derivation, deterministic
+transcript slicing, reverse-complement alignment, U-Net sample/chunk semantics,
+RMT batch identity, run/checkpoint preservation, and strict checkpoint loading.
 
 Smoke tests use real data and are designed to verify that every task/model path can train, validate, infer, and write metrics on the selected held-out subset. The runner does not enforce any metric-based success criterion; inspect the metrics manually.
 
@@ -445,4 +590,3 @@ The smoke runner:
 For gene finding, smoke tests scan the real T2T `test` split and then train/validate/test on the first 10% of one selected chromosome parquet block.  This keeps the smoke run short while using real nucleotide/target arrays.  For segmentation and transcript type, smoke tests use the selected chromosome transcripts from `val-human`.
 
 Use `--refresh-index` to rescan metadata.  Without it, stored indexes are reused.
-

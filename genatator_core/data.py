@@ -22,6 +22,82 @@ from .utils import reverse_complement
 logger = logging.getLogger(__name__)
 
 
+BPE_DATASET_FAMILIES = {"bpe", "bpe_unet", "rmt_unet", "amt_unet"}
+TRANSCRIPT_TASKS = {"segmentation", "transcript_type"}
+
+
+def resolve_dataset_lengths(cfg: Dict[str, Any], task: str) -> Dict[str, Any]:
+    """Validate public length fields and add private, derived runtime lengths.
+
+    BPE configs describe token capacity and an empirical nucleotide/token ratio.
+    They must not carry a separately tuned nucleotide cap. Nucleotide configs use
+    an exact nucleotide length and do not expose BPE-only fields.
+    """
+    resolved = copy.deepcopy(cfg)
+    family = str(resolved.get("model_family", "bpe"))
+
+    if family == "nucleotide":
+        if "max_nucleotides" not in resolved:
+            raise RuntimeError("Nucleotide dataset configs require max_nucleotides")
+        unexpected = [k for k in ("max_bpe_tokens", "average_bpe_token_length") if k in resolved]
+        if unexpected:
+            raise RuntimeError(
+                "Nucleotide dataset configs must not define BPE-only length fields: "
+                f"{unexpected}"
+            )
+        max_nucleotides = int(resolved["max_nucleotides"])
+        max_tokens = max_nucleotides
+    elif family in BPE_DATASET_FAMILIES:
+        if "max_nucleotides" in resolved:
+            raise RuntimeError(
+                "BPE dataset configs must not define max_nucleotides; configure "
+                "max_bpe_tokens and average_bpe_token_length instead"
+            )
+        missing = [k for k in ("max_bpe_tokens", "average_bpe_token_length") if k not in resolved]
+        if missing:
+            raise RuntimeError(f"BPE dataset config is missing required fields: {missing}")
+        max_tokens = int(resolved["max_bpe_tokens"])
+        average_token_length = float(resolved["average_bpe_token_length"])
+        if average_token_length <= 0 or not math.isfinite(average_token_length):
+            raise RuntimeError(
+                "average_bpe_token_length must be a finite positive number, got "
+                f"{resolved['average_bpe_token_length']!r}"
+            )
+        max_nucleotides = max(1, int(max_tokens * average_token_length))
+    else:
+        raise RuntimeError(f"Unsupported dataset model_family={family!r}")
+
+    if max_nucleotides <= 0 or max_tokens <= 0:
+        raise RuntimeError(
+            f"Resolved dataset lengths must be positive: nt={max_nucleotides} tokens={max_tokens}"
+        )
+
+    if task in TRANSCRIPT_TASKS:
+        if "overlap" in resolved:
+            raise RuntimeError(f"{task} uses one crop per transcript and must not define overlap")
+        if bool(resolved.get("random_crop", False)):
+            raise RuntimeError(f"{task} does not support random_crop; transcript crops are deterministic")
+    elif task.startswith("finding"):
+        overlap = float(resolved.get("overlap", 0.5))
+        if not 0.0 <= overlap < 1.0:
+            raise RuntimeError(f"Gene-finding overlap must satisfy 0 <= overlap < 1, got {overlap}")
+    else:
+        raise RuntimeError(f"Unknown dataset task={task!r}")
+
+    resolved["_task"] = task
+    resolved["_resolved_max_nucleotides"] = max_nucleotides
+    resolved["_resolved_max_tokens"] = max_tokens
+    logger.info(
+        "[dataset.lengths] task=%s family=%s max_nt=%d max_tokens=%d average_bpe_token_length=%s",
+        task,
+        family,
+        max_nucleotides,
+        max_tokens,
+        resolved.get("average_bpe_token_length"),
+    )
+    return resolved
+
+
 def _load_jsonl_rows(path: Path) -> MaterializedRows:
     rows = []
     with path.open("r", encoding="utf-8") as fh:
@@ -230,11 +306,19 @@ def _maybe_trim_streaming_row(row: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[
     if "dna_sequence" not in row:
         return row
 
-    max_nt = int(cfg.get("max_nucleotides", cfg.get("context_length", len(row["dna_sequence"]))))
-    overlap = float(cfg.get("overlap", 0.5))
-    max_windows = int(cfg.get("max_windows") or 1)
-    step = max(1, int(max_nt * (1.0 - overlap)))
-    keep_len = max_nt + max(0, max_windows - 1) * step
+    max_nt = int(cfg.get("_resolved_max_nucleotides", len(row["dna_sequence"])))
+    task = str(cfg.get("_task", ""))
+    if task.startswith("finding"):
+        overlap = float(cfg.get("overlap", 0.5))
+        max_windows = int(cfg.get("max_windows") or 1)
+        step = max(1, int(max_nt * (1.0 - overlap)))
+        keep_len = max_nt + max(0, max_windows - 1) * step
+    else:
+        overlap = 0.0
+        max_windows = 1
+        # Preserve the requested left crop margin so deterministic transcript
+        # slicing can begin at that offset after a streaming row is trimmed.
+        keep_len = max_nt + max(0, int(cfg.get("crop_margin", 500)))
     dna = str(row["dna_sequence"])
     keep_len = min(len(dna), keep_len)
 
@@ -329,11 +413,37 @@ def _repo_parquet_files(repo_id: str, cfg: Dict[str, Any]) -> List[str]:
             "Remote direct parquet loading requires config_name for the segmentation dataset, "
             "for example train-human, train-multi-specie, or val-human."
         )
-    prefix = str(config_name).strip("/") + "/"
-    files = HfApi().list_repo_files(repo_id=repo_id, repo_type="dataset")
-    parquet_files = sorted(f for f in files if f.startswith(prefix) and f.endswith(".parquet"))
+    config_prefix = str(config_name).strip("/") + "/"
+    split = str(cfg.get("split", "train")).strip("/")
+    split_prefix = f"{config_prefix}{split}/"
+    files = HfApi().list_repo_files(
+        repo_id=repo_id,
+        repo_type="dataset",
+        revision=cfg.get("revision"),
+    )
+    parquet_files = sorted(
+        f for f in files if f.startswith(split_prefix) and f.endswith(".parquet")
+    )
     if not parquet_files:
-        raise RuntimeError(f"No parquet files found in repo={repo_id} prefix={prefix}")
+        # Backward compatibility for the earlier config/data.parquet layout.
+        parquet_files = sorted(
+            f for f in files
+            if f.startswith(config_prefix)
+            and f.endswith(".parquet")
+            and "/" not in f[len(config_prefix):]
+        )
+        if parquet_files:
+            logger.warning(
+                "[direct_parquet.legacy_layout] repo=%s expected_prefix=%s using_prefix=%s",
+                repo_id,
+                split_prefix,
+                config_prefix,
+            )
+    if not parquet_files:
+        raise RuntimeError(
+            f"No parquet files found in repo={repo_id} config={config_name} split={split} "
+            f"expected_prefix={split_prefix}"
+        )
     return parquet_files
 
 
@@ -348,8 +458,13 @@ def _local_parquet_files(path: Path, cfg: Dict[str, Any]) -> List[Path]:
         return [path.resolve()]
     if path.is_dir():
         config_name = cfg.get("config_name")
+        split = str(cfg.get("split", "train"))
+        if config_name and (path / str(config_name) / split).exists():
+            return sorted((path / str(config_name) / split).rglob("*.parquet"))
         if config_name and (path / str(config_name)).exists():
-            return sorted((path / str(config_name)).rglob("*.parquet"))
+            # Backward compatibility for config/data.parquet. Do not recursively
+            # mix multiple split directories.
+            return sorted((path / str(config_name)).glob("*.parquet"))
         return sorted(path.rglob("*.parquet"))
     return []
 
@@ -360,12 +475,16 @@ def _download_or_reuse_hf_parquets(repo_id: str, filenames: List[str], cfg: Dict
     local_only = bool(cfg.get("local_files_only", False) or cfg.get("hf_local_files_only", False))
     paths: List[Path] = []
     for fn in tqdm(filenames, desc=f"download/reuse {repo_id} parquet files", unit="file"):
-        path = hf_hub_download(
+        kwargs = dict(
             repo_id=repo_id,
             repo_type="dataset",
             filename=fn,
             local_files_only=local_only,
         )
+        for key in ("revision", "cache_dir", "token"):
+            if cfg.get(key) is not None:
+                kwargs[key] = cfg[key]
+        path = hf_hub_download(**kwargs)
         paths.append(Path(path).resolve())
     return paths
 
@@ -390,6 +509,8 @@ def _direct_parquet_transcript_rows_from_files(files: List[Path], cfg: Dict[str,
     statuses = cfg.get("statuses")
     statuses = set(int(x) for x in statuses) if statuses is not None else None
     batch_size = int(cfg.get("parquet_batch_size") or cfg.get("metadata_batch_size") or 64)
+    task = str(cfg.get("_task", "segmentation"))
+    needs_labels = task != "transcript_type"
 
     rows: List[Dict[str, Any]] = []
     observed = []
@@ -404,18 +525,33 @@ def _direct_parquet_transcript_rows_from_files(files: List[Path], cfg: Dict[str,
     pbar_files = tqdm(files, desc="scan/load selected transcript parquet files", unit="file")
     for path in pbar_files:
         pf = pq.ParquetFile(str(path))
+        schema_names = set(pf.schema_arrow.names)
+        required = {"dna_sequence", "metadata"}
+        if needs_labels:
+            required.add("labels")
+        missing = sorted(required - schema_names)
+        if missing:
+            raise RuntimeError(f"Transcript parquet {path} is missing required columns: {missing}")
+        has_status = "status" in schema_names
+        if statuses is not None and not has_status:
+            raise RuntimeError(f"statuses filter was requested but transcript parquet {path} has no status column")
+        columns = ["dna_sequence", "metadata"]
+        if needs_labels:
+            columns.append("labels")
+        if has_status:
+            columns.append("status")
         # Read in bounded batches. This avoids building the HF Arrow cache and
         # avoids holding unselected rows permanently.
         for batch in pf.iter_batches(
             batch_size=batch_size,
-            columns=["dna_sequence", "labels", "metadata", "status"],
+            columns=columns,
             use_threads=False,
         ):
             names = batch.schema.names
             col_meta = batch.column(names.index("metadata"))
             col_status = batch.column(names.index("status")) if "status" in names else None
             col_dna = batch.column(names.index("dna_sequence"))
-            col_labels = batch.column(names.index("labels"))
+            col_labels = batch.column(names.index("labels")) if "labels" in names else None
             total_rows += batch.num_rows
             for i in range(batch.num_rows):
                 meta_value = col_meta[i].as_py()
@@ -430,18 +566,21 @@ def _direct_parquet_transcript_rows_from_files(files: List[Path], cfg: Dict[str,
                 if statuses is not None and status_value not in statuses:
                     continue
                 dna = str(col_dna[i].as_py()).upper()
-                labels = _arrow_2d_scalar_to_numpy(col_labels[i], dtype=np.float32)
-                if len(dna) != labels.shape[0]:
-                    raise RuntimeError(
-                        f"DNA/labels length mismatch in {path}: row={i} dna={len(dna)} labels={labels.shape}"
-                    )
-                rows.append({
+                selected_row = {
                     "dna_sequence": dna,
-                    "labels": labels,
                     "metadata": meta_value,
-                    "status": status_value,
                     "source_parquet": str(path),
-                })
+                }
+                if col_labels is not None:
+                    labels = _arrow_2d_scalar_to_numpy(col_labels[i], dtype=np.float32)
+                    if len(dna) != labels.shape[0]:
+                        raise RuntimeError(
+                            f"DNA/labels length mismatch in {path}: row={i} dna={len(dna)} labels={labels.shape}"
+                        )
+                    selected_row["labels"] = labels
+                if col_status is not None:
+                    selected_row["status"] = status_value
+                rows.append(selected_row)
                 total_selected += 1
             pbar_files.set_postfix(rows=total_rows, selected=total_selected)
 
@@ -462,7 +601,7 @@ def _direct_parquet_transcript_rows_from_files(files: List[Path], cfg: Dict[str,
         total_nt += len(str(r.get("dna_sequence", "")))
     logger.info(
         "[direct_parquet.selected] rows=%d source_rows=%d total_nt=%d expected_label_ram=%s chrom_counts=%s transcript_types=%s",
-        len(rows), total_rows, total_nt, _human_bytes(total_nt * 5 * 4), chrom_counts, type_counts,
+        len(rows), total_rows, total_nt, _human_bytes(total_nt * 5 * 4 if needs_labels else 0), chrom_counts, type_counts,
     )
     return MaterializedRows(rows)
 
@@ -528,6 +667,9 @@ def load_dataset_auto(cfg: Dict[str, Any]) -> HFDataset:
         kwargs["name"] = name
     if data_files:
         kwargs["data_files"] = data_files
+    for key in ("revision", "cache_dir", "token"):
+        if cfg.get(key) is not None:
+            kwargs[key] = cfg[key]
     if streaming:
         iterable = load_dataset(**kwargs, streaming=True)
         return _materialize_streaming_dataset(iterable, cfg)
@@ -683,6 +825,23 @@ def repeater_from_offsets(offsets: Sequence[Tuple[int, int]], attention_mask: Se
     return rep
 
 
+def reverse_complement_task_labels(task: str, labels: np.ndarray) -> np.ndarray:
+    """Reverse nucleotide order and remap orientation-dependent target channels."""
+    channel_order = {
+        "finding_edge": [1, 0, 3, 2],
+        "finding_region": [1, 0],
+        "segmentation": [3, 1, 2, 0, 4],
+    }.get(task)
+    reversed_labels = np.asarray(labels)[::-1]
+    if channel_order is None:
+        return reversed_labels.copy()
+    if reversed_labels.ndim != 2 or reversed_labels.shape[1] != len(channel_order):
+        raise RuntimeError(
+            f"Reverse-complement label shape mismatch for task={task}: {reversed_labels.shape}"
+        )
+    return reversed_labels[:, channel_order].copy()
+
+
 def nucleotide_ids(seq: str, tokenizer: PreTrainedTokenizerBase, max_len: int) -> np.ndarray:
     ids: List[int] = []
     for ch in seq[:max_len]:
@@ -768,7 +927,8 @@ def _log_selected_dataset_stats(task: str, cfg: Dict[str, Any], raw: Any, row_in
                 meta = parse_metadata(r.get("metadata", {}))
                 seq_len = max(0, meta.end - meta.start)
             seq_total += seq_len
-            target_bytes += seq_len * 5 * 4
+            if task == "segmentation":
+                target_bytes += seq_len * 5 * 4
         kind = "transcripts"
         sample_count = len(rows)
     logger.info(
@@ -863,18 +1023,19 @@ class ChromosomeAssembly:
 
 class GenatatorDataset(torch.utils.data.Dataset):
     def __init__(self, cfg: Dict[str, Any], task: str, tokenizer: PreTrainedTokenizerBase, nucleotide_tokenizer: Optional[PreTrainedTokenizerBase] = None, for_inference: bool = False, is_train: bool = False):
-        self.cfg = copy.deepcopy(cfg)
         self.task = task
+        self.cfg = resolve_dataset_lengths(cfg, task)
+        cfg = self.cfg
+        self.model_family = str(cfg.get("model_family", "bpe"))
+        self.max_nucleotides = int(cfg["_resolved_max_nucleotides"])
+        self.max_tokens = int(cfg["_resolved_max_tokens"])
         self.raw = load_dataset_auto(cfg)
         self.row_indices = filter_row_indices(self.raw, cfg)
         self.tokenizer = tokenizer
         self.nucleotide_tokenizer = nucleotide_tokenizer or tokenizer
         self.for_inference = for_inference
         self.is_train = is_train
-        self.model_family = cfg.get("model_family", "bpe")
-        self.max_nucleotides = int(cfg.get("max_nucleotides", cfg.get("context_length", 4096)))
-        self.max_tokens = int(cfg.get("max_tokens", cfg.get("context_length", 1024)))
-        self.overlap = float(cfg.get("overlap", 0.5))
+        self.overlap = float(cfg.get("overlap", 0.5)) if task.startswith("finding") else 0.0
         self.target_indices = channel_indices(task, cfg)
         _log_selected_dataset_stats(task, cfg, self.raw, self.row_indices, self.target_indices)
         # The training pipeline always materializes the requested split/chromosome/filter
@@ -886,7 +1047,6 @@ class GenatatorDataset(torch.utils.data.Dataset):
             # Targets in RAM have already been sliced to the requested target group.
             self.target_indices = list(range(len(channel_indices(task, cfg))))
         self.crop_margin = int(cfg.get("crop_margin", 500))
-        self.random_crop = bool(cfg.get("random_crop", is_train and task in {"segmentation", "transcript_type"}))
         self.reverse_complement = bool(cfg.get("reverse_complement", False))
         self.prewindowed = bool(cfg.get("prewindowed", False))
         self.windows: List[Any] = []
@@ -969,22 +1129,19 @@ class GenatatorDataset(torch.utils.data.Dataset):
     def _crop_transcript(self, seq_len: int) -> Tuple[int, int]:
         if seq_len <= self.max_nucleotides:
             return 0, seq_len
-        if self.random_crop:
-            lo = min(self.crop_margin, max(0, seq_len - self.max_nucleotides))
-            hi = max(lo, seq_len - self.max_nucleotides - self.crop_margin)
-            start = int(np.random.randint(lo, hi + 1)) if hi > lo else int(lo)
-        elif self.for_inference:
-            start = 0
-        else:
-            start = min(self.crop_margin, max(0, seq_len - self.max_nucleotides))
+        start = min(self.crop_margin, max(0, seq_len - self.max_nucleotides))
         return start, min(seq_len, start + self.max_nucleotides)
 
-    def _slice_transcript(self, idx: int) -> Tuple[str, np.ndarray, ParsedMetadata, int]:
+    def _slice_transcript(self, idx: int) -> Tuple[str, Optional[np.ndarray], ParsedMetadata, int]:
         row_i = self.windows[idx]
         row = self.raw[row_i]
         seq = str(row["dna_sequence"]).upper()
         s, e = self._crop_transcript(len(seq))
-        labels = np.asarray(row["labels"][s:e], dtype=np.float32)[:, self.target_indices]
+        labels = None
+        if self.task != "transcript_type":
+            if "labels" not in row:
+                raise RuntimeError("Segmentation transcript row is missing labels")
+            labels = np.asarray(row["labels"][s:e], dtype=np.float32)[:, self.target_indices]
         meta = parse_metadata(row.get("metadata", {}))
         return seq[s:e], labels, meta, s
 
@@ -995,17 +1152,29 @@ class GenatatorDataset(torch.utils.data.Dataset):
             dna, labels, meta, local_start = self._slice_transcript(idx)
         if self.reverse_complement:
             dna = reverse_complement(dna)
-            labels = labels[::-1].copy()
-        item = self._tokenize_token_task(dna, labels, meta, local_start)
+            if labels is not None:
+                labels = reverse_complement_task_labels(self.task, labels)
+        if self.task == "transcript_type":
+            item = self._tokenize_transcript_type(dna, meta, local_start)
+        else:
+            if labels is None:
+                raise RuntimeError(f"Task {self.task} requires nucleotide labels")
+            item = self._tokenize_token_task(dna, labels, meta, local_start)
         if self.task == "transcript_type":
             is_lnc = float(meta.transcript_type.lower() in {"lnc_rna", "lncrna", "lnc-rna", "lnc"})
             item["transcript_type"] = torch.tensor([is_lnc], dtype=torch.float32)
         return item
 
-    def _tokenize_basic(self, dna: str, max_len: int, return_offsets: bool) -> Dict[str, Any]:
+    def _tokenize_basic(
+        self,
+        dna: str,
+        max_len: int,
+        return_offsets: bool,
+        add_special_tokens: bool = True,
+    ) -> Dict[str, Any]:
         kwargs = dict(
             text=dna,
-            add_special_tokens=True,
+            add_special_tokens=add_special_tokens,
             padding="max_length",
             truncation=True,
             max_length=max_len,
@@ -1039,9 +1208,45 @@ class GenatatorDataset(torch.utils.data.Dataset):
                 offsets.append((0, 0))
         return offsets
 
+    def _tokenize_transcript_type(self, dna: str, meta: ParsedMetadata, local_start: int) -> Dict[str, Any]:
+        is_nucleotide = self.model_family == "nucleotide"
+        enc = self._tokenize_basic(
+            dna,
+            self.max_nucleotides if is_nucleotide else self.max_tokens,
+            return_offsets=not is_nucleotide,
+            add_special_tokens=not is_nucleotide,
+        )
+        item = {
+            "input_ids": torch.tensor(enc["input_ids"], dtype=torch.long),
+            "attention_mask": torch.tensor(enc["attention_mask"], dtype=torch.long),
+            "token_type_ids": torch.tensor(
+                token_type_ids_or_zeros(enc, len(enc["input_ids"])), dtype=torch.long
+            ),
+        }
+        if self.for_inference:
+            if is_nucleotide:
+                attn = np.asarray(enc["attention_mask"], dtype=np.int64)
+                special = np.asarray(enc.get("special_tokens_mask", [0] * len(attn)), dtype=np.int64)
+                offsets = self._synthetic_offsets_from_content_mask((attn == 1) & (special == 0))
+            else:
+                offsets = enc["offset_mapping"]
+            item.update({
+                "metadata": meta,
+                "local_start": local_start,
+                "dna_sequence": dna,
+                "offset_mapping": offsets,
+                "reverse_complement": self.reverse_complement,
+            })
+        return item
+
     def _tokenize_token_task(self, dna: str, labels: np.ndarray, meta: ParsedMetadata, local_start: int) -> Dict[str, Any]:
         if self.model_family == "nucleotide":
-            enc = self._tokenize_basic(dna, self.max_nucleotides, return_offsets=False)
+            enc = self._tokenize_basic(
+                dna,
+                self.max_nucleotides,
+                return_offsets=False,
+                add_special_tokens=False,
+            )
             attn = np.asarray(enc["attention_mask"], dtype=np.int64)
             special = np.asarray(enc.get("special_tokens_mask", [0] * len(attn)), dtype=np.int64)
             mask = (attn == 1) & (special == 0)
@@ -1080,6 +1285,8 @@ class GenatatorDataset(torch.utils.data.Dataset):
                 letter_y = np.zeros((letter_len, labels.shape[1]), dtype=np.float32)
                 letter_y[:n] = labels[:n]
                 letter_mask = np.zeros(letter_len, dtype=bool)
+                letter_attention = np.zeros(letter_len, dtype=np.int64)
+                letter_attention[:n] = 1
                 # Only nucleotide positions that are actually covered by retained
                 # BPE tokens can be used by UNET/RMT/AMT repeaters. With small
                 # smoke-test max_tokens the tokenizer may truncate before
@@ -1091,7 +1298,7 @@ class GenatatorDataset(torch.utils.data.Dataset):
                     "letter_level_labels": torch.tensor(letter_y, dtype=torch.float32),
                     "letter_level_labels_mask": torch.tensor(letter_mask, dtype=torch.bool),
                     "letter_level_token_types_ids": torch.zeros(letter_len, dtype=torch.long),
-                    "letter_level_attention_mask": torch.tensor(letter_mask, dtype=torch.long),
+                    "letter_level_attention_mask": torch.tensor(letter_attention, dtype=torch.long),
                     "embedding_repeater": torch.tensor(rep[:letter_len], dtype=torch.long),
                     "pos_weight": torch.ones((self.max_tokens, labels.shape[1]), dtype=torch.float32),
                 })

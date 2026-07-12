@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader, SequentialSampler
 from tqdm.auto import tqdm
 from transformers import Trainer, TrainingArguments
 
-from .config import load_json, save_json
+from .config import load_json
 from .data import GenatatorCollator, GenatatorDataset, make_tokenizer
 from .metrics_training import (
     EDGE_CLASS_NAMES,
@@ -26,9 +26,16 @@ from .metrics_training import (
     sigmoid,
 )
 from .intervals import f1_from_counts, interval_counts
-from .model_builders import build_model
+from .model_builders import build_model, normalize_unet_chunk_size
+from .run_management import (
+    BestCheckpointEvaluationConfigCallback,
+    EvaluationConfigManager,
+    atomic_save_json,
+    create_timestamped_run_dir,
+    is_world_process_zero,
+)
 from .torch_compat import allow_transformers_torch_load_on_legacy_torch
-from .utils import ensure_dir, set_seed
+from .utils import set_seed
 
 logger = logging.getLogger(__name__)
 
@@ -262,8 +269,7 @@ class GenatatorTrainer(Trainer):
             if metrics_path.exists():
                 metrics_path.unlink()
             metrics = self._streaming_evaluate_rank0(eval_dataset=eval_dataset, metric_key_prefix=metric_key_prefix)
-            with open(metrics_path, "w") as fh:
-                json.dump(metrics, fh, indent=2, sort_keys=True)
+            atomic_save_json(metrics, metrics_path)
             logger.info("[rank0_streaming_eval] wrote metrics=%s", metrics_path)
         else:
             timeout_s = float(getattr(self.args, "eval_rank0_timeout_seconds", 86400.0))
@@ -370,13 +376,18 @@ def prepare_nucleotide_tokenizer(model_cfg: Dict[str, Any], tokenizer):
 def validate_rules(cfg: Dict[str, Any], task: str) -> None:
     model_cfg = cfg["model"]
     family = model_cfg["family"]
+    unet_chunk_size = normalize_unet_chunk_size(model_cfg)
     backbone_kind = model_cfg.get("backbone_kind", family)
     tr = cfg["training"]
     train_bs = int(tr.get("per_device_train_batch_size", 1))
     eval_bs = int(tr.get("per_device_eval_batch_size", 1))
-    needs_bs1 = family in {"rmt", "unet"} or (family == "amt" and bool(model_cfg.get("use_unet", False)))
-    if needs_bs1 and (train_bs != 1 or eval_bs != 1):
-        raise RuntimeError("RMT, AMT+UNET, and plain+UNET models require per-device train/eval batch size 1")
+    if train_bs <= 0 or eval_bs <= 0:
+        raise RuntimeError("per-device train/eval batch sizes must be positive")
+    if task == "transcript_type" and family not in {"plain", "caduceus"}:
+        raise RuntimeError(
+            "Transcript-type classification is implemented only for family='plain' and family='caduceus'; "
+            f"got family={family!r}"
+        )
     if family in {"rmt", "amt"} and backbone_kind not in {"gena", "moderngena"}:
         raise RuntimeError(f"{family.upper()} is only valid for GENA/ModernGENA. Got backbone_kind={backbone_kind}")
     if family == "rmt" and backbone_kind == "caduceus":
@@ -388,7 +399,16 @@ def validate_rules(cfg: Dict[str, Any], task: str) -> None:
         logger.info("[rules] nucleotide_tokenizer_path not provided; it will default to tokenizer_path for this BPE-to-nucleotide model")
     if "freeze" in str(model_cfg).lower():
         raise RuntimeError("Freezing options are not supported: all parameters are always trainable")
-    logger.info("[rules] task=%s family=%s backbone_kind=%s train_bs=%d eval_bs=%d dataset_family=%s", task, family, backbone_kind, train_bs, eval_bs, dataset_family_from_model(model_cfg))
+    logger.info(
+        "[rules] task=%s family=%s backbone_kind=%s train_bs=%d eval_bs=%d dataset_family=%s unet_chunk_size=%s",
+        task,
+        family,
+        backbone_kind,
+        train_bs,
+        eval_bs,
+        dataset_family_from_model(model_cfg),
+        unet_chunk_size,
+    )
 
 
 def train_from_config(config_path: str, task: str) -> None:
@@ -396,8 +416,18 @@ def train_from_config(config_path: str, task: str) -> None:
     cfg = load_json(config_path)
     validate_rules(cfg, task)
     set_seed(int(cfg.get("seed", 42)))
-    output_dir = ensure_dir(cfg["training"]["output_dir"])
-    save_json(cfg, output_dir / "config.json")
+    tr = cfg["training"]
+    configured_output_dir = str(Path(tr["output_dir"]).expanduser().resolve())
+    output_dir = create_timestamped_run_dir(tr, config_path=config_path)
+    tr["output_base_dir"] = configured_output_dir
+    tr["output_dir"] = str(output_dir)
+    tr["overwrite_output_dir"] = False
+    logger.info(
+        "[training.run] base_output_dir=%s effective_output_dir=%s custom_prefix=%s",
+        configured_output_dir,
+        output_dir,
+        tr.get("custom_prefix", ""),
+    )
 
     model_cfg = cfg["model"]
     dataset_family = dataset_family_from_model(model_cfg)
@@ -411,6 +441,15 @@ def train_from_config(config_path: str, task: str) -> None:
     logger.info("[tokenizer.main] path=%s pad=%s cls=%s sep=%s padding_side=%s", model_cfg["tokenizer_path"], tokenizer.pad_token_id, tokenizer.cls_token_id, tokenizer.sep_token_id, tokenizer.padding_side)
     if nucleotide_tokenizer is not None:
         logger.info("[tokenizer.nucleotide] path=%s pad=%s cls=%s sep=%s padding_side=%s vocab_size=%s", model_cfg["nucleotide_tokenizer_path"], nucleotide_tokenizer.pad_token_id, nucleotide_tokenizer.cls_token_id, nucleotide_tokenizer.sep_token_id, nucleotide_tokenizer.padding_side, model_cfg.get("nucleotide_vocab_size"))
+
+    # At this point tokenizer-dependent values such as nucleotide_vocab_size
+    # are resolved, while runtime-only objects have not yet entered cfg.
+    evaluation_config_manager = EvaluationConfigManager(cfg, task=task, run_dir=output_dir)
+    if is_world_process_zero():
+        atomic_save_json(cfg, output_dir / "training_config.json")
+        # Keep the historical filename for callers that already consume it.
+        atomic_save_json(cfg, output_dir / "config.json")
+    evaluation_config_manager.write_initial()
     cfg["_tokenizer"] = tokenizer
 
     train_data_cfg = dict(cfg["train_dataset"])
@@ -423,7 +462,6 @@ def train_from_config(config_path: str, task: str) -> None:
     eval_dataset = GenatatorDataset(eval_data_cfg, task=task, tokenizer=tokenizer, nucleotide_tokenizer=nucleotide_tokenizer, is_train=False)
 
     model = build_model(cfg, task=task)
-    tr = cfg["training"]
     logging_strategy = str(tr.get("logging_strategy", "steps"))
     evaluation_strategy = str(tr.get("evaluation_strategy", tr.get("eval_strategy", "steps")))
     save_strategy = str(tr.get("save_strategy", "steps"))
@@ -455,7 +493,8 @@ def train_from_config(config_path: str, task: str) -> None:
     )
     ta_kwargs = dict(
         output_dir=str(output_dir),
-        overwrite_output_dir=bool(tr.get("overwrite_output_dir", False)),
+        # Every invocation owns a newly created timestamped directory.
+        overwrite_output_dir=False,
         max_steps=int(tr.get("max_steps", -1)),
         num_train_epochs=float(tr.get("num_train_epochs", 1.0)),
         per_device_train_batch_size=int(tr.get("per_device_train_batch_size", 1)),
@@ -483,7 +522,7 @@ def train_from_config(config_path: str, task: str) -> None:
         load_best_model_at_end=bool(tr.get("load_best_model_at_end", False)),
         metric_for_best_model=tr.get("metric_for_best_model"),
         greater_is_better=tr.get("greater_is_better"),
-        report_to=["tensorboard"],
+        report_to=tr.get("report_to", "tensorboard"),
         logging_dir=str(output_dir / "tensorboard"),
         disable_tqdm=False,
         dataloader_num_workers=int(tr.get("dataloader_num_workers", 4)),
@@ -515,10 +554,27 @@ def train_from_config(config_path: str, task: str) -> None:
             model_cfg.get("allow_unsafe_torch_load_with_torch_lt_2_6", True)
         ),
         genatator_task=task,
+        callbacks=[BestCheckpointEvaluationConfigCallback(evaluation_config_manager)],
     )
     resume = tr.get("resume_from_checkpoint") or None
+    if isinstance(resume, bool):
+        raise RuntimeError(
+            "training.resume_from_checkpoint must be an explicit checkpoint path. "
+            "Boolean auto-resume cannot search a newly created timestamped run directory."
+        )
     logger.info("[training] resume_from_checkpoint=%s", resume)
     train_result = trainer.train(resume_from_checkpoint=resume)
-    trainer.save_model(str(output_dir / "final_model"))
+    final_model_dir = output_dir / "final_model"
+    trainer.save_model(str(final_model_dir))
     trainer.save_state()
-    save_json(dict(train_result.metrics), output_dir / "train_metrics.json")
+    if trainer.is_world_process_zero():
+        atomic_save_json(dict(train_result.metrics), output_dir / "train_metrics.json")
+        best = getattr(trainer.state, "best_model_checkpoint", None)
+        if best and Path(best).expanduser().exists():
+            evaluation_config_manager.update_checkpoint(best, selection="best", copy_to=final_model_dir)
+        else:
+            evaluation_config_manager.update_checkpoint(
+                final_model_dir,
+                selection="final_model_no_best",
+                copy_to=final_model_dir,
+            )

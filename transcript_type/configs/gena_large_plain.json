@@ -15,17 +15,15 @@
     "split": "train",
     "genomes": [],
     "chromosomes": [],
-    "max_nucleotides": 250000,
-    "max_tokens": 32768,
-    "overlap": 0.5,
     "crop_margin": 500,
-    "random_crop": true,
     "target_group": "primary",
     "statuses": [
       1
     ],
     "loader": "direct_parquet",
-    "parquet_batch_size": 64
+    "parquet_batch_size": 64,
+    "max_bpe_tokens": 512,
+    "average_bpe_token_length": 9.0
   },
   "eval_dataset": {
     "path": "AIRI-Institute/genatator-gene-segmentation-dataset",
@@ -33,20 +31,19 @@
     "split": "validation",
     "genomes": [],
     "chromosomes": [],
-    "max_nucleotides": 250000,
-    "max_tokens": 32768,
-    "overlap": 0.5,
     "crop_margin": 500,
-    "random_crop": false,
     "target_group": "primary",
     "statuses": [
       1
     ],
     "loader": "direct_parquet",
-    "parquet_batch_size": 64
+    "parquet_batch_size": 64,
+    "max_bpe_tokens": 512,
+    "average_bpe_token_length": 9.0
   },
   "training": {
     "output_dir": "runs/transcript_type_gena_large_plain",
+    "custom_prefix": "",
     "overwrite_output_dir": false,
     "max_steps": 500000,
     "per_device_train_batch_size": 2,

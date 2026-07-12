@@ -90,6 +90,14 @@ class HiddenStateBackbone(nn.Module):
                 num_labels=int(modernbert_num_labels),
                 trust_remote_code=trust_remote_code,
             )
+            # HiddenStateBackbone calls the encoder directly and supplies its own
+            # task head in the enclosing GENATATOR model.  Keeping ModernBERT's
+            # pretrained token-classification head here would register trainable
+            # parameters that never participate in forward/backward, which can
+            # break DDP when unused-parameter discovery is disabled.
+            if hasattr(owner, "classifier"):
+                owner.classifier = nn.Identity()
+                logger.info("[backbone] replaced unused ModernBERT classifier with Identity")
             # Keep exactly one registered module. Do not additionally assign
             # `self.encoder = owner.model`, because that creates duplicated named
             # parameters and safetensors refuses to save them.
@@ -159,6 +167,17 @@ class HiddenStateBackbone(nn.Module):
         return get_word_embeddings(self._embedding_source(), context="HiddenStateBackbone.embeddings")
 
     def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, inputs_embeds=None, output_hidden_states=True, return_dict=True, **kwargs):
+        if self.backbone_kind == "gena":
+            sequence_length = int(
+                input_ids.shape[1] if input_ids is not None else inputs_embeds.shape[1]
+            )
+            position_limit = getattr(self.config, "max_position_embeddings", None)
+            if position_limit is not None and sequence_length > int(position_limit):
+                raise RuntimeError(
+                    f"Direct GENA input has {sequence_length} BPE tokens, but this backbone supports "
+                    f"at most {int(position_limit)} absolute positions. Reduce max_bpe_tokens or use "
+                    "an RMT/AMT model that segments the token sequence before the GENA backbone."
+                )
         common = dict(
             input_ids=input_ids,
             attention_mask=attention_mask,

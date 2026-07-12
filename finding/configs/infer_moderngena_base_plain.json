@@ -18,10 +18,10 @@
         "chr20",
         "20"
       ],
-      "max_nucleotides": 9216,
-      "max_tokens": 1024,
       "overlap": 0.5,
-      "target_group": "primary"
+      "target_group": "primary",
+      "max_bpe_tokens": 1024,
+      "average_bpe_token_length": 9.0
     },
     "inference": {
       "checkpoint_path": "runs/finding_edge_moderngena_base_plain/final_model",
@@ -47,10 +47,10 @@
         "chr20",
         "20"
       ],
-      "max_nucleotides": 73728,
-      "max_tokens": 8192,
       "overlap": 0.5,
-      "target_group": "primary"
+      "target_group": "primary",
+      "max_bpe_tokens": 8192,
+      "average_bpe_token_length": 9.0
     },
     "inference": {
       "checkpoint_path": "runs/finding_region_moderngena_base_plain/final_model",

@@ -6,13 +6,29 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn import BCEWithLogitsLoss
 from transformers.modeling_outputs import TokenClassifierOutput
 
 from .backbones import get_word_embeddings, infer_hidden_size, infer_vocab_size_from_embeddings
-from .unet import UNET1DSegmentationHead
+from .unet import DEFAULT_UNET_CHUNK_SIZE, UNET1DSegmentationHead, run_samplewise_chunked_unet
 
 logger = logging.getLogger(__name__)
+
+
+def scatter_active_rows(compact: torch.Tensor, non_empty_mask, batch_size: int) -> torch.Tensor:
+    """Restore compact RMT segment rows to their original batch identities."""
+
+    active_indices = torch.tensor(
+        [i for i, is_active in enumerate(non_empty_mask) if is_active],
+        dtype=torch.long,
+        device=compact.device,
+    )
+    if int(compact.shape[0]) != int(active_indices.numel()):
+        raise RuntimeError(
+            f"RMT active-row mismatch: compact_rows={compact.shape[0]} active_indices={active_indices.numel()}"
+        )
+    full = compact.new_zeros((int(batch_size), *compact.shape[1:]))
+    full.index_copy_(0, active_indices, compact)
+    return full
 
 
 class RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater(nn.Module):
@@ -33,7 +49,8 @@ class RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater(nn.Module
     - hidden size is detected automatically from the loaded backbone config and embedding table;
     - UNET input width is computed as 2 * hidden_size, so GENA/ModernGENA base/large work;
     - output labels are configurable by `num_labels`;
-    - batch size is explicitly restricted to 1.
+    - RMT token encoding may be batched, while UNET is always called with one
+      unpadded nucleotide sample at a time.
     """
 
     def __init__(self, base_model, **rmt_kwargs):
@@ -41,7 +58,20 @@ class RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater(nn.Module
         self.model = base_model
         self.num_labels = int(rmt_kwargs.pop("num_labels"))
         self.cycles = int(rmt_kwargs.pop("cycles", 3))
-        self.unet_sub_model_input_size = int(rmt_kwargs.get("unet_sub_model_input_size", 8192))
+        configured_chunk = rmt_kwargs.pop("unet_chunk_size", None)
+        legacy_chunk = rmt_kwargs.pop("unet_sub_model_input_size", None)
+        if configured_chunk is not None and legacy_chunk is not None and int(configured_chunk) != int(legacy_chunk):
+            raise RuntimeError(
+                "Conflicting RMT UNET chunk sizes: model.unet_chunk_size="
+                f"{configured_chunk} and model.rmt.unet_sub_model_input_size={legacy_chunk}"
+            )
+        self.unet_chunk_size = int(
+            configured_chunk if configured_chunk is not None else (
+                legacy_chunk if legacy_chunk is not None else DEFAULT_UNET_CHUNK_SIZE
+            )
+        )
+        if self.unet_chunk_size <= 0:
+            raise RuntimeError("unet_chunk_size must be positive")
         self.hidden_size = infer_hidden_size(self.model.config, context="RMT.backbone")
         word_embeddings = get_word_embeddings(self.model, context="RMT.backbone")
         _, emb_hidden = infer_vocab_size_from_embeddings(word_embeddings, context="RMT.backbone")
@@ -60,7 +90,7 @@ class RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater(nn.Module
         self.fc = nn.Linear(self.unet_input_dim, self.num_labels)
         logger.info(
             "[RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater] hidden_size=%d num_labels=%d unet_input_dim=%d cycles=%d unet_chunk=%d",
-            self.hidden_size, self.num_labels, self.unet_input_dim, self.cycles, self.unet_sub_model_input_size,
+            self.hidden_size, self.num_labels, self.unet_input_dim, self.cycles, self.unet_chunk_size,
         )
         self.set_params(**rmt_kwargs)
         self.rmt_config["sum_loss"] = True
@@ -191,64 +221,43 @@ class RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater(nn.Module
             seg_inputs_embeds[:, self.memory_position] = memory[non_empty_mask]
             out = self.model(input_ids=None, inputs_embeds=seg_inputs_embeds, attention_mask=seg_attention_mask, token_type_ids=seg_token_type_ids, output_hidden_states=True, return_dict=True)
             memory[non_empty_mask] = out.hidden_states[-1][:, self.memory_position]
-            logits.append(out.logits)
+            # Compacting active rows and then padding at the end changes sample
+            # identity when, for example, non_empty_mask=[False, True]. Scatter
+            # every segment back to its original batch indices immediately.
+            logits.append(scatter_active_rows(out.logits, non_empty_mask, bs))
             if segment_labels is not None:
-                labels_segm.append(torch.stack([el for el, m in zip(segment_labels, non_empty_mask) if m]))
+                compact_labels = torch.stack([el for el, m in zip(segment_labels, non_empty_mask) if m])
+                labels_segm.append(scatter_active_rows(compact_labels, non_empty_mask, bs))
             if segment_labels_mask is not None:
-                logits_masks.append(torch.stack([el for el, m in zip(segment_labels_mask, non_empty_mask) if m]))
+                compact_mask = torch.stack([el for el, m in zip(segment_labels_mask, non_empty_mask) if m])
+                logits_masks.append(scatter_active_rows(compact_mask, non_empty_mask, bs))
         if out is None:
             raise RuntimeError("RMT produced no segment outputs.")
-        for i in range(len(logits)):
-            logits[i] = F.pad(logits[i], (0, 0, 0, 0, 0, bs - logits[i].shape[0]))
-            if labels_segm:
-                labels_segm[i] = F.pad(labels_segm[i], (0, 0, 0, 0, 0, bs - labels_segm[i].shape[0]))
-            if logits_masks:
-                logits_masks[i] = F.pad(logits_masks[i], (0, 0, 0, bs - logits_masks[i].shape[0]))
         token_logits = torch.cat(logits, dim=1)
         token_mask = torch.cat(logits_masks, dim=1) if logits_masks else None
         return token_logits, token_mask
 
     def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, position_ids=None, head_mask=None, inputs_embeds=None, labels=None, labels_mask=None, pos_weight=None, output_attentions=None, output_hidden_states=None, return_dict=None, embedding_repeater=None, letter_level_tokens=None, letter_level_labels=None, letter_level_labels_mask=None, letter_level_token_types_ids=None, letter_level_attention_mask=None):
-        if input_ids.shape[0] != 1:
-            raise RuntimeError("RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater requires batch size 1.")
-        if embedding_repeater is None or letter_level_tokens is None or letter_level_labels_mask is None:
-            raise RuntimeError("RMT repeater requires embedding_repeater, letter_level_tokens and letter_level_labels_mask.")
+        if embedding_repeater is None or letter_level_tokens is None:
+            raise RuntimeError("RMT repeater requires embedding_repeater and letter_level_tokens.")
         token_logits, token_mask = self._encode_rmt_tokens(input_ids, labels=labels, labels_mask=labels_mask, token_type_ids=token_type_ids, position_ids=position_ids, head_mask=head_mask, inputs_embeds=inputs_embeds, output_attentions=output_attentions, output_hidden_states=output_hidden_states, return_dict=return_dict)
         if token_mask is None:
             raise RuntimeError("RMT token mask was not produced. labels_mask is required for repeater alignment.")
-        curr_logits = token_logits[0, token_mask[0].bool(), :].unsqueeze(0)
-        raw_lmask = letter_level_labels_mask[0].bool()
-        repeater_full = embedding_repeater[0].long()
-        lmask = raw_lmask & (repeater_full >= 0)
-        dropped = int((raw_lmask & (repeater_full < 0)).sum().item())
-        if dropped:
-            logger.info("[RMTRepeater] dropped %d nucleotide positions not covered by retained BPE tokens", dropped)
-        curr_repeater = repeater_full[lmask]
-        if curr_repeater.numel() == 0:
-            raise RuntimeError("RMT embedding_repeater is empty after removing uncovered BPE positions.")
-        if curr_repeater.max().item() >= curr_logits.shape[1]:
-            raise RuntimeError(f"RMT repeater max {curr_repeater.max().item()} incompatible with token length {curr_logits.shape[1]}")
-        nt_emb = self.nucleotide_embedding(letter_level_tokens[0][lmask].unsqueeze(0))
-        repeated = torch.cat((nt_emb, curr_logits[:, curr_repeater, :]), dim=-1)
-        target = letter_level_labels[0][lmask].unsqueeze(0) if letter_level_labels is not None else None
-        weight = pos_weight[0, 0, :].to(repeated.device).float() if pos_weight is not None else None
-        loss_fct = BCEWithLogitsLoss(pos_weight=weight)
-        loss = 0.0
-        collected_logits = None
-        x = repeated
-        num_chunks = math.ceil(x.shape[1] / self.unet_sub_model_input_size)
-        for _ in range(self.cycles):
-            logits_chunks = []
-            embedding_chunks = []
-            for i in range(num_chunks):
-                chunk = x[:, i * self.unet_sub_model_input_size : (i + 1) * self.unet_sub_model_input_size, :]
-                z = self.activation_fn(self.sub_model(chunk.transpose(1, 2))).transpose(1, 2)
-                embedding_chunks.append(z)
-                logits_chunks.append(self.fc(z))
-            collected_logits = torch.cat(logits_chunks, dim=1)
-            if target is not None:
-                loss = loss + loss_fct(collected_logits.float(), target.float())
-            x = x + torch.cat(embedding_chunks, dim=1)
-        full_logits = collected_logits.new_zeros((1, letter_level_tokens.shape[1], self.fc.out_features))
-        full_logits[:, lmask, :] = collected_logits
-        return TokenClassifierOutput(loss=(loss / self.cycles if target is not None else None), logits=full_logits)
+        loss, logits = run_samplewise_chunked_unet(
+            token_hidden=token_logits,
+            token_content_mask=token_mask,
+            embedding_repeater=embedding_repeater,
+            letter_level_tokens=letter_level_tokens,
+            letter_level_attention_mask=letter_level_attention_mask,
+            letter_level_labels=letter_level_labels,
+            letter_level_labels_mask=letter_level_labels_mask,
+            pos_weight=pos_weight,
+            nucleotide_embedding=self.nucleotide_embedding,
+            unet=self.sub_model,
+            activation_fn=self.activation_fn,
+            classifier=self.fc,
+            cycles=self.cycles,
+            chunk_size=self.unet_chunk_size,
+            context="RMTRepeater",
+        )
+        return TokenClassifierOutput(loss=loss, logits=logits)

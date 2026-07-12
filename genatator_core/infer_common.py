@@ -36,6 +36,14 @@ def prepare_tokenizers(model_cfg: Dict[str, Any]):
 
 def prepare_model(cfg: Dict[str, Any], task: str, device: str):
     logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+    model_checkpoint = cfg.get("model", {}).get("checkpoint_path")
+    inference_checkpoint = cfg.get("inference", {}).get("checkpoint_path")
+    if model_checkpoint and inference_checkpoint:
+        raise RuntimeError(
+            "Set only inference.checkpoint_path for evaluation. Defining both "
+            "model.checkpoint_path and inference.checkpoint_path would load two finetuned "
+            "checkpoints into the same model."
+        )
     tokenizer, nucleotide_tokenizer = prepare_tokenizers(cfg["model"])
     cfg["_tokenizer"] = tokenizer
     model = build_model(cfg, task=task)
@@ -60,6 +68,47 @@ def undo_reverse_complement_logits(logits: np.ndarray, task: str) -> np.ndarray:
     if task == "transcript_type":
         return logits
     raise RuntimeError(task)
+
+
+def project_masked_letter_logits_to_nucleotides(
+    logits: np.ndarray,
+    mask: np.ndarray,
+    dna_length: int,
+) -> np.ndarray:
+    """Place retained letter logits on a full crop; uncovered positions stay NaN."""
+    logits = np.asarray(logits)
+    mask = np.asarray(mask, dtype=bool)
+    retained = logits[mask]
+    out = np.full((int(dna_length), logits.shape[-1]), np.nan, dtype=np.float32)
+    n = min(len(out), retained.shape[0])
+    out[:n] = retained[:n]
+    return out
+
+
+def project_bpe_token_logits_to_nucleotides(
+    logits: np.ndarray,
+    offset_mapping,
+    attention_mask: np.ndarray,
+    dna_length: int,
+) -> np.ndarray:
+    """Expand BPE-token logits to nucleotide coordinates without inventing zeros."""
+    logits = np.asarray(logits)
+    dna_length = int(dna_length)
+    tmp = np.zeros((dna_length, logits.shape[-1]), dtype=np.float32)
+    counts = np.zeros(dna_length, dtype=np.float32)
+    for token_i, ((start, end), attended) in enumerate(zip(offset_mapping, attention_mask)):
+        if not int(attended) or int(end) <= int(start):
+            continue
+        start = max(0, min(dna_length, int(start)))
+        end = max(0, min(dna_length, int(end)))
+        if end <= start:
+            continue
+        tmp[start:end] += logits[token_i]
+        counts[start:end] += 1.0
+    out = np.full((dna_length, logits.shape[-1]), np.nan, dtype=np.float32)
+    covered = counts > 0
+    out[covered] = tmp[covered] / counts[covered, None]
+    return out
 
 
 def _predict_once(cfg: Dict[str, Any], task: str, device: str, reverse_complement: bool) -> List[Dict[str, Any]]:
@@ -90,7 +139,18 @@ def _predict_once(cfg: Dict[str, Any], task: str, device: str, reverse_complemen
                 masks = batch.get("labels_mask")
                 masks = masks.detach().cpu().numpy().astype(bool) if masks is not None else None
             for i in range(logits.shape[0]):
-                row_logits = logits[i] if task == "transcript_type" else logits[i][masks[i] if masks is not None else np.ones(logits.shape[1], dtype=bool)]
+                if task == "transcript_type":
+                    row_logits = logits[i]
+                elif family in {"nucleotide", "bpe_unet", "rmt_unet", "amt_unet"}:
+                    row_logits = project_masked_letter_logits_to_nucleotides(
+                        logits[i],
+                        masks[i],
+                        len(dna[i]),
+                    )
+                else:
+                    row_logits = logits[i][
+                        masks[i] if masks is not None else np.ones(logits.shape[1], dtype=bool)
+                    ]
                 if reverse_complement:
                     row_logits = undo_reverse_complement_logits(row_logits, task)
                 rows.append({
@@ -119,6 +179,15 @@ def predict_dataset_logits(cfg: Dict[str, Any], task: str, device: str = "cuda")
         if np.asarray(a["logits"]).shape != np.asarray(b["logits"]).shape:
             raise RuntimeError(f"RC logits shape mismatch: {np.asarray(a['logits']).shape} vs {np.asarray(b['logits']).shape}")
         m = dict(a)
-        m["logits"] = 0.5 * (np.asarray(a["logits"]) + np.asarray(b["logits"]))
+        stacked = np.stack(
+            [np.asarray(a["logits"], dtype=np.float32), np.asarray(b["logits"], dtype=np.float32)],
+            axis=0,
+        )
+        finite = np.isfinite(stacked)
+        totals = np.where(finite, stacked, 0.0).sum(axis=0)
+        counts = finite.sum(axis=0)
+        averaged = np.full_like(totals, np.nan, dtype=np.float32)
+        np.divide(totals, counts, out=averaged, where=counts > 0)
+        m["logits"] = averaged
         merged.append(m)
     return merged
