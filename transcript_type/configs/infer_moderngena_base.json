@@ -12,16 +12,14 @@
     "path": "AIRI-Institute/genatator-gene-segmentation-dataset",
     "config_name": "val-human",
     "split": "validation",
-    "genomes": null,
+    "genomes": [
+      "GCF_009914755.1"
+    ],
     "chromosomes": [
-      "NC_060944.1",
-      "chr20",
-      "20"
+      "NC_060944.1"
     ],
     "crop_margin": 500,
-    "statuses": [
-      1
-    ],
+    "target_group": "primary",
     "loader": "direct_parquet",
     "parquet_batch_size": 64,
     "max_bpe_tokens": 4096,
@@ -29,11 +27,12 @@
   },
   "inference": {
     "device": "cuda",
-    "checkpoint_path": "runs/transcript_type_moderngena_base_plain/final_model",
-    "batch_size": 1,
+    "checkpoint_path": null,
+    "batch_size": 2,
     "use_reverse_complement": true,
     "threshold": 0.5,
-    "output_tsv": "runs/inference/transcript_type_predictions.tsv",
-    "metrics_json": "runs/inference/transcript_type_metrics.json"
+    "output_tsv": "transcript_type_predictions.tsv",
+    "true_gff": null,
+    "metrics_json": "transcript_type_metrics.json"
   }
 }

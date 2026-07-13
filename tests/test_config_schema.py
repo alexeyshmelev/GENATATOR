@@ -6,6 +6,8 @@ import unittest
 
 
 REPO = Path(__file__).resolve().parents[1]
+FIXED_GENOME = ["GCF_009914755.1"]
+FIXED_CHROMOSOME = ["NC_060944.1"]
 
 
 def _uses_unet(model: dict) -> bool:
@@ -14,84 +16,116 @@ def _uses_unet(model: dict) -> bool:
     )
 
 
-def _model_dataset_pairs(path: Path, cfg: dict):
-    task_group = path.relative_to(REPO).parts[0]
-    if "train_dataset" in cfg:
-        transcript_task = task_group in {"segmentation", "transcript_type"}
-        return [
-            (cfg["model"], cfg["train_dataset"], transcript_task),
-            (cfg["model"], cfg["eval_dataset"], transcript_task),
-        ]
-    if task_group == "finding":
-        return [
-            (cfg[stage]["model"], cfg[stage]["dataset"], False)
-            for stage in ("edge", "region")
-        ]
-    return [(cfg["model"], cfg["dataset"], True)]
-
-
-def test_all_shipped_configs_use_canonical_length_and_unet_fields() -> None:
-    paths = sorted(
-        path
-        for task in ("finding", "segmentation", "transcript_type")
-        for path in (REPO / task / "configs").glob("*.json")
-    )
-    assert paths
-    for path in paths:
+def _training_paths(task: str):
+    for path in sorted((REPO / task / "configs").glob("*.json")):
         cfg = json.loads(path.read_text(encoding="utf-8"))
-        if "training" in cfg:
-            assert "custom_prefix" in cfg["training"], path
-        for model, dataset, transcript_task in _model_dataset_pairs(path, cfg):
+        if isinstance(cfg.get("training"), dict):
+            yield path, cfg
+
+
+def test_all_shipped_training_configs_use_requested_contracts() -> None:
+    for task in ("finding", "segmentation", "transcript_type"):
+        for path, cfg in _training_paths(task):
+            model = cfg["model"]
+            assert cfg.get("true_gff") is None, path
+            assert cfg["training"].get("custom_prefix") is not None, path
+            assert "cycles" not in path.name, path
             if model["family"] == "caduceus":
-                assert "max_nucleotides" in dataset, path
-                assert "max_bpe_tokens" not in dataset, path
-                assert "average_bpe_token_length" not in dataset, path
-            else:
-                assert "max_nucleotides" not in dataset, path
-                assert dataset["max_bpe_tokens"] > 0, path
-                assert dataset["average_bpe_token_length"] > 0, path
-            resolved_nt = (
-                int(dataset["max_nucleotides"])
-                if model["family"] == "caduceus"
-                else int(dataset["max_bpe_tokens"] * dataset["average_bpe_token_length"])
-            )
-            assert 30000 <= resolved_nt <= 40000, path
-            if transcript_task:
-                assert "overlap" not in dataset, path
-                assert "random_crop" not in dataset, path
-            if _uses_unet(model):
-                assert model["unet_chunk_size"] == 8192, path
-                assert "unet_sub_model_input_size" not in model.get("rmt", {}), path
-            assert "nucleotide_tokenizer_path" not in model, path
+                assert model["bidirectional_weight_tie"] is False, path
             if model["family"] == "rmt":
-                assert "input_size" not in model["rmt"], path
+                assert model["cycles"] == 1, path
                 assert model["rmt"]["segment_size"] == (512 if model["backbone_kind"] == "gena" else 1024), path
                 assert model["rmt"]["max_n_segments"] > 0, path
-            if model["family"] == "amt":
-                assert model["amt"]["segment_size"] == (512 if model["backbone_kind"] == "gena" else 1024), path
+            if model["family"] == "unet":
+                assert model["unet_cycles"] == 1, path
+            if model["family"] == "amt" and model.get("use_unet"):
+                assert model["unet_cycles"] == 1, path
+            if _uses_unet(model):
+                assert model["unet_chunk_size"] == 8192, path
 
+            for dataset_name in ("train_dataset", "eval_dataset"):
+                dataset = cfg[dataset_name]
+                if model["family"] == "caduceus":
+                    assert dataset["max_nucleotides"] == 32768, path
+                    assert "max_bpe_tokens" not in dataset, path
+                else:
+                    assert dataset["max_bpe_tokens"] > 0, path
+                    assert dataset["average_bpe_token_length"] > 0, path
+                    if model["backbone_kind"] == "gena" and model["family"] in {"plain", "unet"}:
+                        assert dataset["max_bpe_tokens"] <= 512, path
+                    else:
+                        resolved_nt = int(dataset["max_bpe_tokens"] * dataset["average_bpe_token_length"])
+                        assert 30000 <= resolved_nt <= 40000, path
+                if task != "finding":
+                    assert "overlap" not in dataset, path
 
-def test_training_status_filter_and_full_segmentation_inference_are_distinct() -> None:
-    for task in ("segmentation", "transcript_type"):
-        for path in (REPO / task / "configs").glob("*.json"):
-            cfg = json.loads(path.read_text(encoding="utf-8"))
-            if "training" in cfg:
+            if task == "segmentation":
+                expected_random = model["family"] == "caduceus"
+                assert cfg["train_dataset"]["random_crop"] is expected_random, path
+                assert cfg["eval_dataset"]["random_crop"] is expected_random, path
                 assert cfg["train_dataset"]["statuses"] == [1], path
                 assert cfg["eval_dataset"]["statuses"] == [1], path
-    segmentation_infer = json.loads(
-        (REPO / "segmentation/configs/infer_caduceus_ps.json").read_text(encoding="utf-8")
-    )
-    assert "statuses" not in segmentation_infer["dataset"]
-    assert segmentation_infer["inference"]["coordinate_mode"] == "transcript"
-    assert isinstance(segmentation_infer["inference"]["use_cds_heuristic"], bool)
+
+
+def test_config_matrix_is_complete() -> None:
+    backbones = {"gena_base", "gena_large", "moderngena_base", "moderngena_large"}
+    segmentation_expected = {
+        f"{backbone}_{variant}.json"
+        for backbone in backbones
+        for variant in ("unet", "rmt_unet", "amt_unet")
+    }
+    segmentation_actual = {p.name for p, _ in _training_paths("segmentation")}
+    assert segmentation_expected <= segmentation_actual
+
+    for stage in ("edge", "region"):
+        expected = {
+            f"{stage}_{backbone}_{variant}.json"
+            for backbone in backbones
+            for variant in ("plain", "unet", "rmt_unet", "amt_plain", "amt_unet")
+        }
+        actual = {p.name for p, _ in _training_paths("finding") if p.name.startswith(f"{stage}_")}
+        assert expected <= actual
+
+    transcript_expected = {f"{backbone}_plain.json" for backbone in backbones}
+    transcript_actual = {p.name for p, _ in _training_paths("transcript_type")}
+    assert transcript_expected <= transcript_actual
+
+
+def test_standalone_evaluation_templates_use_required_subsets() -> None:
+    segmentation = json.loads((REPO / "segmentation/configs/infer_caduceus_ps.json").read_text())
+    assert segmentation["dataset"]["config_name"] == "val-human"
+    assert segmentation["dataset"]["split"] == "validation"
+    assert segmentation["dataset"]["genomes"] == FIXED_GENOME
+    assert segmentation["dataset"]["chromosomes"] == FIXED_CHROMOSOME
+    assert "statuses" not in segmentation["dataset"]
+    assert segmentation["dataset"]["full_transcript_chunks"] is True
+    assert segmentation["inference"]["use_reverse_complement"] is True
+
+    transcript = json.loads((REPO / "transcript_type/configs/infer_moderngena_base.json").read_text())
+    assert transcript["dataset"]["config_name"] == "val-human"
+    assert transcript["dataset"]["split"] == "validation"
+    assert transcript["dataset"]["genomes"] == FIXED_GENOME
+    assert transcript["dataset"]["chromosomes"] == FIXED_CHROMOSOME
+    assert "statuses" not in transcript["dataset"]
+    assert transcript["inference"]["use_reverse_complement"] is True
+
+    finding = json.loads((REPO / "finding/configs/infer_moderngena_base_plain.json").read_text())
+    for stage in ("edge", "region"):
+        assert finding[stage]["dataset"]["split"] == "test"
+        assert finding[stage]["dataset"]["genomes"] == FIXED_GENOME
+        assert finding[stage]["dataset"]["chromosomes"] == FIXED_CHROMOSOME
+    assert finding["inference"]["use_reverse_complement"] is True
 
 
 class ShippedConfigSchemaTests(unittest.TestCase):
-    def test_canonical_length_and_unet_fields(self) -> None:
-        test_all_shipped_configs_use_canonical_length_and_unet_fields()
+    def test_requested_contracts(self) -> None:
+        test_all_shipped_training_configs_use_requested_contracts()
 
-    def test_training_and_standalone_status_policies(self) -> None:
-        test_training_status_filter_and_full_segmentation_inference_are_distinct()
+    def test_complete_matrix(self) -> None:
+        test_config_matrix_is_complete()
+
+    def test_evaluation_templates(self) -> None:
+        test_standalone_evaluation_templates_use_required_subsets()
 
 
 if __name__ == "__main__":

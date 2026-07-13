@@ -36,6 +36,8 @@ class RunManagementTests(unittest.TestCase):
                 "statuses": [1],
                 "random_crop": False,
             },
+            "true_gff": "/tmp/reference.gff",
+            "evaluation": {},
             "training": {
                 "output_dir": str(base),
                 "custom_prefix": "experiment",
@@ -65,8 +67,13 @@ class RunManagementTests(unittest.TestCase):
             self.assertNotIn("statuses", evaluation["dataset"])
             self.assertNotIn("random_crop", evaluation["dataset"])
             self.assertNotIn("overlap", evaluation["dataset"])
+            self.assertTrue(evaluation["dataset"]["full_transcript_chunks"])
+            self.assertEqual(evaluation["dataset"]["genomes"], ["GCF_009914755.1"])
+            self.assertEqual(evaluation["dataset"]["chromosomes"], ["NC_060944.1"])
             self.assertEqual(cfg["eval_dataset"]["statuses"], [1])
+            self.assertTrue(evaluation["inference"]["use_reverse_complement"])
             self.assertTrue(evaluation["inference"]["use_cds_heuristic"])
+            self.assertEqual(evaluation["inference"]["true_gff"], "/tmp/reference.gff")
 
             manager = EvaluationConfigManager(cfg, task="segmentation", run_dir=run_dir)
             manager.write_initial()
@@ -77,6 +84,19 @@ class RunManagementTests(unittest.TestCase):
             self.assertEqual(Path(written["inference"]["checkpoint_path"]), checkpoint.resolve())
             self.assertEqual(written["_generated"]["checkpoint_selection"], "best")
             self.assertTrue((checkpoint / "evaluation_config.json").is_file())
+
+    def test_finding_evaluation_uses_test_split_and_fixed_chromosome(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "run"
+            run_dir.mkdir()
+            cfg = self._config(Path(temporary) / "base")
+            cfg["eval_dataset"].pop("config_name", None)
+            evaluation = build_evaluation_config(cfg, task="finding_edge", run_dir=run_dir)
+            self.assertEqual(evaluation["dataset"]["split"], "test")
+            self.assertEqual(evaluation["dataset"]["genomes"], ["GCF_009914755.1"])
+            self.assertEqual(evaluation["dataset"]["chromosomes"], ["NC_060944.1"])
+            self.assertTrue(evaluation["inference"]["use_reverse_complement"])
+            self.assertEqual(evaluation["inference"]["true_gff"], "/tmp/reference.gff")
 
     def test_external_resumed_best_is_referenced_but_never_modified(self):
         with tempfile.TemporaryDirectory() as temporary:

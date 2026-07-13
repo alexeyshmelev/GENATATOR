@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -10,6 +11,7 @@ try:
         nucleotide_ids,
         resolve_dataset_lengths,
         reverse_complement_task_labels,
+        _maybe_trim_streaming_row,
     )
 except ImportError:
     GenatatorDataset = None
@@ -62,14 +64,42 @@ class DataSemanticsTests(unittest.TestCase):
                 "transcript_type",
             )
 
-    def test_transcript_crop_is_single_and_deterministic(self) -> None:
+    def test_transcript_crop_is_configurable(self) -> None:
         dataset = object.__new__(GenatatorDataset)
         dataset.max_nucleotides = 1000
         dataset.crop_margin = 500
+
+        dataset.random_crop = False
         self.assertEqual(dataset._crop_transcript(800), (0, 800))
-        self.assertEqual(dataset._crop_transcript(1200), (200, 1200))
-        self.assertEqual(dataset._crop_transcript(3000), (500, 1500))
-        self.assertEqual(dataset._crop_transcript(3000), (500, 1500))
+        self.assertEqual(dataset._crop_transcript(1200), (0, 1000))
+        self.assertEqual(dataset._crop_transcript(3000), (0, 1000))
+
+        dataset.random_crop = True
+        self.assertEqual(dataset._crop_transcript(800), (0, 800))
+        import torch
+        with patch("genatator_core.data.torch.randint", return_value=torch.tensor([2200])):
+            self.assertEqual(dataset._crop_transcript(3000), (2200, 3000))
+        with patch("genatator_core.data.torch.randint", return_value=torch.tensor([600])):
+            self.assertEqual(dataset._crop_transcript(1200), (600, 1200))
+
+
+    def test_streaming_trim_keeps_full_source_for_random_or_full_evaluation(self) -> None:
+        row = {
+            "dna_sequence": "A" * 2000,
+            "labels": np.zeros((2000, 5), dtype=np.float32),
+            "metadata": {"start": 100, "end": 2100, "chrom": "chr"},
+        }
+        base = {
+            "streaming_trim_rows": True,
+            "_resolved_max_nucleotides": 1000,
+            "_task": "segmentation",
+        }
+        beginning = _maybe_trim_streaming_row(row, {**base, "random_crop": False})
+        self.assertEqual(len(beginning["dna_sequence"]), 1000)
+        random_source = _maybe_trim_streaming_row(row, {**base, "random_crop": True})
+        self.assertEqual(len(random_source["dna_sequence"]), 2000)
+        full_eval = _maybe_trim_streaming_row(row, {**base, "full_transcript_chunks": True})
+        self.assertEqual(len(full_eval["dna_sequence"]), 2000)
 
     def test_reverse_complement_remaps_orientation_dependent_channels(self) -> None:
         segmentation = np.arange(20).reshape(4, 5)
@@ -123,6 +153,7 @@ class DataSemanticsTests(unittest.TestCase):
         dataset.model_family = "nucleotide"
         dataset.max_nucleotides = 4
         dataset.tokenizer = FakeTokenizer()
+        dataset.for_inference = False
         item = dataset._tokenize_token_task(
             "ACGT",
             np.arange(4, dtype=np.float32).reshape(4, 1),

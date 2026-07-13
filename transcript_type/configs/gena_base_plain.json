@@ -22,7 +22,7 @@
     ],
     "loader": "direct_parquet",
     "parquet_batch_size": 64,
-    "max_bpe_tokens": 4096,
+    "max_bpe_tokens": 512,
     "average_bpe_token_length": 9.0
   },
   "eval_dataset": {
@@ -38,8 +38,12 @@
     ],
     "loader": "direct_parquet",
     "parquet_batch_size": 64,
-    "max_bpe_tokens": 4096,
+    "max_bpe_tokens": 512,
     "average_bpe_token_length": 9.0
+  },
+  "true_gff": null,
+  "evaluation": {
+    "use_reverse_complement": true
   },
   "training": {
     "output_dir": "runs/transcript_type_gena_base_plain",

@@ -13,27 +13,11 @@ except ImportError:
 
 
 @unittest.skipIf(torch is None, "torch/transformers are not installed")
-class DirectGenaChunkingTests(unittest.TestCase):
-    def test_long_direct_gena_inputs_are_chunked_and_reassembled(self) -> None:
+class DirectGenaLengthTests(unittest.TestCase):
+    def test_long_direct_gena_input_is_rejected_without_chunking(self) -> None:
         class FakeEncoder(nn.Module):
-            def forward(
-                self,
-                input_ids=None,
-                attention_mask=None,
-                token_type_ids=None,
-                inputs_embeds=None,
-                output_hidden_states=False,
-                return_dict=True,
-            ):
-                if inputs_embeds is not None:
-                    hidden = inputs_embeds
-                else:
-                    hidden = input_ids.float().unsqueeze(-1).repeat(1, 1, 2)
-                return types.SimpleNamespace(
-                    last_hidden_state=hidden,
-                    hidden_states=None,
-                    attentions=None,
-                )
+            def forward(self, **kwargs):
+                raise AssertionError("Encoder must not run for an over-limit direct GENA input")
 
         backbone = HiddenStateBackbone.__new__(HiddenStateBackbone)
         nn.Module.__init__(backbone)
@@ -43,23 +27,13 @@ class DirectGenaChunkingTests(unittest.TestCase):
         backbone.encoder = FakeEncoder()
         backbone.uses_owner = False
 
-        input_ids = torch.tensor(
-            [[1, 2, 3, 4, 5, 6], [7, 8, 0, 0, 0, 0]],
-            dtype=torch.long,
-        )
-        attention = torch.tensor(
-            [[1, 1, 1, 1, 1, 1], [1, 1, 0, 0, 0, 0]],
-            dtype=torch.long,
-        )
-        output = backbone(
-            input_ids=input_ids,
-            attention_mask=attention,
-            token_type_ids=torch.zeros_like(input_ids),
-        )
-        self.assertEqual(tuple(output.logits.shape), (2, 6, 2))
-        self.assertTrue(torch.equal(output.logits[0, :, 0], input_ids[0].float()))
-        self.assertTrue(torch.equal(output.logits[1, :2, 0], input_ids[1, :2].float()))
-        self.assertTrue(bool((output.logits[1, 3:] == 0).all()))
+        input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+        with self.assertRaisesRegex(RuntimeError, "does not support outer-input elongation"):
+            backbone(
+                input_ids=input_ids,
+                attention_mask=torch.ones_like(input_ids),
+                token_type_ids=torch.zeros_like(input_ids),
+            )
 
 
 if __name__ == "__main__":
