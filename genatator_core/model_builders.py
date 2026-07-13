@@ -80,8 +80,12 @@ def build_model(cfg: Dict[str, Any], task: str):
         if backbone_kind != "caduceus":
             raise RuntimeError("family='caduceus' requires backbone_kind='caduceus'")
         config = AutoConfig.from_pretrained(backbone_path, trust_remote_code=trust_remote_code)
-        config.bidirectional_weight_tie = bool(model_cfg.get("bidirectional_weight_tie", False))
-        logger.info("[caduceus] loading AutoModel path=%s bidirectional_weight_tie=%s", backbone_path, config.bidirectional_weight_tie)
+        # GENATATOR intentionally trains Caduceus with untied bidirectional
+        # projections. This is forced regardless of either the downloaded HF
+        # config or a user-supplied JSON value.
+        config.bidirectional_weight_tie = False
+        model_cfg["bidirectional_weight_tie"] = False
+        logger.info("[caduceus] loading AutoModel path=%s bidirectional_weight_tie=false (forced)", backbone_path)
         hidden_size = int(model_cfg.get("hidden_size") or infer_caduceus_hidden_size(config, backbone_path))
         if "hidden_size" in model_cfg:
             logger.info("[caduceus.shape] using explicit model.hidden_size=%d from config", hidden_size)
@@ -135,7 +139,7 @@ def build_model(cfg: Dict[str, Any], task: str):
             "tokenizer": cfg["_tokenizer"],
             "num_labels": num_labels,
             "nucleotide_vocab_size": _nucleotide_vocab_size(model_cfg),
-            "cycles": int(model_cfg.get("cycles", 3)),
+            "cycles": int(model_cfg.get("cycles", 1)),
             "unet_channels": model_cfg.get("unet_channels"),
             "unet_chunk_size": int(unet_chunk_size),
         })

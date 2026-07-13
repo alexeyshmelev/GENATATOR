@@ -28,6 +28,10 @@
     "overlap": 0.5,
     "target_group": "primary"
   },
+  "true_gff": null,
+  "evaluation": {
+    "use_reverse_complement": true
+  },
   "training": {
     "output_dir": "runs/finding_region_caduceus_ph",
     "custom_prefix": "",

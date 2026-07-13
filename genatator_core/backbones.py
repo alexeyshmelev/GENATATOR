@@ -192,78 +192,19 @@ class HiddenStateBackbone(nn.Module):
                 raise RuntimeError(f"Backbone emitted hidden width {hidden.shape[-1]}, expected {self.hidden_size}")
         return hidden, hidden_states
 
-    def _forward_gena_in_chunks(
-        self,
-        *,
-        input_ids,
-        attention_mask,
-        token_type_ids,
-        inputs_embeds,
-        chunk_size: int,
-    ) -> torch.Tensor:
-        """Run direct GENA on long outer inputs using independent backbone chunks."""
-
-        sequence_length = int(input_ids.shape[1] if input_ids is not None else inputs_embeds.shape[1])
-        batch_size = int(input_ids.shape[0] if input_ids is not None else inputs_embeds.shape[0])
-        logger.info(
-            "[backbone.forward] direct GENA outer sequence=%d exceeds position limit=%d; processing in independent BPE chunks",
-            sequence_length,
-            chunk_size,
-        )
-        chunks = []
-        for start in range(0, sequence_length, int(chunk_size)):
-            end = min(sequence_length, start + int(chunk_size))
-            chunk_attention = attention_mask[:, start:end] if attention_mask is not None else None
-            if chunk_attention is None:
-                active_indices = torch.arange(batch_size, device=(input_ids if input_ids is not None else inputs_embeds).device)
-            else:
-                active_indices = torch.nonzero(chunk_attention.bool().any(dim=1), as_tuple=False).flatten()
-
-            if active_indices.numel() == 0:
-                reference = inputs_embeds if inputs_embeds is not None else self.get_input_embeddings().weight
-                chunks.append(reference.new_zeros((batch_size, end - start, self.hidden_size)))
-                continue
-
-            chunk_input_ids = None
-            if input_ids is not None:
-                chunk_input_ids = input_ids.index_select(0, active_indices)[:, start:end]
-            chunk_inputs_embeds = None
-            if inputs_embeds is not None:
-                chunk_inputs_embeds = inputs_embeds.index_select(0, active_indices)[:, start:end, :]
-            active_attention = chunk_attention.index_select(0, active_indices) if chunk_attention is not None else None
-            active_token_types = None
-            if token_type_ids is not None:
-                active_token_types = token_type_ids.index_select(0, active_indices)[:, start:end]
-
-            out = self._encoder()(
-                input_ids=chunk_input_ids,
-                attention_mask=active_attention,
-                token_type_ids=active_token_types,
-                inputs_embeds=chunk_inputs_embeds,
-                output_hidden_states=False,
-                return_dict=True,
-            )
-            active_hidden, _ = self._extract_hidden(out)
-            full_hidden = active_hidden.new_zeros((batch_size, end - start, self.hidden_size))
-            full_hidden.index_copy_(0, active_indices, active_hidden)
-            chunks.append(full_hidden)
-        return torch.cat(chunks, dim=1)
-
     def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, inputs_embeds=None, output_hidden_states=True, return_dict=True, **kwargs):
         if self.backbone_kind == "gena":
             sequence_length = int(
                 input_ids.shape[1] if input_ids is not None else inputs_embeds.shape[1]
             )
-            position_limit = getattr(self.config, "max_position_embeddings", None)
-            if position_limit is not None and sequence_length > int(position_limit):
-                hidden = self._forward_gena_in_chunks(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    token_type_ids=token_type_ids,
-                    inputs_embeds=inputs_embeds,
-                    chunk_size=int(position_limit),
+            position_limit = int(getattr(self.config, "max_position_embeddings", 512))
+            if sequence_length > position_limit:
+                raise RuntimeError(
+                    "Direct/plain GENA does not support outer-input elongation: "
+                    f"received {sequence_length} BPE positions, maximum is {position_limit}. "
+                    "Set max_bpe_tokens to at most 512 or use RMT/AMT. Independent "
+                    "backbone chunking and hidden-state concatenation are intentionally disabled."
                 )
-                return TokenClassifierOutput(loss=None, logits=hidden, hidden_states=None, attentions=None)
         common = dict(
             input_ids=input_ids,
             attention_mask=attention_mask,

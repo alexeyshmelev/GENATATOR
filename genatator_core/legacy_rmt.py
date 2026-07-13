@@ -43,7 +43,7 @@ class RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater(nn.Module
     - BPE hidden states are mapped to nucleotide positions with `embedding_repeater`;
     - nucleotide embeddings are concatenated with repeated BPE hidden states;
     - the same 1D UNET head refines nucleotide-level logits;
-    - cycles=3 is supported and defaults to 3.
+    - cycles defaults to 1.
 
     Deliberate changes, all shape-related:
     - hidden size is detected automatically from the loaded backbone config and embedding table;
@@ -57,7 +57,7 @@ class RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater(nn.Module
         super().__init__()
         self.model = base_model
         self.num_labels = int(rmt_kwargs.pop("num_labels"))
-        self.cycles = int(rmt_kwargs.pop("cycles", 3))
+        self.cycles = int(rmt_kwargs.pop("cycles", 1))
         configured_chunk = rmt_kwargs.pop("unet_chunk_size", None)
         legacy_chunk = rmt_kwargs.pop("unet_sub_model_input_size", None)
         if configured_chunk is not None and legacy_chunk is not None and int(configured_chunk) != int(legacy_chunk):

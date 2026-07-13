@@ -111,6 +111,75 @@ def project_bpe_token_logits_to_nucleotides(
     return out
 
 
+
+
+def _transcript_row_key(row: Dict[str, Any]) -> tuple:
+    meta = row["metadata"]
+    return (
+        meta.transcript_id,
+        meta.gene_id,
+        meta.genome,
+        meta.chrom,
+        int(meta.start),
+        int(meta.end),
+        meta.strand,
+    )
+
+
+def aggregate_full_segmentation_chunks(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Gather non-overlapping segmentation chunks into one full transcript row."""
+    grouped: Dict[tuple, List[Dict[str, Any]]] = {}
+    order: List[tuple] = []
+    for row in rows:
+        key = _transcript_row_key(row)
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(row)
+
+    gathered: List[Dict[str, Any]] = []
+    for key in order:
+        parts = sorted(grouped[key], key=lambda item: int(item["local_start"]))
+        full_length = max(int(part["local_start"]) + int(np.asarray(part["logits"]).shape[0]) for part in parts)
+        channels = int(np.asarray(parts[0]["logits"]).shape[-1])
+        full_logits = np.full((full_length, channels), np.nan, dtype=np.float32)
+        covered = np.zeros(full_length, dtype=bool)
+        sequence = [""] * full_length
+        for part in parts:
+            start = int(part["local_start"])
+            logits = np.asarray(part["logits"], dtype=np.float32)
+            end = start + int(logits.shape[0])
+            if np.any(covered[start:end]):
+                raise RuntimeError(
+                    f"Full-transcript segmentation chunks overlap for transcript={key[0]!r} at [{start}, {end})"
+                )
+            full_logits[start:end] = logits
+            covered[start:end] = True
+            dna = str(part["dna_sequence"])[: logits.shape[0]]
+            if bool(part.get("reverse_complement", False)):
+                from .utils import reverse_complement
+                dna = reverse_complement(dna)
+            sequence[start:end] = list(dna)
+        if not bool(covered.all()):
+            missing = int((~covered).sum())
+            raise RuntimeError(
+                f"Full-transcript segmentation gathering left {missing} nucleotide positions uncovered "
+                f"for transcript={key[0]!r}"
+            )
+        if any(base == "" for base in sequence):
+            raise RuntimeError(f"Full-transcript DNA gathering failed for transcript={key[0]!r}")
+        first = parts[0]
+        gathered.append({
+            "metadata": first["metadata"],
+            "dna_sequence": "".join(sequence),
+            "local_start": 0,
+            "offset_mapping": [],
+            "model_family": first["model_family"],
+            "reverse_complement": bool(first.get("reverse_complement", False)),
+            "logits": full_logits,
+        })
+    return gathered
+
 def _predict_once(cfg: Dict[str, Any], task: str, device: str, reverse_complement: bool) -> List[Dict[str, Any]]:
     model, tokenizer, nucleotide_tokenizer = prepare_model(cfg, task, device)
     data_cfg = dict(cfg["dataset"])
@@ -159,8 +228,11 @@ def _predict_once(cfg: Dict[str, Any], task: str, device: str, reverse_complemen
                     "local_start": int(local_start[i]),
                     "offset_mapping": offset_mapping[i],
                     "model_family": family,
+                    "reverse_complement": bool(reverse_complement),
                     "logits": row_logits,
                 })
+    if task == "segmentation" and bool(data_cfg.get("full_transcript_chunks", False)):
+        return aggregate_full_segmentation_chunks(rows)
     return rows
 
 

@@ -23,6 +23,7 @@ from .metrics_training import (
     _safe_binary_average_precision,
     metric_for_task,
     metric_names_for_task,
+    segmentation_interval_predictions,
     sigmoid,
 )
 from .intervals import f1_from_counts, interval_counts
@@ -156,15 +157,15 @@ class GenatatorTrainer(Trainer):
             logits_np = logits.detach().float().cpu().numpy()
             labels_np = labels_t.detach().float().cpu().numpy()
             mask_np = mask_t.detach().cpu().numpy().astype(bool)
-            probs = sigmoid(logits_np)
             for class_name, channel_index in SEGMENTATION_CLASS_INDEX.items():
                 tp = fp = fn = 0
+                decoded = segmentation_interval_predictions(logits_np, class_name)
                 for sample_index in range(labels_np.shape[0]):
                     valid = mask_np[sample_index]
                     if not np.any(valid):
                         continue
                     references = (labels_np[sample_index, valid, channel_index] >= 0.5).astype(np.int8)
-                    predictions = (probs[sample_index, valid, channel_index] >= 0.5).astype(np.int8)
+                    predictions = decoded[sample_index, valid]
                     sample_tp, sample_fp, sample_fn = interval_counts(references, predictions)
                     tp += sample_tp
                     fp += sample_fp
@@ -388,6 +389,17 @@ def validate_rules(cfg: Dict[str, Any], task: str) -> None:
     eval_bs = int(tr.get("per_device_eval_batch_size", 1))
     if train_bs <= 0 or eval_bs <= 0:
         raise RuntimeError("per-device train/eval batch sizes must be positive")
+    if family == "caduceus":
+        # This project always trains Caduceus with untied bidirectional weights.
+        model_cfg["bidirectional_weight_tie"] = False
+    if backbone_kind == "gena" and family in {"plain", "unet"}:
+        for dataset_name in ("train_dataset", "eval_dataset"):
+            max_bpe_tokens = int(cfg[dataset_name].get("max_bpe_tokens", 0))
+            if max_bpe_tokens > 512:
+                raise RuntimeError(
+                    f"Direct/plain GENA requires {dataset_name}.max_bpe_tokens <= 512; "
+                    f"got {max_bpe_tokens}. Use RMT/AMT for longer BPE inputs."
+                )
     if task == "transcript_type" and family not in {"plain", "caduceus"}:
         raise RuntimeError(
             "Transcript-type classification is implemented only for family='plain' and family='caduceus'; "

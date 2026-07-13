@@ -13,27 +13,29 @@
     "path": "AIRI-Institute/genatator-gene-segmentation-dataset",
     "config_name": "val-human",
     "split": "validation",
-    "genomes": null,
-    "chromosomes": [
-      "NC_060944.1",
-      "chr20",
-      "20"
+    "genomes": [
+      "GCF_009914755.1"
     ],
-    "crop_margin": 500,
+    "chromosomes": [
+      "NC_060944.1"
+    ],
     "max_nucleotides": 32768,
+    "crop_margin": 500,
+    "target_group": "primary",
     "loader": "direct_parquet",
-    "parquet_batch_size": 64
+    "parquet_batch_size": 64,
+    "full_transcript_chunks": true
   },
   "inference": {
     "device": "cuda",
-    "checkpoint_path": "runs/segmentation_caduceus_ps_middle_loss/final_model",
+    "checkpoint_path": null,
     "batch_size": 1,
     "use_reverse_complement": true,
     "use_cds_heuristic": true,
-    "threshold": 0.5,
     "coordinate_mode": "transcript",
-    "output_gff": "runs/inference/segmentation_predictions.gff",
+    "empty_segment_policy": "error",
+    "output_gff": "segmentation_predictions.gff",
     "true_gff": null,
-    "metrics_json": "runs/inference/segmentation_metrics.json"
+    "metrics_json": "segmentation_metrics.json"
   }
 }

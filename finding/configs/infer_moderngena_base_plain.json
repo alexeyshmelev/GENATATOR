@@ -12,11 +12,11 @@
     "dataset": {
       "path": "AIRI-Institute/genatator-gene-finding-dataset",
       "split": "test",
-      "genomes": null,
+      "genomes": [
+        "GCF_009914755.1"
+      ],
       "chromosomes": [
-        "NC_060944.1",
-        "chr20",
-        "20"
+        "NC_060944.1"
       ],
       "overlap": 0.5,
       "target_group": "primary",
@@ -24,8 +24,8 @@
       "average_bpe_token_length": 9.0
     },
     "inference": {
-      "checkpoint_path": "runs/finding_edge_moderngena_base_plain/final_model",
-      "batch_size": 1
+      "checkpoint_path": null,
+      "batch_size": 2
     }
   },
   "region": {
@@ -41,11 +41,11 @@
     "dataset": {
       "path": "AIRI-Institute/genatator-gene-finding-dataset",
       "split": "test",
-      "genomes": null,
+      "genomes": [
+        "GCF_009914755.1"
+      ],
       "chromosomes": [
-        "NC_060944.1",
-        "chr20",
-        "20"
+        "NC_060944.1"
       ],
       "overlap": 0.5,
       "target_group": "primary",
@@ -53,34 +53,27 @@
       "average_bpe_token_length": 9.0
     },
     "inference": {
-      "checkpoint_path": "runs/finding_region_moderngena_base_plain/final_model",
-      "batch_size": 1
+      "checkpoint_path": null,
+      "batch_size": 2
     }
   },
   "postprocess": {
-    "lp_frac": 0.05,
-    "pk_prom": 0.1,
-    "pk_dist": 50,
-    "pk_height": null,
+    "low_pass_fraction": 0.05,
+    "peak_prominence": 0.15,
+    "peak_distance": 50,
+    "peak_height": null,
     "interval_window_size": 2000000,
     "max_pairs_per_seed": 10,
     "prob_threshold": 0.5,
     "zero_fraction_drop_threshold": 0.01,
-    "pairing_progress_every": null
+    "pairing_progress_every": 1000
   },
   "inference": {
     "device": "cuda",
     "use_reverse_complement": true,
-    "output_gff": "runs/inference/finding_predictions.gff",
+    "output_gff": "finding_predictions.gff",
     "true_gff": null,
-    "metrics_json": "runs/inference/finding_metrics.json",
-    "k_values": [
-      0,
-      50,
-      100,
-      250,
-      500
-    ],
-    "use_strand": true
+    "metrics_json": "finding_metrics.json",
+    "empty_gff_policy": "error"
   }
 }

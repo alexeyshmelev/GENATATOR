@@ -90,9 +90,11 @@ The supplied task/model combinations are:
 
 | Task | Supplied model variants |
 | --- | --- |
-| Gene-finding edge and region | Caduceus PH/PS; GENA base/large plain and U-Net; GENA large RMT+U-Net; ModernGENA base plain, U-Net, RMT+U-Net, AMT plain, and AMT+U-Net; ModernGENA large plain and U-Net |
-| Segmentation | Caduceus PH/PS; GENA base/large U-Net; GENA large RMT+U-Net; ModernGENA base U-Net, RMT+U-Net, and AMT+U-Net; ModernGENA large U-Net |
-| Transcript type | Caduceus PH/PS; GENA base/large plain; ModernGENA base/large plain |
+| Gene-finding edge and region | Caduceus PH/PS. For each GENA base, GENA large, ModernGENA base, and ModernGENA large backbone: plain, U-Net, RMT+U-Net, AMT plain, and AMT+U-Net. Edge and region have separate configs for every variant. |
+| Segmentation | Caduceus PH/PS. For each GENA base, GENA large, ModernGENA base, and ModernGENA large backbone: U-Net, RMT+U-Net, and AMT+U-Net. Plain BPE heads are excluded because segmentation requires nucleotide-resolution outputs. |
+| Transcript type | Caduceus PH/PS; GENA base/large plain; ModernGENA base/large plain. Memory and U-Net variants are excluded because this task has one transcript-level output. |
+
+All U-Net and RMT cycle counts default to `1`, and every supplied config sets them to `1`. Cycle counts are not encoded in config filenames or run names.
 
 Use the matching JSON under the task's `configs/` directory. The generated evaluation config copies the complete model block, so evaluation uses the same backbone, tokenizer, memory wrapper, U-Net settings, and head shape as training.
 
@@ -106,6 +108,7 @@ Every train config has the same top-level structure:
   "model": {},
   "train_dataset": {},
   "eval_dataset": {},
+  "true_gff": null,
   "training": {}
 }
 ```
@@ -152,7 +155,7 @@ For RMT:
 ```json
 {
   "family": "rmt",
-  "cycles": 3,
+  "cycles": 1,
   "unet_chunk_size": 8192,
   "rmt": {
     "segment_size": 512,
@@ -214,6 +217,8 @@ Caduceus is nucleotide-tokenized, so its dataset length is configured directly i
 
 Caduceus sequences are tokenized by the downloaded Hugging Face tokenizer with
 its normal special tokens; labels are applied only to nucleotide-token positions.
+`bidirectional_weight_tie` is forced to `false` by the model builder on every
+Caduceus load, regardless of the checkpoint or JSON value.
 
 GENA and ModernGENA are BPE-tokenized. Their configs must not define a fixed nucleotide context as the primary length. Instead they define both the maximum BPE-token count and the tokenizer's average nucleotide span per BPE token:
 
@@ -228,12 +233,11 @@ calculated in nucleotide coordinates from that derived length. Tokenization may
 produce fewer tokens, in which case the model input is padded, or more tokens,
 in which case it is truncated to `max_bpe_tokens`.
 
-Direct GENA plain/U-Net models use absolute position embeddings and the released
-backbones support at most 512 BPE positions per backbone call. When the outer
-input is longer, the adapter processes it in independent 512-token backbone
-chunks and concatenates their hidden states. RMT and AMT instead use their own
-recurrent memory segmentation. ModernGENA uses 1024-token memory segments by
-default for RMT/AMT.
+Direct GENA plain/U-Net models use absolute position embeddings and are limited
+to at most `512` BPE positions. Inputs or configs above that limit raise an error;
+there is no independent-chunk elongation or concatenation. Longer GENA contexts
+must use RMT or AMT. ModernGENA uses `1024`-token memory segments by default for
+RMT/AMT.
 
 ### `training`
 
@@ -390,7 +394,9 @@ Every training run creates:
 <run-directory>/evaluation_config.json
 ```
 
-The file contains the complete model definition and the held-out dataset definition needed by that task. Its checkpoint path is updated automatically whenever the best checkpoint changes. A copy is also stored in checkpoint directories, so the architecture and evaluation settings remain next to the saved weights. Do not replace the copied model block with a generic inference example: U-Net, RMT, AMT, tokenizer, and Caduceus settings are architecture-critical.
+The file contains the complete model definition and the task-specific held-out dataset definition. Its checkpoint path is updated automatically whenever the best checkpoint changes. A copy is also stored in checkpoint directories, so the architecture and evaluation settings remain next to the saved weights. Do not replace the copied model block with a generic inference example: U-Net, RMT, AMT, tokenizer, and Caduceus settings are architecture-critical.
+
+Every generated evaluation config is restricted to genome `GCF_009914755.1` and chromosome `NC_060944.1`. Gene finding uses its `test` split. Segmentation and transcript type use `val-human/validation`. Final segmentation and transcript-type evaluation remove the status filter and therefore use every transcript/isoform on that chromosome. `true_gff` is copied from the top-level training config into `inference.true_gff`, including when it is `null`. Reverse-complement averaging defaults to `true`.
 
 Run post-training evaluation on one GPU from the repository root. It does not require `torchrun`.
 
@@ -430,7 +436,7 @@ PYTHONPATH=$PWD CUDA_VISIBLE_DEVICES=0 \
 
 Training-time human validation deliberately keeps representative rows with status 1. On `NC_060944.1`, that is 963 transcript rows representing 963 genes; the dataset contains 980 genes in total, but 17 have no status-1 row. This is expected and is not a loader loss. Separate final segmentation evaluation removes the status filter and evaluates all 3,998 transcripts from all 980 genes on that chromosome.
 
-Segmentation inference writes a transcript-coordinate GFF (`seqid = transcript_id`). If a model-length crop starts after transcript position zero, exon and CDS intervals are shifted back by the crop's `local_start` before writing, so they remain aligned to the original transcript coordinate system. A transcript longer than the selected model context contributes one deterministic slice; segmentation and transcript-type tasks do not create overlapping windows or stitch multiple predictions.
+Segmentation inference writes a transcript-coordinate GFF (`seqid = transcript_id`). Final evaluation processes every transcript over its complete length with non-overlapping model-sized chunks, gathers those chunks in transcript order, and writes one full-length prediction per transcript. For reverse-complement averaging, the complete transcript is reverse-complemented first, chunked with the same non-overlapping rule, restored to the original orientation, and then averaged with the forward prediction.
 
 Set `inference.true_gff` to run the official gene-level segmentation metric and write `inference.metrics_json`. If it is `null`, inference still writes predictions but does not run the remote official metric.
 
@@ -455,7 +461,7 @@ PYTHONPATH=$PWD CUDA_VISIBLE_DEVICES=0 \
   --config runs/<transcript-type-run>/evaluation_config.json
 ```
 
-The command writes one TSV row per selected transcript with the true type, lncRNA probability, and predicted type, plus a JSON file containing accuracy. Its threshold is applied to the lncRNA probability. As with segmentation, each long transcript contributes one deterministic, non-overlapping model-length slice.
+The command writes one TSV row per selected transcript with the true type, lncRNA probability, and predicted type, plus a JSON file containing accuracy. Its threshold is applied to the lncRNA probability. Automatic evaluation loads every transcript/isoform from the selected validation chromosome; transcript-type inputs still follow the configured model context.
 
 ### Evaluation checklist
 
@@ -555,7 +561,12 @@ The dataset retains all annotated transcripts. Training-time validation uses sta
 
 ### Sampling and BPE handling
 
-The model input is only the transcript DNA sequence. It must not include intergenic regions, neighboring genes, or other chromosome context. Each selected transcript contributes exactly one model-length slice. The crop keeps the configured left margin (normally about 500 nt) when the transcript is long enough; it is never expanded into overlapping windows. Caduceus slice length is defined in nucleotides, while GENA/ModernGENA slice length is derived from the BPE fields described above. Inference writes transcript-coordinate predictions.
+The model input is only the transcript DNA sequence. It must not include intergenic regions, neighboring genes, or other chromosome context. Training-time cropping is controlled by `random_crop`:
+
+- `false`: use the complete transcript when it fits; otherwise take the model-length prefix beginning at transcript position zero.
+- `true`: use the complete transcript when it fits; otherwise choose a random start while guaranteeing that at least `crop_margin` nucleotides (normally 500) remain to the right of the start. The selected sequence extends up to the model context or transcript end.
+
+All supplied Caduceus segmentation configs set `random_crop: true`. All supplied GENA and ModernGENA segmentation configs set `random_crop: false`, so their long samples always begin at the transcript beginning. Crops never overlap. Caduceus length is defined in nucleotides, while GENA/ModernGENA length is derived from the BPE fields described above.
 
 GENA/ModernGENA segmentation must use U-Net/RMT/AMT+U-Net so that BPE states are expanded to nucleotide resolution before loss and metrics are computed.
 
@@ -568,11 +579,18 @@ interval_f1_exon
 interval_f1_CDS
 ```
 
-UTR and intron training-time metrics are intentionally excluded.  Gene-level and MI metrics are computed only by `segmentation/infer.py` through the official Evaluate metric.
+There is no independent `0.5` prediction threshold. At each nucleotide:
+
+```text
+exon prediction = EXON wins argmax(EXON, 5UTR, 3UTR)
+CDS prediction  = CDS  wins argmax(CDS, INTRON)
+```
+
+The resulting binary tracks are converted to contiguous intervals. A predicted interval is a true positive only when it exactly equals a reference interval; unmatched predicted/reference intervals are false positives/false negatives. UTR and intron training-time metrics are intentionally excluded. Gene-level and MI metrics are computed only by `segmentation/infer.py` through the official Evaluate metric. Segmentation GFF decoding uses the same comparison-group argmax rule.
 
 ### Validation and long transcripts
 
-Training-time validation uses the same one-slice model-context construction as training, with deterministic cropping. If a transcript is longer than the model context, validation and standalone inference evaluate one deterministic model-length slice rather than feeding the whole transcript or reconstructing it from overlapping windows. Standalone inference restores the crop offset in the transcript-coordinate GFF before the official metric is called.
+Training-time validation uses the same configured crop policy as training: random for Caduceus configs and beginning-only for GENA/ModernGENA configs. Standalone final segmentation evaluation is different: it removes the status filter, uses all transcripts on the required chromosome, and reconstructs every complete transcript from non-overlapping chunks regardless of model context size.
 
 For memory safety, validation uses the rank-0 streaming loop described in the training section.  No validation logits or labels are gathered across GPUs.  Each evaluated batch is converted to CPU NumPy arrays immediately and only task-specific counters or CPU arrays required for the metric are retained.  This same evaluation rule is applied to gene finding, segmentation, and transcript-type training.
 
@@ -605,9 +623,10 @@ Run the focused regression suite after installing the project dependencies:
 python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-The focused tests cover config contracts, BPE length derivation, deterministic
-transcript slicing, reverse-complement alignment, U-Net sample/chunk semantics,
-RMT batch identity, run/checkpoint preservation, and strict checkpoint loading.
+The focused tests cover config contracts, BPE length derivation, configurable
+transcript cropping, complete-transcript non-overlapping gathering,
+reverse-complement alignment, interval argmax decoding, U-Net sample/chunk
+semantics, RMT batch identity, run/checkpoint preservation, and strict checkpoint loading.
 
 Smoke tests use real data and are designed to verify that every task/model path can train, validate, infer, and write metrics on the selected held-out subset. The runner does not enforce any metric-based success criterion; inspect the metrics manually.
 

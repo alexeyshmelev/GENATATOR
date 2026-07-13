@@ -164,7 +164,7 @@ def finding_data(path: Path, aliases: List[str], family: str, max_nt: int, max_t
     return cfg
 
 
-def transcript_data(path: Path, aliases: List[str], family: str, max_nt: int, max_tok: int) -> dict:
+def transcript_data(path: Path, aliases: List[str], family: str, max_nt: int, max_tok: int, random_crop: bool | None = None) -> dict:
     cfg = {
         "path": str(path),
         "split": "test",
@@ -177,6 +177,8 @@ def transcript_data(path: Path, aliases: List[str], family: str, max_nt: int, ma
         "loader": "direct_parquet",
         "parquet_batch_size": 64,
     }
+    if random_crop is not None:
+        cfg["random_crop"] = bool(random_crop)
     cfg.update(_length_fields(family, max_nt, max_tok))
     return cfg
 
@@ -198,7 +200,7 @@ def make_finding_train_config(
         extra = {"unet_cycles": 1}
     elif family == "rmt":
         extra = {
-            "cycles": 3,
+            "cycles": 1,
             "rmt": {
                     "segment_size": 64,
                     "max_n_segments": 8,
@@ -234,6 +236,8 @@ def make_finding_train_config(
         # chromosome-selected test samples.
         "train_dataset": dataset,
         "eval_dataset": dict(dataset),
+        "true_gff": None,
+        "evaluation": {"use_reverse_complement": True},
         "training": smoke_training(work / name, bs, SMOKE_EPOCHS, SMOKE_LR, f"finding_{task}"),
     }
     return write_json(work / "configs" / f"{name}.json", cfg)
@@ -255,7 +259,7 @@ def make_seg_train_config(
             extra = {"unet_cycles": 1}
         elif family == "rmt":
             extra = {
-                "cycles": 3,
+                "cycles": 1,
                 "rmt": {
                     "segment_size": 64,
                     "max_n_segments": 8,
@@ -285,12 +289,17 @@ def make_seg_train_config(
         else:
             raise RuntimeError(f"Unsupported segmentation family={family}")
     name = f"segmentation_{model_name}_{family}"
-    dataset = transcript_data(selection.selected_parquet_path, aliases, family, max_nt, max_tok)
+    dataset = transcript_data(
+        selection.selected_parquet_path, aliases, family, max_nt, max_tok,
+        random_crop=(kind == "caduceus"),
+    )
     cfg = {
         "seed": 42,
         "model": model_cfg(model_name, family, extra),
         "train_dataset": dataset,
         "eval_dataset": dict(dataset),
+        "true_gff": None,
+        "evaluation": {"use_reverse_complement": True},
         "training": smoke_training(work / name, bs, SMOKE_EPOCHS, SMOKE_LR, "segmentation"),
     }
     return write_json(work / "configs" / f"{name}.json", cfg)
@@ -314,6 +323,8 @@ def make_tt_train_config(
         "model": model_cfg(model_name, family),
         "train_dataset": dataset,
         "eval_dataset": dict(dataset),
+        "true_gff": None,
+        "evaluation": {"use_reverse_complement": True},
         "training": smoke_training(work / name, bs, SMOKE_EPOCHS, SMOKE_LR, "transcript_type"),
     }
     return write_json(work / "configs" / f"{name}.json", cfg)
@@ -369,7 +380,7 @@ def make_finding_infer_config(
         },
         "inference": {
             "device": "cuda",
-            "use_reverse_complement": False,
+            "use_reverse_complement": True,
             "output_gff": str(work / f"finding_{model_name}_{variant}.gff"),
             "true_gff": true_gff,
             "metrics_json": str(work / f"finding_{model_name}_{variant}.metrics.json"),
@@ -396,18 +407,18 @@ def make_seg_infer_config(
     train_cfg = json.loads((work / "configs" / f"segmentation_{model_name}_{family}.json").read_text())
     cfg = {
         "model": train_cfg["model"],
-        "dataset": transcript_data(
+        "dataset": {**transcript_data(
             selection.selected_parquet_path,
             aliases,
             family,
             512,
             512 if family == "caduceus" else 64,
-        ),
+        ), "full_transcript_chunks": True},
         "inference": {
             "device": "cuda",
             "checkpoint_path": str(train_dir / "final_model"),
             "batch_size": 1,
-            "use_reverse_complement": False,
+            "use_reverse_complement": True,
             "use_cds_heuristic": True,
             "threshold": 0.5,
             "empty_segment_policy": "best_interval",
@@ -442,8 +453,9 @@ def make_tt_infer_config(
             "device": "cuda",
             "checkpoint_path": str(train_dir / "final_model"),
             "batch_size": 1,
-            "use_reverse_complement": False,
+            "use_reverse_complement": True,
             "threshold": 0.5,
+            "true_gff": None,
             "output_tsv": str(work / f"transcript_type_{model_name}_{family}.tsv"),
             "metrics_json": str(work / f"transcript_type_{model_name}_{family}.metrics.json"),
         },

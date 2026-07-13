@@ -74,9 +74,9 @@ def resolve_dataset_lengths(cfg: Dict[str, Any], task: str) -> Dict[str, Any]:
 
     if task in TRANSCRIPT_TASKS:
         if "overlap" in resolved:
-            raise RuntimeError(f"{task} uses one crop per transcript and must not define overlap")
-        if bool(resolved.get("random_crop", False)):
-            raise RuntimeError(f"{task} does not support random_crop; transcript crops are deterministic")
+            raise RuntimeError(f"{task} does not use overlapping transcript crops and must not define overlap")
+        if int(resolved.get("crop_margin", 500)) < 1:
+            raise RuntimeError("crop_margin must be at least 1 nucleotide")
     elif task.startswith("finding"):
         overlap = float(resolved.get("overlap", 0.5))
         if not 0.0 <= overlap < 1.0:
@@ -306,7 +306,8 @@ def _maybe_trim_streaming_row(row: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[
     if "dna_sequence" not in row:
         return row
 
-    max_nt = int(cfg.get("_resolved_max_nucleotides", len(row["dna_sequence"])))
+    dna = str(row["dna_sequence"])
+    max_nt = int(cfg.get("_resolved_max_nucleotides", len(dna)))
     task = str(cfg.get("_task", ""))
     if task.startswith("finding"):
         overlap = float(cfg.get("overlap", 0.5))
@@ -316,10 +317,13 @@ def _maybe_trim_streaming_row(row: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[
     else:
         overlap = 0.0
         max_windows = 1
-        # Preserve the requested left crop margin so deterministic transcript
-        # slicing can begin at that offset after a streaming row is trimmed.
-        keep_len = max_nt + max(0, int(cfg.get("crop_margin", 500)))
-    dna = str(row["dna_sequence"])
+        # Random transcript cropping must retain the complete source row so any
+        # valid start can be sampled. Beginning-only crops need only the model
+        # context. Full-transcript evaluation also keeps the complete row.
+        if bool(cfg.get("random_crop", False)) or bool(cfg.get("full_transcript_chunks", False)):
+            keep_len = len(dna)
+        else:
+            keep_len = max_nt
     keep_len = min(len(dna), keep_len)
 
     trimmed = dict(row)
@@ -1066,7 +1070,11 @@ class GenatatorDataset(torch.utils.data.Dataset):
             # Targets in RAM have already been sliced to the requested target group.
             self.target_indices = list(range(len(channel_indices(task, cfg))))
         self.crop_margin = int(cfg.get("crop_margin", 500))
+        self.random_crop = bool(cfg.get("random_crop", False))
         self.reverse_complement = bool(cfg.get("reverse_complement", False))
+        self.full_transcript_chunks = bool(cfg.get("full_transcript_chunks", False))
+        if self.full_transcript_chunks and (not self.for_inference or self.task != "segmentation"):
+            raise RuntimeError("full_transcript_chunks is supported only for standalone segmentation inference")
         self.prewindowed = bool(cfg.get("prewindowed", False))
         self.windows: List[Any] = []
         if task.startswith("finding"):
@@ -1079,7 +1087,7 @@ class GenatatorDataset(torch.utils.data.Dataset):
         max_windows = cfg.get("max_windows")
         if max_windows:
             self.windows = self.windows[: int(max_windows)]
-        logger.info("[dataset] task=%s family=%s windows=%d max_nt=%d max_tokens=%d overlap=%.3f rc=%s is_train=%s", task, self.model_family, len(self.windows), self.max_nucleotides, self.max_tokens, self.overlap, self.reverse_complement, self.is_train)
+        logger.info("[dataset] task=%s family=%s windows=%d max_nt=%d max_tokens=%d overlap=%.3f random_crop=%s full_transcript_chunks=%s rc=%s is_train=%s", task, self.model_family, len(self.windows), self.max_nucleotides, self.max_tokens, self.overlap, self.random_crop, self.full_transcript_chunks, self.reverse_complement, self.is_train)
 
     def _build_prewindowed_finding_indices(self) -> None:
         self.windows = list(self.row_indices)
@@ -1113,16 +1121,76 @@ class GenatatorDataset(torch.utils.data.Dataset):
             for s, e in make_windows(assembly.length, self.max_nucleotides, self.overlap):
                 self.windows.append((key, s, e))
 
+    def _bpe_full_transcript_chunk_bounds(self, dna: str) -> List[Tuple[int, int]]:
+        if not getattr(self.tokenizer, "is_fast", False):
+            raise RuntimeError("Full-transcript BPE chunking requires a fast tokenizer")
+
+        def encoded_length(start: int, end: int) -> int:
+            encoded = self.tokenizer(
+                dna[start:end],
+                add_special_tokens=True,
+                padding=False,
+                truncation=False,
+                return_attention_mask=False,
+                return_token_type_ids=False,
+            )
+            return len(encoded["input_ids"])
+
+        bounds: List[Tuple[int, int]] = []
+        start_nt = 0
+        while start_nt < len(dna):
+            upper = min(len(dna), start_nt + self.max_nucleotides)
+            if encoded_length(start_nt, upper) <= self.max_tokens:
+                end_nt = upper
+            else:
+                low = start_nt + 1
+                high = upper
+                if encoded_length(start_nt, low) > self.max_tokens:
+                    raise RuntimeError(
+                        "A single nucleotide plus tokenizer special tokens exceeds max_bpe_tokens="
+                        f"{self.max_tokens}"
+                    )
+                # Largest nucleotide endpoint whose independently tokenized chunk
+                # fits the model's complete BPE input, including special tokens.
+                while low < high:
+                    mid = (low + high + 1) // 2
+                    if encoded_length(start_nt, mid) <= self.max_tokens:
+                        low = mid
+                    else:
+                        high = mid - 1
+                end_nt = low
+            if end_nt <= start_nt:
+                raise RuntimeError("Full-transcript BPE chunking made no progress")
+            bounds.append((start_nt, end_nt))
+            start_nt = end_nt
+        return bounds
+
+    def _full_transcript_chunk_bounds(self, dna: str) -> List[Tuple[int, int]]:
+        if not dna:
+            raise RuntimeError("Empty transcript sequence")
+        if self.model_family == "nucleotide":
+            return make_windows(len(dna), self.max_nucleotides, 0.0)
+        return self._bpe_full_transcript_chunk_bounds(dna)
+
     def _build_transcript_indices(self) -> None:
-        self.windows = list(self.row_indices)
+        self.windows = []
         by_chrom: Dict[str, Dict[str, int]] = {}
         for row_i in self.row_indices:
-            meta = parse_metadata(self.raw["metadata"][row_i])
+            row = self.raw[row_i]
+            meta = parse_metadata(row.get("metadata", {}))
             chrom = meta.chrom or "<empty>"
             d = by_chrom.setdefault(chrom, {"count": 0, "min_start": None, "max_end": None})
             d["count"] += 1
             d["min_start"] = meta.start if d["min_start"] is None else min(d["min_start"], meta.start)
             d["max_end"] = meta.end if d["max_end"] is None else max(d["max_end"], meta.end)
+            if self.full_transcript_chunks:
+                original = str(row["dna_sequence"]).upper()
+                oriented = reverse_complement(original) if self.reverse_complement else original
+                for oriented_start, oriented_end in self._full_transcript_chunk_bounds(oriented):
+                    original_start = len(original) - oriented_end if self.reverse_complement else oriented_start
+                    self.windows.append((row_i, oriented_start, oriented_end, original_start))
+            else:
+                self.windows.append(row_i)
         for chrom, d in sorted(by_chrom.items()):
             span = int(d["max_end"] - d["min_start"]) if d["min_start"] is not None and d["max_end"] is not None else 0
             logger.info("[transcript.selection] task=%s chrom=%s transcripts_found=%d metadata_min_start=%s metadata_max_end=%s metadata_span=%d", self.task, chrom, d["count"], d["min_start"], d["max_end"], span)
@@ -1148,10 +1216,29 @@ class GenatatorDataset(torch.utils.data.Dataset):
     def _crop_transcript(self, seq_len: int) -> Tuple[int, int]:
         if seq_len <= self.max_nucleotides:
             return 0, seq_len
-        start = min(self.crop_margin, max(0, seq_len - self.max_nucleotides))
+        if not self.random_crop:
+            return 0, self.max_nucleotides
+        latest_start = max(0, seq_len - self.crop_margin)
+        start = int(torch.randint(0, latest_start + 1, (1,)).item())
         return start, min(seq_len, start + self.max_nucleotides)
 
     def _slice_transcript(self, idx: int) -> Tuple[str, Optional[np.ndarray], ParsedMetadata, int]:
+        if self.full_transcript_chunks:
+            row_i, s, e, original_start = self.windows[idx]
+            row = self.raw[row_i]
+            original_seq = str(row["dna_sequence"]).upper()
+            seq = reverse_complement(original_seq) if self.reverse_complement else original_seq
+            labels = None
+            if self.task != "transcript_type":
+                if "labels" not in row:
+                    raise RuntimeError("Segmentation transcript row is missing labels")
+                full_labels = np.asarray(row["labels"], dtype=np.float32)[:, self.target_indices]
+                if self.reverse_complement:
+                    full_labels = reverse_complement_task_labels(self.task, full_labels)
+                labels = full_labels[s:e]
+            meta = parse_metadata(row.get("metadata", {}))
+            return seq[s:e], labels, meta, int(original_start)
+
         row_i = self.windows[idx]
         row = self.raw[row_i]
         seq = str(row["dna_sequence"]).upper()
@@ -1169,7 +1256,7 @@ class GenatatorDataset(torch.utils.data.Dataset):
             dna, labels, meta, local_start = self._slice_finding(idx)
         else:
             dna, labels, meta, local_start = self._slice_transcript(idx)
-        if self.reverse_complement:
+        if self.reverse_complement and not self.full_transcript_chunks:
             dna = reverse_complement(dna)
             if labels is not None:
                 labels = reverse_complement_task_labels(self.task, labels)

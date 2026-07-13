@@ -156,17 +156,35 @@ def build_evaluation_config(cfg: Dict[str, Any], *, task: str, run_dir: str | Pa
 
     run_dir = Path(run_dir).resolve()
     model_cfg = copy.deepcopy(cfg["model"])
-    # Inference owns checkpoint loading.  Keeping both fields non-null loads
+    # Inference owns checkpoint loading. Keeping both fields non-null loads
     # weights twice and can silently mix two different checkpoints.
     model_cfg["checkpoint_path"] = None
     dataset_cfg = copy.deepcopy(cfg["eval_dataset"])
     training_cfg = cfg["training"]
-    requested = copy.deepcopy(cfg.get("evaluation", {}))
+    requested = copy.deepcopy(cfg.get("evaluation") or {})
+    true_gff = cfg.get("true_gff", requested.get("true_gff"))
+
+    # Every automatically generated evaluation is intentionally restricted to
+    # the held-out human chromosome used by the project benchmark.
+    dataset_cfg["genomes"] = ["GCF_009914755.1"]
+    dataset_cfg["chromosomes"] = ["NC_060944.1"]
+    # Final evaluation must not inherit smoke/debug row or window limits from
+    # a training configuration.
+    for limiting_key in (
+        "max_rows",
+        "max_windows",
+        "streaming_max_rows",
+        "streaming_max_scanned_rows",
+        "streaming_trim_rows",
+    ):
+        dataset_cfg.pop(limiting_key, None)
+
     common = {
         "device": requested.get("device", "cuda"),
         "checkpoint_path": None,
         "batch_size": int(requested.get("batch_size", training_cfg.get("per_device_eval_batch_size", 1))),
-        "use_reverse_complement": bool(requested.get("use_reverse_complement", False)),
+        "use_reverse_complement": bool(requested.get("use_reverse_complement", True)),
+        "true_gff": true_gff,
     }
 
     generated = {
@@ -177,6 +195,9 @@ def build_evaluation_config(cfg: Dict[str, Any], *, task: str, run_dir: str | Pa
     }
 
     if task in {"finding_edge", "finding_region"}:
+        # Gene finding has a dedicated held-out test split.
+        dataset_cfg["split"] = "test"
+        dataset_cfg.pop("statuses", None)
         common["metrics_json"] = _absolute_output(run_dir, f"{task}_metrics.json")
         return {
             "task": task,
@@ -187,19 +208,20 @@ def build_evaluation_config(cfg: Dict[str, Any], *, task: str, run_dir: str | Pa
         }
 
     if task == "segmentation":
-        # Standalone evaluation must cover every transcript/isoform.  The
-        # training-time eval_dataset remains untouched (typically statuses=[1]).
+        # Final evaluation uses every transcript/isoform from val-human and
+        # gathers non-overlapping model-sized chunks over complete transcripts.
+        dataset_cfg["config_name"] = "val-human"
+        dataset_cfg["split"] = "validation"
         dataset_cfg.pop("statuses", None)
         dataset_cfg.pop("random_crop", None)
         dataset_cfg.pop("overlap", None)
+        dataset_cfg["full_transcript_chunks"] = True
         common.update(
             {
-                "threshold": float(requested.get("threshold", 0.5)),
                 "use_cds_heuristic": bool(requested.get("use_cds_heuristic", True)),
                 "coordinate_mode": requested.get("coordinate_mode", "transcript"),
                 "empty_segment_policy": requested.get("empty_segment_policy", "error"),
                 "output_gff": _absolute_output(run_dir, "segmentation_predictions.gff"),
-                "true_gff": requested.get("true_gff"),
                 "metrics_json": _absolute_output(run_dir, "segmentation_metrics.json"),
             }
         )
@@ -211,6 +233,9 @@ def build_evaluation_config(cfg: Dict[str, Any], *, task: str, run_dir: str | Pa
         }
 
     if task == "transcript_type":
+        dataset_cfg["config_name"] = "val-human"
+        dataset_cfg["split"] = "validation"
+        dataset_cfg.pop("statuses", None)
         dataset_cfg.pop("random_crop", None)
         dataset_cfg.pop("overlap", None)
         common.update(

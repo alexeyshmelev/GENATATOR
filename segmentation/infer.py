@@ -31,7 +31,6 @@ for r in rows:
     rec = labels_to_segmentation_record(
         r["metadata"],
         probs,
-        threshold=float(cfg.get("inference", {}).get("threshold", 0.5)),
         force_nonempty=force_nonempty,
     )
     if use_cds_heuristic and rec["transcript_type"] == "mRNA":

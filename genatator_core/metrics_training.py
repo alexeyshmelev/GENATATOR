@@ -13,6 +13,25 @@ from .intervals import f1_from_counts, interval_counts
 EDGE_CLASS_NAMES: tuple[str, ...] = ("TSS+", "TSS-", "PolyA+", "PolyA-")
 REGION_CLASS_NAMES: tuple[str, ...] = ("intragenic+", "intragenic-")
 SEGMENTATION_CLASS_INDEX = {"exon": 1, "CDS": 4}
+SEGMENTATION_INTERVAL_COMPARISON_GROUPS = {
+    # The interval metric is decoded from raw per-nucleotide class scores.
+    # Exon is positive only when EXON wins against 5UTR and 3UTR.
+    "exon": (1, (1, 0, 3)),
+    # CDS is positive only when CDS wins against INTRON.
+    "CDS": (4, (4, 2)),
+}
+
+
+def segmentation_interval_predictions(logits: np.ndarray, class_name: str) -> np.ndarray:
+    """Decode one segmentation interval track by argmax within its comparison group."""
+    try:
+        positive_channel, comparison_channels = SEGMENTATION_INTERVAL_COMPARISON_GROUPS[class_name]
+    except KeyError as exc:
+        raise RuntimeError(f"Unsupported segmentation interval class: {class_name!r}") from exc
+    scores = np.asarray(logits)[..., list(comparison_channels)]
+    winner_in_group = np.argmax(scores, axis=-1)
+    positive_position = comparison_channels.index(positive_channel)
+    return (winner_in_group == positive_position).astype(np.int8)
 
 
 def _pred_array(predictions: Any) -> np.ndarray:
@@ -168,17 +187,16 @@ def segmentation_interval_metrics(eval_pred: Any) -> Dict[str, float]:
     logits = _pred_array(eval_pred.predictions)
     labels, mask = _labels_and_mask(eval_pred.label_ids)
     _validate_token_metric_shapes(logits, labels, mask, 5, "segmentation")
-    probabilities = sigmoid(logits)
-
     metrics: Dict[str, float] = {}
     for class_name, channel_index in SEGMENTATION_CLASS_INDEX.items():
         tp = fp = fn = 0
+        decoded = segmentation_interval_predictions(logits, class_name)
         for sample_index in range(labels.shape[0]):
             valid = mask[sample_index]
             if not np.any(valid):
                 continue
             references = (labels[sample_index, valid, channel_index] >= 0.5).astype(np.int8)
-            predictions = (probabilities[sample_index, valid, channel_index] >= 0.5).astype(np.int8)
+            predictions = decoded[sample_index, valid]
             sample_tp, sample_fp, sample_fn = interval_counts(references, predictions)
             tp += sample_tp
             fp += sample_fp

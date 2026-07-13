@@ -16,7 +16,7 @@
     "chromosomes": [],
     "overlap": 0.5,
     "target_group": "primary",
-    "max_bpe_tokens": 4096,
+    "max_bpe_tokens": 512,
     "average_bpe_token_length": 9.0
   },
   "eval_dataset": {
@@ -26,8 +26,12 @@
     "chromosomes": [],
     "overlap": 0.5,
     "target_group": "primary",
-    "max_bpe_tokens": 4096,
+    "max_bpe_tokens": 512,
     "average_bpe_token_length": 9.0
+  },
+  "true_gff": null,
+  "evaluation": {
+    "use_reverse_complement": true
   },
   "training": {
     "output_dir": "runs/finding_edge_gena_large_plain",
