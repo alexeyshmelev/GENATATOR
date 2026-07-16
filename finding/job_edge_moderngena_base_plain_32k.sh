@@ -27,7 +27,7 @@ export TOKENIZERS_PARALLELISM=0
 
 export PYTHONPATH=$PWD
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 finding/train.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 -m finding.train \
                                 --task edge \
                                 --config finding/configs/edge_moderngena_base_plain_32k.json
 date
