@@ -1,0 +1,182 @@
+Wed Jul 15 10:08:59 PM MSK 2026
+[2026-07-15 22:09:06,020] torch.distributed.run: [WARNING] 
+[2026-07-15 22:09:06,020] torch.distributed.run: [WARNING] *****************************************
+[2026-07-15 22:09:06,020] torch.distributed.run: [WARNING] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+[2026-07-15 22:09:06,020] torch.distributed.run: [WARNING] *****************************************
+Traceback (most recent call last):
+Traceback (most recent call last):
+Traceback (most recent call last):
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/finding/train.py", line 3, in <module>
+Traceback (most recent call last):
+Traceback (most recent call last):
+Traceback (most recent call last):
+Traceback (most recent call last):
+Traceback (most recent call last):
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/finding/train.py", line 3, in <module>
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/finding/train.py", line 3, in <module>
+      File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/finding/train.py", line 3, in <module>
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/finding/train.py", line 3, in <module>
+        from genatator_core.train_common import train_from_config
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/finding/train.py", line 3, in <module>
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/finding/train.py", line 3, in <module>
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/finding/train.py", line 3, in <module>
+    from genatator_core.train_common import train_from_config
+from genatator_core.train_common import train_from_config
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/train_common.py", line 19, in <module>
+        from genatator_core.train_common import train_from_config
+    from genatator_core.train_common import train_from_config      File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/train_common.py", line 19, in <module>
+    from genatator_core.train_common import train_from_config
+from genatator_core.train_common import train_from_config
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/train_common.py", line 19, in <module>
+
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/train_common.py", line 19, in <module>
+from genatator_core.train_common import train_from_config
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/train_common.py", line 19, in <module>
+    from .metrics_training import (
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/metrics_training.py", line 6, in <module>
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/train_common.py", line 19, in <module>
+            from .metrics_training import (  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/train_common.py", line 19, in <module>
+from .metrics_training import (
+    from .metrics_training import (  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/train_common.py", line 19, in <module>
+from .metrics_training import (
+    from .metrics_training import (
+
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/metrics_training.py", line 6, in <module>
+      File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/metrics_training.py", line 6, in <module>
+
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/metrics_training.py", line 6, in <module>
+      File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/metrics_training.py", line 6, in <module>
+import evaluate      File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/metrics_training.py", line 6, in <module>
+from .metrics_training import (
+            from .metrics_training import (
+
+import evaluate
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/metrics_training.py", line 6, in <module>
+    import evaluateimport evaluate
+import evaluate
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/metrics_training.py", line 6, in <module>
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/finding/evaluate.py", line 16, in <module>
+import evaluate
+    
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/finding/evaluate.py", line 16, in <module>
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/finding/evaluate.py", line 16, in <module>
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/finding/evaluate.py", line 16, in <module>
+      File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/finding/evaluate.py", line 16, in <module>
+import evaluate
+                import evaluate
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/finding/evaluate.py", line 16, in <module>
+    from genatator_core.infer_common import prepare_model, sigmoid, undo_reverse_complement_logits
+from genatator_core.infer_common import prepare_model, sigmoid, undo_reverse_complement_logits
+from genatator_core.infer_common import prepare_model, sigmoid, undo_reverse_complement_logits
+from genatator_core.infer_common import prepare_model, sigmoid, undo_reverse_complement_logits
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/finding/evaluate.py", line 16, in <module>
+from genatator_core.infer_common import prepare_model, sigmoid, undo_reverse_complement_logits
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/finding/evaluate.py", line 16, in <module>
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/infer_common.py", line 14, in <module>
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/infer_common.py", line 14, in <module>
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/infer_common.py", line 14, in <module>
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/infer_common.py", line 14, in <module>
+              File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/infer_common.py", line 14, in <module>
+            from genatator_core.infer_common import prepare_model, sigmoid, undo_reverse_complement_logitsfrom .train_common import dataset_family_from_model, prepare_nucleotide_tokenizer
+from genatator_core.infer_common import prepare_model, sigmoid, undo_reverse_complement_logitsfrom genatator_core.infer_common import prepare_model, sigmoid, undo_reverse_complement_logits
+    from .train_common import dataset_family_from_model, prepare_nucleotide_tokenizer
+    from .train_common import dataset_family_from_model, prepare_nucleotide_tokenizerfrom .train_common import dataset_family_from_model, prepare_nucleotide_tokenizer
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/infer_common.py", line 14, in <module>
+ImportError
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/infer_common.py", line 14, in <module>
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/infer_common.py", line 14, in <module>
+from .train_common import dataset_family_from_model, prepare_nucleotide_tokenizer
+ImportError
+ImportError
+ImportError: cannot import name 'dataset_family_from_model' from partially initialized module 'genatator_core.train_common' (most likely due to a circular import) (/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/train_common.py)            ImportError: cannot import name 'dataset_family_from_model' from partially initialized module 'genatator_core.train_common' (most likely due to a circular import) (/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/train_common.py): cannot import name 'dataset_family_from_model' from partially initialized module 'genatator_core.train_common' (most likely due to a circular import) (/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/train_common.py): cannot import name 'dataset_family_from_model' from partially initialized module 'genatator_core.train_common' (most likely due to a circular import) (/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/train_common.py)
+from .train_common import dataset_family_from_model, prepare_nucleotide_tokenizer
+from .train_common import dataset_family_from_model, prepare_nucleotide_tokenizer
+from .train_common import dataset_family_from_model, prepare_nucleotide_tokenizer
+ImportError: cannot import name 'dataset_family_from_model' from partially initialized module 'genatator_core.train_common' (most likely due to a circular import) (/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/train_common.py)
+
+
+ImportErrorImportError: cannot import name 'dataset_family_from_model' from partially initialized module 'genatator_core.train_common' (most likely due to a circular import) (/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/train_common.py)
+: : 
+cannot import name 'dataset_family_from_model' from partially initialized module 'genatator_core.train_common' (most likely due to a circular import) (/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/train_common.py)
+cannot import name 'dataset_family_from_model' from partially initialized module 'genatator_core.train_common' (most likely due to a circular import) (/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/train_common.py)
+[2026-07-15 22:09:36,040] torch.distributed.elastic.multiprocessing.api: [ERROR] failed (exitcode: 1) local_rank: 0 (pid: 1718928) of binary: /external/nfs/01-home/vsefishman/envs/genatator_pipeline/bin/python3.11
+Traceback (most recent call last):
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/bin/torchrun", line 6, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 347, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/torch/distributed/run.py", line 812, in main
+    run(args)
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/torch/distributed/run.py", line 803, in run
+    elastic_launch(
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 135, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 268, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+finding/train.py FAILED
+------------------------------------------------------------
+Failures:
+[1]:
+  time      : 2026-07-15_22:09:36
+  host      : hgx053.gigalearn.internal
+  rank      : 1 (local_rank: 1)
+  exitcode  : 1 (pid: 1718929)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[2]:
+  time      : 2026-07-15_22:09:36
+  host      : hgx053.gigalearn.internal
+  rank      : 2 (local_rank: 2)
+  exitcode  : 1 (pid: 1718930)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[3]:
+  time      : 2026-07-15_22:09:36
+  host      : hgx053.gigalearn.internal
+  rank      : 3 (local_rank: 3)
+  exitcode  : 1 (pid: 1718931)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[4]:
+  time      : 2026-07-15_22:09:36
+  host      : hgx053.gigalearn.internal
+  rank      : 4 (local_rank: 4)
+  exitcode  : 1 (pid: 1718932)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[5]:
+  time      : 2026-07-15_22:09:36
+  host      : hgx053.gigalearn.internal
+  rank      : 5 (local_rank: 5)
+  exitcode  : 1 (pid: 1718933)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[6]:
+  time      : 2026-07-15_22:09:36
+  host      : hgx053.gigalearn.internal
+  rank      : 6 (local_rank: 6)
+  exitcode  : 1 (pid: 1718934)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[7]:
+  time      : 2026-07-15_22:09:36
+  host      : hgx053.gigalearn.internal
+  rank      : 7 (local_rank: 7)
+  exitcode  : 1 (pid: 1718935)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-07-15_22:09:36
+  host      : hgx053.gigalearn.internal
+  rank      : 0 (local_rank: 0)
+  exitcode  : 1 (pid: 1718928)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================
