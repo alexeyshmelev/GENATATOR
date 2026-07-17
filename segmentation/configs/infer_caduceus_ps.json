@@ -37,5 +37,6 @@
     "output_gff": "segmentation_predictions.gff",
     "true_gff": null,
     "metrics_json": "segmentation_metrics.json"
-  }
+  },
+  "task": "segmentation"
 }

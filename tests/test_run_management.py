@@ -37,11 +37,10 @@ class RunManagementTests(unittest.TestCase):
                 "random_crop": False,
             },
             "true_gff": "/tmp/reference.gff",
-            "evaluation": {},
             "training": {
                 "output_dir": str(base),
                 "custom_prefix": "experiment",
-                "per_device_eval_batch_size": 3,
+                "per_device_eval_batch_size": 1,
             },
         }
 
@@ -71,6 +70,7 @@ class RunManagementTests(unittest.TestCase):
             self.assertEqual(evaluation["dataset"]["genomes"], ["GCF_009914755.1"])
             self.assertEqual(evaluation["dataset"]["chromosomes"], ["NC_060944.1"])
             self.assertEqual(cfg["eval_dataset"]["statuses"], [1])
+            self.assertEqual(evaluation["inference"]["batch_size"], 1)
             self.assertTrue(evaluation["inference"]["use_reverse_complement"])
             self.assertTrue(evaluation["inference"]["use_cds_heuristic"])
             self.assertEqual(evaluation["inference"]["true_gff"], "/tmp/reference.gff")

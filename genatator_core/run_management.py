@@ -160,9 +160,9 @@ def build_evaluation_config(cfg: Dict[str, Any], *, task: str, run_dir: str | Pa
     # weights twice and can silently mix two different checkpoints.
     model_cfg["checkpoint_path"] = None
     dataset_cfg = copy.deepcopy(cfg["eval_dataset"])
-    training_cfg = cfg["training"]
-    requested = copy.deepcopy(cfg.get("evaluation") or {})
-    true_gff = cfg.get("true_gff", requested.get("true_gff"))
+    # Training never uses reverse-complement augmentation. Generated inference
+    # configs expose the inference-only switches explicitly with project defaults.
+    true_gff = cfg.get("true_gff")
 
     # Every automatically generated evaluation is intentionally restricted to
     # the held-out human chromosome used by the project benchmark.
@@ -180,10 +180,10 @@ def build_evaluation_config(cfg: Dict[str, Any], *, task: str, run_dir: str | Pa
         dataset_cfg.pop(limiting_key, None)
 
     common = {
-        "device": requested.get("device", "cuda"),
+        "device": "cuda",
         "checkpoint_path": None,
-        "batch_size": int(requested.get("batch_size", training_cfg.get("per_device_eval_batch_size", 1))),
-        "use_reverse_complement": bool(requested.get("use_reverse_complement", True)),
+        "batch_size": 1,
+        "use_reverse_complement": True,
         "true_gff": true_gff,
     }
 
@@ -218,14 +218,15 @@ def build_evaluation_config(cfg: Dict[str, Any], *, task: str, run_dir: str | Pa
         dataset_cfg["full_transcript_chunks"] = True
         common.update(
             {
-                "use_cds_heuristic": bool(requested.get("use_cds_heuristic", True)),
-                "coordinate_mode": requested.get("coordinate_mode", "transcript"),
-                "empty_segment_policy": requested.get("empty_segment_policy", "error"),
+                "use_cds_heuristic": True,
+                "coordinate_mode": "transcript",
+                "empty_segment_policy": "error",
                 "output_gff": _absolute_output(run_dir, "segmentation_predictions.gff"),
                 "metrics_json": _absolute_output(run_dir, "segmentation_metrics.json"),
             }
         )
         return {
+            "task": task,
             "model": model_cfg,
             "dataset": dataset_cfg,
             "inference": common,
@@ -240,12 +241,13 @@ def build_evaluation_config(cfg: Dict[str, Any], *, task: str, run_dir: str | Pa
         dataset_cfg.pop("overlap", None)
         common.update(
             {
-                "threshold": float(requested.get("threshold", 0.5)),
+                "threshold": 0.5,
                 "output_tsv": _absolute_output(run_dir, "transcript_type_predictions.tsv"),
                 "metrics_json": _absolute_output(run_dir, "transcript_type_metrics.json"),
             }
         )
         return {
+            "task": task,
             "model": model_cfg,
             "dataset": dataset_cfg,
             "inference": common,

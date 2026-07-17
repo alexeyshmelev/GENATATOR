@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import math
@@ -131,17 +132,45 @@ def _nested_target_scalar_to_numpy(scalar: Any) -> np.ndarray:
     raise RuntimeError(f"Unsupported Arrow targets type: {outer.type}")
 
 
-def _read_parquet_block_row(parquet_path: str) -> Dict[str, Any]:
-    """Load one selected chromosome block into RAM.
+def _metadata_value_to_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8", errors="replace")
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("{"):
+            return dict(json.loads(text))
+        if "|" in text:
+            parts = text.split("|")
+            start = end = 0
+            if len(parts) > 6 and ":" in parts[6]:
+                start_s, end_s = parts[6].split(":", 1)
+                start, end = int(start_s), int(end_s)
+            return {
+                "transcript_id": parts[0] if len(parts) > 0 else "",
+                "gene_id": parts[1] if len(parts) > 1 else "",
+                "transcript_type": parts[2] if len(parts) > 2 else "",
+                "strand": parts[3] if len(parts) > 3 else "+",
+                "genome": parts[4] if len(parts) > 4 else "",
+                "chrom": parts[5] if len(parts) > 5 else "",
+                "start": start,
+                "end": end,
+                "chrom_length": end,
+            }
+    raise RuntimeError(f"Unsupported metadata value in finding parquet: {type(value)}")
 
-    Gene-finding smoke jobs traverse chromosome windows sequentially and retain only
-    the current selected parquet block. Rejected chromosomes are never loaded here.
-    """
+
+def _read_parquet_block_row(
+    parquet_path: str,
+    target_indices: Optional[Sequence[int]] = None,
+) -> Dict[str, Any]:
+    """Read one finding block directly into a plain Python/NumPy dictionary."""
     import pyarrow.parquet as pq
 
     table = pq.read_table(
         str(parquet_path),
-        columns=["dna_sequence", "targets"],
+        columns=["dna_sequence", "targets", "metadata"],
         memory_map=True,
         use_threads=False,
     )
@@ -151,18 +180,17 @@ def _read_parquet_block_row(parquet_path: str) -> Dict[str, Any]:
             f"got {table.num_rows}"
         )
     dna = str(table.column("dna_sequence")[0].as_py()).upper()
-    targets = _nested_target_scalar_to_numpy(table.column("targets")[0])
+    all_targets = _nested_target_scalar_to_numpy(table.column("targets")[0])
+    if target_indices is None:
+        targets = np.ascontiguousarray(all_targets, dtype=np.float32)
+    else:
+        targets = np.ascontiguousarray(all_targets[:, list(target_indices)], dtype=np.float32)
+    metadata = _metadata_value_to_dict(table.column("metadata")[0].as_py())
     if len(dna) != targets.shape[0]:
         raise RuntimeError(
             f"DNA/target length mismatch in {parquet_path}: dna={len(dna)} targets={targets.shape}"
         )
-    logger.info(
-        "[finding.parquet_block.ram] loaded selected block only path=%s length=%d target_channels=%d",
-        parquet_path,
-        len(dna),
-        targets.shape[1],
-    )
-    return {"dna_sequence": dna, "targets": targets}
+    return {"dna_sequence": dna, "targets": targets, "metadata": metadata}
 
 
 @dataclass(frozen=True)
@@ -406,55 +434,66 @@ def _repo_parquet_files(repo_id: str, cfg: Dict[str, Any]) -> List[str]:
     from huggingface_hub import HfApi
 
     config_name = cfg.get("config_name")
+    split = str(cfg.get("split", "train")).strip("/")
     data_files = cfg.get("data_files")
     if data_files:
-        files = data_files.get(cfg.get("split", "train"), data_files) if isinstance(data_files, dict) else data_files
+        files = data_files.get(split, data_files) if isinstance(data_files, dict) else data_files
         if isinstance(files, str):
             return [files]
         return list(files)
-    if not config_name:
-        raise RuntimeError(
-            "Remote direct parquet loading requires config_name for the segmentation dataset, "
-            "for example train-human, train-multi-specie, or val-human."
-        )
-    config_prefix = str(config_name).strip("/") + "/"
-    split = str(cfg.get("split", "train")).strip("/")
-    split_prefix = f"{config_prefix}{split}/"
-    files = HfApi().list_repo_files(
-        repo_id=repo_id,
-        repo_type="dataset",
-        revision=cfg.get("revision"),
-    )
-    parquet_files = sorted(
-        f for f in files if f.startswith(split_prefix) and f.endswith(".parquet")
-    )
-    if not parquet_files:
-        # Backward compatibility for the earlier config/data.parquet layout.
+
+    from filelock import FileLock
+
+    cache_root = Path(
+        cfg.get("finding_index_cache_dir")
+        or os.environ.get("GENATATOR_CACHE_DIR")
+        or (Path.home() / ".cache" / "genatator")
+    ).expanduser().resolve() / "repo_manifests"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    manifest_key = hashlib.sha256(
+        f"{repo_id}|{cfg.get('revision', '')}".encode("utf-8")
+    ).hexdigest()
+    manifest_path = cache_root / f"{manifest_key}.json"
+    with FileLock(str(manifest_path) + ".lock"):
+        if manifest_path.exists():
+            files = list(json.loads(manifest_path.read_text(encoding="utf-8"))["files"])
+        else:
+            files = list(
+                HfApi().list_repo_files(
+                    repo_id=repo_id,
+                    repo_type="dataset",
+                    revision=cfg.get("revision"),
+                )
+            )
+            temporary = manifest_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps({"files": files}), encoding="utf-8")
+            os.replace(temporary, manifest_path)
+    if config_name:
+        config_prefix = str(config_name).strip("/") + "/"
+        prefixes = [f"{config_prefix}{split}/", config_prefix]
+    else:
+        # Gene-finding repository layout: data/train, data/validation, data/test.
+        prefixes = [f"data/{split}/", f"{split}/"]
+
+    for prefix in prefixes:
         parquet_files = sorted(
             f for f in files
-            if f.startswith(config_prefix)
-            and f.endswith(".parquet")
-            and "/" not in f[len(config_prefix):]
+            if f.startswith(prefix) and f.endswith(".parquet")
+            and (prefix.endswith(f"{split}/") or "/" not in f[len(prefix):])
         )
         if parquet_files:
-            logger.warning(
-                "[direct_parquet.legacy_layout] repo=%s expected_prefix=%s using_prefix=%s",
-                repo_id,
-                split_prefix,
-                config_prefix,
-            )
-    if not parquet_files:
-        raise RuntimeError(
-            f"No parquet files found in repo={repo_id} config={config_name} split={split} "
-            f"expected_prefix={split_prefix}"
-        )
-    return parquet_files
+            return parquet_files
+    raise RuntimeError(
+        f"No parquet files found in repo={repo_id} config={config_name} split={split}; "
+        f"searched prefixes={prefixes}"
+    )
 
 
 def _local_parquet_files(path: Path, cfg: Dict[str, Any]) -> List[Path]:
     data_files = cfg.get("data_files")
+    split = str(cfg.get("split", "train"))
     if data_files:
-        files = data_files.get(cfg.get("split", "train"), data_files) if isinstance(data_files, dict) else data_files
+        files = data_files.get(split, data_files) if isinstance(data_files, dict) else data_files
         if isinstance(files, str):
             files = [files]
         return [Path(f).expanduser().resolve() for f in files]
@@ -462,35 +501,62 @@ def _local_parquet_files(path: Path, cfg: Dict[str, Any]) -> List[Path]:
         return [path.resolve()]
     if path.is_dir():
         config_name = cfg.get("config_name")
-        split = str(cfg.get("split", "train"))
-        if config_name and (path / str(config_name) / split).exists():
-            return sorted((path / str(config_name) / split).rglob("*.parquet"))
-        if config_name and (path / str(config_name)).exists():
-            # Backward compatibility for config/data.parquet. Do not recursively
-            # mix multiple split directories.
-            return sorted((path / str(config_name)).glob("*.parquet"))
+        candidates = []
+        if config_name:
+            candidates.extend([path / str(config_name) / split, path / str(config_name)])
+        else:
+            candidates.extend([path / "data" / split, path / split])
+        for root in candidates:
+            if root.exists():
+                files = sorted(root.rglob("*.parquet"))
+                if files:
+                    return files
         return sorted(path.rglob("*.parquet"))
     return []
 
 
 def _download_or_reuse_hf_parquets(repo_id: str, filenames: List[str], cfg: Dict[str, Any]) -> List[Path]:
+    """Resolve one shared local file manifest so DDP ranks do not repeat 20k Hub calls."""
+    from filelock import FileLock
     from huggingface_hub import hf_hub_download
 
+    cache_root = Path(
+        cfg.get("finding_index_cache_dir")
+        or os.environ.get("GENATATOR_CACHE_DIR")
+        or (Path.home() / ".cache" / "genatator")
+    ).expanduser().resolve() / "download_manifests"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256()
+    digest.update(repo_id.encode())
+    digest.update(str(cfg.get("revision", "")).encode())
+    for filename in filenames:
+        digest.update(filename.encode())
+    manifest = cache_root / f"{digest.hexdigest()}.json"
+    lock = FileLock(str(manifest) + ".lock")
     local_only = bool(cfg.get("local_files_only", False) or cfg.get("hf_local_files_only", False))
-    paths: List[Path] = []
-    for fn in tqdm(filenames, desc=f"download/reuse {repo_id} parquet files", unit="file"):
-        kwargs = dict(
-            repo_id=repo_id,
-            repo_type="dataset",
-            filename=fn,
-            local_files_only=local_only,
-        )
-        for key in ("revision", "cache_dir", "token"):
-            if cfg.get(key) is not None:
-                kwargs[key] = cfg[key]
-        path = hf_hub_download(**kwargs)
-        paths.append(Path(path).resolve())
-    return paths
+
+    with lock:
+        if manifest.exists():
+            paths = [Path(value).expanduser().resolve() for value in json.loads(manifest.read_text())["paths"]]
+            if len(paths) == len(filenames) and all(path.exists() for path in paths):
+                return paths
+
+        paths: List[Path] = []
+        for filename in tqdm(filenames, desc=f"download/reuse {repo_id} parquet files", unit="file"):
+            kwargs = {
+                "repo_id": repo_id,
+                "repo_type": "dataset",
+                "filename": filename,
+                "local_files_only": local_only,
+            }
+            for key in ("revision", "cache_dir", "token"):
+                if cfg.get(key) is not None:
+                    kwargs[key] = cfg[key]
+            paths.append(Path(hf_hub_download(**kwargs)).resolve())
+        temporary = manifest.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"paths": [str(path) for path in paths]}), encoding="utf-8")
+        os.replace(temporary, manifest)
+        return paths
 
 
 def _arrow_2d_scalar_to_numpy(scalar: Any, dtype=np.float32) -> np.ndarray:
@@ -625,6 +691,230 @@ def _load_segmentation_direct_parquet(cfg: Dict[str, Any]) -> MaterializedRows:
         )
         files = _download_or_reuse_hf_parquets(str(ref), filenames, cfg)
     return _direct_parquet_transcript_rows_from_files(files, cfg)
+
+
+def _finding_parquet_paths(cfg: Dict[str, Any]) -> List[Path]:
+    path = cfg["path"]
+    ref = local_or_remote(path)
+    if is_local(path):
+        files = _local_parquet_files(Path(ref).expanduser(), cfg)
+        if not files:
+            raise RuntimeError(f"No local finding parquet files found for {ref}")
+        return files
+    filenames = _repo_parquet_files(str(ref), cfg)
+    logger.info(
+        "[finding.direct.remote] repo=%s split=%s parquet_files=%d",
+        ref,
+        cfg.get("split", "train"),
+        len(filenames),
+    )
+    return _download_or_reuse_hf_parquets(str(ref), filenames, cfg)
+
+
+def _finding_index_cache_path(files: Sequence[Path], cfg: Dict[str, Any]) -> Path:
+    cache_root = Path(
+        cfg.get("finding_index_cache_dir")
+        or os.environ.get("GENATATOR_CACHE_DIR")
+        or (Path.home() / ".cache" / "genatator")
+    ).expanduser().resolve() / "finding_indexes"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256()
+    digest.update(str(cfg.get("path", "")).encode())
+    digest.update(str(cfg.get("split", "train")).encode())
+    digest.update(str(cfg.get("revision", "")).encode())
+    for file_path in files:
+        stat = file_path.stat()
+        digest.update(str(file_path).encode())
+        digest.update(str(stat.st_size).encode())
+        digest.update(str(stat.st_mtime_ns).encode())
+    return cache_root / f"{digest.hexdigest()}.json"
+
+
+def _scan_all_finding_block_metadata(files: Sequence[Path], cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Scan only metadata from each finding parquet and share the index across ranks."""
+    import pyarrow.parquet as pq
+    from filelock import FileLock
+
+    cache_path = _finding_index_cache_path(files, cfg)
+    lock = FileLock(str(cache_path) + ".lock")
+    with lock:
+        if cache_path.exists():
+            return list(json.loads(cache_path.read_text(encoding="utf-8"))["blocks"])
+        blocks: List[Dict[str, Any]] = []
+        for path in tqdm(files, desc="index finding parquet metadata", unit="file"):
+            parquet = pq.ParquetFile(str(path))
+            names = set(parquet.schema_arrow.names)
+            required = {"dna_sequence", "targets", "metadata"}
+            missing = sorted(required - names)
+            if missing:
+                raise RuntimeError(f"Finding parquet {path} is missing columns: {missing}")
+            columns = ["metadata"] + (["status"] if "status" in names else [])
+            table = parquet.read(columns=columns, use_threads=False)
+            if table.num_rows != 1:
+                raise RuntimeError(f"Expected one row in finding parquet {path}, got {table.num_rows}")
+            row = {
+                "parquet_path": str(path.resolve()),
+                "metadata": _metadata_value_to_dict(table.column("metadata")[0].as_py()),
+            }
+            if "status" in columns:
+                row["status"] = int(table.column("status")[0].as_py())
+            blocks.append(row)
+        temporary = cache_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"blocks": blocks}), encoding="utf-8")
+        os.replace(temporary, cache_path)
+        return blocks
+
+
+def load_finding_parquet_groups(cfg: Dict[str, Any]) -> Dict[Tuple[str, str], List[Dict[str, Any]]]:
+    """Build a lightweight block index without creating a Hugging Face Arrow dataset."""
+    files = _finding_parquet_paths(cfg)
+    blocks = _scan_all_finding_block_metadata(files, cfg)
+    genomes = {_norm_id(x) for x in (cfg.get("genomes") or [])}
+    chromosomes: set[str] = set()
+    for chromosome in cfg.get("chromosomes") or []:
+        chromosomes |= _chrom_aliases(chromosome)
+    statuses = cfg.get("statuses")
+    statuses = {int(x) for x in statuses} if statuses is not None else None
+    if statuses is not None and any("status" not in block for block in blocks):
+        raise RuntimeError("statuses filter was requested but one or more finding parquet files have no status column")
+    max_rows = int(cfg.get("max_rows")) if cfg.get("max_rows") else None
+
+    all_keys = set()
+    selected: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    selected_count = 0
+    for block in blocks:
+        meta = parse_metadata(block["metadata"])
+        key = (meta.genome, meta.chrom)
+        all_keys.add(key)
+        if not _matches_any(meta.genome, genomes):
+            continue
+        if not _matches_any(meta.chrom, chromosomes, is_chrom=True):
+            continue
+        if statuses is not None:
+            if "status" not in block or int(block["status"]) not in statuses:
+                continue
+        selected.setdefault(key, []).append(block)
+        selected_count += 1
+        if max_rows is not None and selected_count >= max_rows:
+            break
+    if not selected:
+        raise RuntimeError(
+            "Direct finding parquet loader selected zero blocks. "
+            f"genomes={cfg.get('genomes')} chromosomes={cfg.get('chromosomes')} statuses={cfg.get('statuses')}"
+        )
+    for key in selected:
+        selected[key].sort(key=lambda item: parse_metadata(item["metadata"]).start)
+    logger.info(
+        "[finding.direct.index] available_chromosomes=%d selected_chromosomes=%d selected_blocks=%d keys=%s",
+        len(all_keys),
+        len(selected),
+        selected_count,
+        [f"{genome}|{chrom}" for genome, chrom in sorted(selected)],
+    )
+    return selected
+
+
+class FindingChromosomeStore:
+    """Keep parquet descriptors for every chromosome and one assembled chromosome in RAM."""
+
+    def __init__(self, groups: Dict[Tuple[str, str], List[Dict[str, Any]]], target_indices: Sequence[int]):
+        self.groups = groups
+        self.target_indices = list(target_indices)
+        self.spans: Dict[Tuple[str, str], Tuple[int, int, int]] = {}
+        for key, blocks in groups.items():
+            metas = [parse_metadata(block["metadata"]) for block in blocks]
+            start = min(meta.start for meta in metas)
+            end = max(meta.end for meta in metas)
+            chrom_length = max([meta.chrom_length for meta in metas] + [end])
+            self.spans[key] = (start, end, chrom_length)
+        self._cache_key: Optional[Tuple[str, str]] = None
+        self._cache: Optional[Dict[str, Any]] = None
+
+    def keys(self) -> List[Tuple[str, str]]:
+        return sorted(self.groups)
+
+    def span(self, key: Tuple[str, str]) -> Tuple[int, int, int]:
+        return self.spans[key]
+
+    def release(self) -> None:
+        self._cache_key = None
+        self._cache = None
+
+    def _assemble(self, key: Tuple[str, str]) -> Dict[str, Any]:
+        if self._cache_key == key and self._cache is not None:
+            return self._cache
+        self.release()
+        blocks = self.groups[key]
+        start, end, chrom_length = self.spans[key]
+        length = end - start
+        sequence_buffer = bytearray(length)
+        targets = np.empty((length, len(self.target_indices)), dtype=np.float32)
+        expected_start = start
+        for descriptor in blocks:
+            expected_meta = parse_metadata(descriptor["metadata"])
+            if expected_meta.start != expected_start:
+                relation = "overlap" if expected_meta.start < expected_start else "gap"
+                raise RuntimeError(
+                    f"Finding chromosome blocks contain a {relation} for {key}: "
+                    f"expected_start={expected_start} block_start={expected_meta.start}"
+                )
+            block = _read_parquet_block_row(descriptor["parquet_path"], self.target_indices)
+            actual_meta = parse_metadata(block["metadata"])
+            if (actual_meta.genome, actual_meta.chrom, actual_meta.start, actual_meta.end) != (
+                expected_meta.genome, expected_meta.chrom, expected_meta.start, expected_meta.end
+            ):
+                raise RuntimeError(f"Finding parquet metadata changed after indexing: {descriptor['parquet_path']}")
+            block_length = actual_meta.end - actual_meta.start
+            if block_length != len(block["dna_sequence"]):
+                raise RuntimeError(
+                    f"Finding block metadata length mismatch in {descriptor['parquet_path']}: "
+                    f"metadata={block_length} sequence={len(block['dna_sequence'])}"
+                )
+            offset = actual_meta.start - start
+            stop = offset + block_length
+            sequence_buffer[offset:stop] = block["dna_sequence"].encode("ascii")
+            targets[offset:stop] = block["targets"]
+            expected_start = actual_meta.end
+            del block
+        if expected_start != end:
+            raise RuntimeError(f"Finding chromosome assembly ended at {expected_start}, expected {end} for {key}")
+        assembled = {
+            "dna_sequence": sequence_buffer.decode("ascii"),
+            "targets": targets,
+            "metadata": {
+                "genome": key[0],
+                "chrom": key[1],
+                "start": start,
+                "end": end,
+                "chrom_length": chrom_length,
+                "strand": "+",
+            },
+        }
+        self._cache_key = key
+        self._cache = assembled
+        logger.info(
+            "[finding.direct.assembly] genome=%s chrom=%s blocks=%d length=%d target_shape=%s; only this chromosome is cached",
+            key[0], key[1], len(blocks), length, targets.shape,
+        )
+        return assembled
+
+    def get_slice(self, key: Tuple[str, str], rel_start: int, rel_end: int) -> Tuple[str, np.ndarray, ParsedMetadata, int]:
+        chromosome = self._assemble(key)
+        start, end, chrom_length = self.spans[key]
+        if rel_start < 0 or rel_end > end - start or rel_end <= rel_start:
+            raise RuntimeError(f"Invalid finding window [{rel_start}, {rel_end}) for {key}")
+        absolute_start = start + rel_start
+        absolute_end = start + rel_end
+        metadata = ParsedMetadata(
+            genome=key[0], chrom=key[1], start=absolute_start, end=absolute_end,
+            chrom_length=chrom_length, strand="+",
+        )
+        return (
+            chromosome["dna_sequence"][rel_start:rel_end],
+            chromosome["targets"][rel_start:rel_end],
+            metadata,
+            0,
+        )
 
 def load_dataset_auto(cfg: Dict[str, Any]) -> HFDataset:
     path = cfg["path"]
@@ -1052,42 +1342,57 @@ class GenatatorDataset(torch.utils.data.Dataset):
         self.model_family = str(cfg.get("model_family", "bpe"))
         self.max_nucleotides = int(cfg["_resolved_max_nucleotides"])
         self.max_tokens = int(cfg["_resolved_max_tokens"])
-        self.raw = load_dataset_auto(cfg)
-        self.row_indices = filter_row_indices(self.raw, cfg)
         self.tokenizer = tokenizer
         self.nucleotide_tokenizer = nucleotide_tokenizer or tokenizer
         self.for_inference = for_inference
         self.is_train = is_train
         self.overlap = float(cfg.get("overlap", 0.5)) if task.startswith("finding") else 0.0
         self.target_indices = channel_indices(task, cfg)
-        _log_selected_dataset_stats(task, cfg, self.raw, self.row_indices, self.target_indices)
-        # The training pipeline always materializes the requested split/chromosome/filter
-        # into CPU RAM before window generation. For gene-finding parquet indexes this
-        # loads only selected chromosome blocks, never rejected chromosomes.
-        self.raw = _preload_selected_rows_to_ram(task, self.raw, self.row_indices, self.target_indices)
-        self.row_indices = list(range(len(self.raw)))
-        if task.startswith("finding"):
-            # Targets in RAM have already been sliced to the requested target group.
-            self.target_indices = list(range(len(channel_indices(task, cfg))))
         self.crop_margin = int(cfg.get("crop_margin", 500))
         self.random_crop = bool(cfg.get("random_crop", False))
-        self.reverse_complement = bool(cfg.get("reverse_complement", False))
+        requested_rc = bool(cfg.get("reverse_complement", False))
+        if requested_rc and not for_inference:
+            raise RuntimeError("reverse_complement is inference-only and must not be set in training/evaluation datasets")
+        self.reverse_complement = requested_rc if for_inference else False
         self.full_transcript_chunks = bool(cfg.get("full_transcript_chunks", False))
         if self.full_transcript_chunks and (not self.for_inference or self.task != "segmentation"):
             raise RuntimeError("full_transcript_chunks is supported only for standalone segmentation inference")
         self.prewindowed = bool(cfg.get("prewindowed", False))
         self.windows: List[Any] = []
-        if task.startswith("finding"):
-            if self.prewindowed:
+        self.finding_window_groups: Dict[Tuple[str, str], List[int]] = {}
+        self.finding_store: Optional[FindingChromosomeStore] = None
+
+        if task.startswith("finding") and not self.prewindowed:
+            groups = load_finding_parquet_groups(cfg)
+            self.finding_store = FindingChromosomeStore(groups, self.target_indices)
+            self.target_indices = list(range(len(self.target_indices)))
+            self.raw = None
+            self.row_indices: List[int] = []
+            self._build_finding_windows()
+        else:
+            self.raw = load_dataset_auto(cfg)
+            self.row_indices = filter_row_indices(self.raw, cfg)
+            _log_selected_dataset_stats(task, cfg, self.raw, self.row_indices, self.target_indices)
+            self.raw = _preload_selected_rows_to_ram(task, self.raw, self.row_indices, self.target_indices)
+            self.row_indices = list(range(len(self.raw)))
+            if task.startswith("finding"):
+                self.target_indices = list(range(len(channel_indices(task, cfg))))
+            if task.startswith("finding"):
                 self._build_prewindowed_finding_indices()
             else:
-                self._build_finding_windows()
-        else:
-            self._build_transcript_indices()
+                self._build_transcript_indices()
+
         max_windows = cfg.get("max_windows")
         if max_windows:
             self.windows = self.windows[: int(max_windows)]
-        logger.info("[dataset] task=%s family=%s windows=%d max_nt=%d max_tokens=%d overlap=%.3f random_crop=%s full_transcript_chunks=%s rc=%s is_train=%s", task, self.model_family, len(self.windows), self.max_nucleotides, self.max_tokens, self.overlap, self.random_crop, self.full_transcript_chunks, self.reverse_complement, self.is_train)
+            if task.startswith("finding") and self.finding_store is not None:
+                self._reindex_finding_window_groups()
+        logger.info(
+            "[dataset] task=%s family=%s windows=%d max_nt=%d max_tokens=%d overlap=%.3f "
+            "random_crop=%s full_transcript_chunks=%s rc=%s is_train=%s",
+            task, self.model_family, len(self.windows), self.max_nucleotides, self.max_tokens,
+            self.overlap, self.random_crop, self.full_transcript_chunks, self.reverse_complement, self.is_train,
+        )
 
     def _build_prewindowed_finding_indices(self) -> None:
         self.windows = list(self.row_indices)
@@ -1110,7 +1415,24 @@ class GenatatorDataset(torch.utils.data.Dataset):
             dict(sorted(by_source_block.items())),
         )
 
+    def _reindex_finding_window_groups(self) -> None:
+        self.finding_window_groups = {}
+        for window_index, window in enumerate(self.windows):
+            key = window[0]
+            self.finding_window_groups.setdefault(key, []).append(window_index)
+
     def _build_finding_windows(self) -> None:
+        if self.finding_store is not None:
+            for key in self.finding_store.keys():
+                start, end, _ = self.finding_store.span(key)
+                for window_start, window_end in make_windows(end - start, self.max_nucleotides, self.overlap):
+                    self.windows.append((key, window_start, window_end))
+            self._reindex_finding_window_groups()
+            logger.info(
+                "[finding.direct.windows] chromosomes=%d windows=%d overlap=%.3f",
+                len(self.finding_window_groups), len(self.windows), self.overlap,
+            )
+            return
         grouped: Dict[Tuple[str, str], List[Tuple[int, ParsedMetadata]]] = {}
         for row_i in self.row_indices:
             meta = parse_metadata(self.raw["metadata"][row_i])
@@ -1118,8 +1440,13 @@ class GenatatorDataset(torch.utils.data.Dataset):
             grouped.setdefault(key, []).append((row_i, meta))
         self.assemblies = {k: ChromosomeAssembly(k, rows, self.raw) for k, rows in grouped.items()}
         for key, assembly in self.assemblies.items():
-            for s, e in make_windows(assembly.length, self.max_nucleotides, self.overlap):
-                self.windows.append((key, s, e))
+            for window_start, window_end in make_windows(assembly.length, self.max_nucleotides, self.overlap):
+                self.windows.append((key, window_start, window_end))
+        self._reindex_finding_window_groups()
+
+    def release_finding_cache(self) -> None:
+        if self.finding_store is not None:
+            self.finding_store.release()
 
     def _bpe_full_transcript_chunk_bounds(self, dna: str) -> List[Tuple[int, int]]:
         if not getattr(self.tokenizer, "is_fast", False):
@@ -1211,6 +1538,8 @@ class GenatatorDataset(torch.utils.data.Dataset):
                 )
             return seq, labels, meta, 0
         key, s, e = self.windows[idx]
+        if self.finding_store is not None:
+            return self.finding_store.get_slice(key, s, e)
         return self.assemblies[key].get_slice(s, e, self.target_indices)
 
     def _crop_transcript(self, seq_len: int) -> Tuple[int, int]:

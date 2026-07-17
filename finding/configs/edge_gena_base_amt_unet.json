@@ -40,9 +40,6 @@
     "average_bpe_token_length": 9.0
   },
   "true_gff": null,
-  "evaluation": {
-    "use_reverse_complement": true
-  },
   "training": {
     "output_dir": "runs/finding_edge_gena_base_amt_unet",
     "custom_prefix": "",
@@ -62,7 +59,7 @@
     "load_best_model_at_end": true,
     "metric_for_best_model": "loss",
     "greater_is_better": false,
-    "dataloader_num_workers": 16,
+    "dataloader_num_workers": 0,
     "bf16": true,
     "fp16": false,
     "resume_from_checkpoint": null,
@@ -71,5 +68,6 @@
     "eval_interval": 1000,
     "save_interval": 1000,
     "eval_accumulation_steps": 1
-  }
+  },
+  "task": "finding_edge"
 }

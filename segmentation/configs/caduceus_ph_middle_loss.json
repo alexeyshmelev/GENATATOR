@@ -43,9 +43,6 @@
     "random_crop": true
   },
   "true_gff": null,
-  "evaluation": {
-    "use_reverse_complement": true
-  },
   "training": {
     "output_dir": "runs/segmentation_caduceus_ph_middle_loss",
     "custom_prefix": "",
@@ -74,5 +71,6 @@
     "eval_interval": 1000,
     "save_interval": 1000,
     "eval_accumulation_steps": 1
-  }
+  },
+  "task": "segmentation"
 }

@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, SequentialSampler
+from torch.utils.data import DataLoader, Sampler, SequentialSampler
 from tqdm.auto import tqdm
 from transformers import Trainer, TrainingArguments
 
@@ -39,6 +39,44 @@ from .torch_compat import allow_transformers_torch_load_on_legacy_torch
 from .utils import set_seed
 
 logger = logging.getLogger(__name__)
+
+
+class FindingWindowSampler(Sampler[int]):
+    """Chromosome-grouped global order with unique, equal GPU lanes.
+
+    Transformers/Accelerate shards the returned global batch order across ranks.
+    We pre-interleave equal, non-overlapping rank lanes so every rank receives a
+    chromosome-grouped sequence and no overlap window is repeated.
+    """
+
+    def __init__(self, dataset: GenatatorDataset, seed: int = 42):
+        self.dataset = dataset
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __len__(self) -> int:
+        world = max(1, int(os.environ.get("WORLD_SIZE", "1")))
+        return (len(self.dataset) // world) * world
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        groups = [list(indices) for _, indices in sorted(self.dataset.finding_window_groups.items())]
+        rng.shuffle(groups)
+        for group in groups:
+            rng.shuffle(group)
+        ordered = [index for group in groups for index in group]
+        world = max(1, int(os.environ.get("WORLD_SIZE", "1")))
+        usable = (len(ordered) // world) * world
+        ordered = ordered[:usable]
+        if world == 1:
+            return iter(ordered)
+        per_rank = usable // world
+        lanes = [ordered[rank * per_rank:(rank + 1) * per_rank] for rank in range(world)]
+        interleaved = [lanes[rank][offset] for offset in range(per_rank) for rank in range(world)]
+        return iter(interleaved)
 
 
 class GenatatorTrainer(Trainer):
@@ -218,12 +256,14 @@ class GenatatorTrainer(Trainer):
         dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
         if dataset is None:
             return {}
+        if hasattr(self.train_dataset, "release_finding_cache"):
+            self.train_dataset.release_finding_cache()
         dataloader = DataLoader(
             dataset,
             sampler=SequentialSampler(dataset),
-            batch_size=int(self.args.per_device_eval_batch_size),
+            batch_size=1,
             collate_fn=self.data_collator,
-            num_workers=int(self.args.dataloader_num_workers),
+            num_workers=0 if self.genatator_task.startswith("finding") else int(self.args.dataloader_num_workers),
             pin_memory=bool(self.args.dataloader_pin_memory),
         )
         model = self.accelerator.unwrap_model(self.model) if hasattr(self, "accelerator") else self.model
@@ -247,6 +287,8 @@ class GenatatorTrainer(Trainer):
         pbar.close()
         metrics = self._finalize_streaming_state(state, metric_key_prefix)
         metrics[f"{metric_key_prefix}_samples"] = float(len(dataset)) if hasattr(dataset, "__len__") else 0.0
+        if hasattr(dataset, "release_finding_cache"):
+            dataset.release_finding_cache()
         return metrics
 
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix: str = "eval"):
@@ -292,8 +334,14 @@ class GenatatorTrainer(Trainer):
         return metrics
 
     def _get_train_sampler(self, *args, **kwargs):
+        dataset = args[0] if args else kwargs.get("train_dataset", self.train_dataset)
+        if self.genatator_task.startswith("finding") and getattr(dataset, "finding_window_groups", None):
+            logger.info(
+                "[training.sampler] chromosome-grouped finding sampler enabled; "
+                "overlapping windows are uniquely sharded without GPU duplication"
+            )
+            return FindingWindowSampler(dataset, seed=int(self.args.seed))
         if self.sequential_train:
-            dataset = args[0] if args else kwargs.get("train_dataset", self.train_dataset)
             logger.info(
                 "[training.sampler] SequentialSampler enabled; every selected sample/window "
                 "is visited once per epoch in dataset order"
@@ -387,8 +435,20 @@ def validate_rules(cfg: Dict[str, Any], task: str) -> None:
     tr = cfg["training"]
     train_bs = int(tr.get("per_device_train_batch_size", 1))
     eval_bs = int(tr.get("per_device_eval_batch_size", 1))
-    if train_bs <= 0 or eval_bs <= 0:
-        raise RuntimeError("per-device train/eval batch sizes must be positive")
+    if train_bs != 1 or eval_bs != 1:
+        raise RuntimeError(
+            "GENATATOR requires per_device_train_batch_size=1 and per_device_eval_batch_size=1 for every task/model"
+        )
+    configured_task = str(cfg.get("task", task))
+    if configured_task != task:
+        raise RuntimeError(f"Config task={configured_task!r} does not match requested task={task!r}")
+    for dataset_name in ("train_dataset", "eval_dataset"):
+        if "reverse_complement" in cfg[dataset_name]:
+            raise RuntimeError(
+                f"{dataset_name}.reverse_complement is forbidden: reverse-complement averaging is inference-only"
+            )
+    if "evaluation" in cfg and "use_reverse_complement" in (cfg.get("evaluation") or {}):
+        raise RuntimeError("Training configs must not contain reverse-complement options; they are generated for inference")
     if family == "caduceus":
         # This project always trains Caduceus with untied bidirectional weights.
         model_cfg["bidirectional_weight_tie"] = False
@@ -428,13 +488,20 @@ def validate_rules(cfg: Dict[str, Any], task: str) -> None:
     )
 
 
-def train_from_config(config_path: str, task: str) -> None:
+def train_from_config(config_path: str, task: str | None = None) -> None:
     # Keep routine training output limited to the Trainer/TQDM progress bar.
     # Warnings and errors remain visible, while per-module INFO diagnostics are
     # suppressed during training.
     logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.WARNING)
     logging.getLogger().setLevel(logging.WARNING)
     cfg = load_json(config_path)
+    configured_task = str(cfg.get("task", ""))
+    if task is None:
+        task = configured_task
+    if task not in {"finding_edge", "finding_region", "segmentation", "transcript_type"}:
+        raise RuntimeError(
+            "Training config must set task to finding_edge, finding_region, segmentation, or transcript_type"
+        )
     validate_rules(cfg, task)
     set_seed(int(cfg.get("seed", 42)))
     tr = cfg["training"]
@@ -518,8 +585,8 @@ def train_from_config(config_path: str, task: str) -> None:
         overwrite_output_dir=False,
         max_steps=int(tr.get("max_steps", -1)),
         num_train_epochs=float(tr.get("num_train_epochs", 1.0)),
-        per_device_train_batch_size=int(tr.get("per_device_train_batch_size", 1)),
-        per_device_eval_batch_size=int(tr.get("per_device_eval_batch_size", 1)),
+        per_device_train_batch_size=1,
+        per_device_eval_batch_size=1,
         # Critical for long nucleotide-level validation. Transformers otherwise
         # keeps all prediction/label tensors on the GPU until the whole eval
         # loop finishes; for transcript/chromosome tasks this can require tens
@@ -546,7 +613,8 @@ def train_from_config(config_path: str, task: str) -> None:
         report_to=tr.get("report_to", "tensorboard"),
         logging_dir=str(output_dir / "tensorboard"),
         disable_tqdm=False,
-        dataloader_num_workers=int(tr.get("dataloader_num_workers", 4)),
+        dataloader_num_workers=0 if task.startswith("finding") else int(tr.get("dataloader_num_workers", 4)),
+        dataloader_drop_last=bool(task.startswith("finding")),
         bf16=bool(tr.get("bf16", False)),
         fp16=bool(tr.get("fp16", False)),
         remove_unused_columns=False,

@@ -25,7 +25,7 @@
     },
     "inference": {
       "checkpoint_path": null,
-      "batch_size": 2
+      "batch_size": 1
     }
   },
   "region": {
@@ -54,7 +54,7 @@
     },
     "inference": {
       "checkpoint_path": null,
-      "batch_size": 2
+      "batch_size": 1
     }
   },
   "postprocess": {
@@ -74,6 +74,8 @@
     "output_gff": "finding_predictions.gff",
     "true_gff": null,
     "metrics_json": "finding_metrics.json",
-    "empty_gff_policy": "error"
-  }
+    "empty_gff_policy": "error",
+    "batch_size": 1
+  },
+  "task": "finding"
 }

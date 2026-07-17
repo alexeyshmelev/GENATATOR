@@ -28,11 +28,12 @@
   "inference": {
     "device": "cuda",
     "checkpoint_path": null,
-    "batch_size": 2,
+    "batch_size": 1,
     "use_reverse_complement": true,
     "threshold": 0.5,
     "output_tsv": "transcript_type_predictions.tsv",
     "true_gff": null,
     "metrics_json": "transcript_type_metrics.json"
-  }
+  },
+  "task": "transcript_type"
 }

@@ -186,7 +186,10 @@ def _predict_once(cfg: Dict[str, Any], task: str, device: str, reverse_complemen
     data_cfg["model_family"] = dataset_family_from_model(cfg["model"])
     data_cfg["reverse_complement"] = reverse_complement
     dataset = GenatatorDataset(data_cfg, task=task, tokenizer=tokenizer, nucleotide_tokenizer=nucleotide_tokenizer, for_inference=True)
-    loader = DataLoader(dataset, batch_size=int(cfg.get("inference", {}).get("batch_size", 1)), collate_fn=GenatatorCollator())
+    configured_batch_size = int(cfg.get("inference", {}).get("batch_size", 1))
+    if configured_batch_size != 1:
+        raise RuntimeError("GENATATOR inference batch_size must be 1 for every task/model")
+    loader = DataLoader(dataset, batch_size=1, collate_fn=GenatatorCollator())
     rows = []
     with torch.no_grad():
         for batch in tqdm(loader, desc=f"infer:{task}:rc={reverse_complement}"):
@@ -237,7 +240,7 @@ def _predict_once(cfg: Dict[str, Any], task: str, device: str, reverse_complemen
 
 
 def predict_dataset_logits(cfg: Dict[str, Any], task: str, device: str = "cuda") -> List[Dict[str, Any]]:
-    use_rc = bool(cfg.get("inference", {}).get("use_reverse_complement", False))
+    use_rc = bool(cfg.get("inference", {}).get("use_reverse_complement", True))
     rows = _predict_once(copy.deepcopy(cfg), task, device, reverse_complement=False)
     if not use_rc:
         return rows

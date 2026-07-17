@@ -109,8 +109,8 @@ def smoke_training(
         "overwrite_output_dir": True,
         "max_steps": -1,
         "num_train_epochs": float(epochs),
-        "per_device_train_batch_size": int(batch_size),
-        "per_device_eval_batch_size": int(batch_size),
+        "per_device_train_batch_size": 1,
+        "per_device_eval_batch_size": 1,
         "gradient_accumulation_steps": 1,
         "learning_rate": float(learning_rate),
         "weight_decay": 0.0,
@@ -227,17 +227,17 @@ def make_finding_train_config(
             },
         }
     name = f"finding_{task}_{model_name}_{family}"
-    bs = 1 if family in {"unet", "rmt"} else 2
+    bs = 1
     dataset = finding_data(data_path, aliases, family, max_nt, max_tok)
     cfg = {
         "seed": 42,
+        "task": f"finding_{task}",
         "model": model_cfg(model_name, family, extra),
         # Smoke protocol: train and validation use the same
         # chromosome-selected test samples.
         "train_dataset": dataset,
         "eval_dataset": dict(dataset),
         "true_gff": None,
-        "evaluation": {"use_reverse_complement": True},
         "training": smoke_training(work / name, bs, SMOKE_EPOCHS, SMOKE_LR, f"finding_{task}"),
     }
     return write_json(work / "configs" / f"{name}.json", cfg)
@@ -252,7 +252,7 @@ def make_seg_train_config(
 ) -> Path:
     kind = MODELS[model_name]["kind"]
     if kind == "caduceus":
-        family, extra, max_nt, max_tok, bs = "caduceus", None, 512, 512, 2
+        family, extra, max_nt, max_tok, bs = "caduceus", None, 512, 512, 1
     else:
         family, max_nt, max_tok, bs = variant, 512, 64, 1
         if family == "unet":
@@ -295,11 +295,11 @@ def make_seg_train_config(
     )
     cfg = {
         "seed": 42,
+        "task": "segmentation",
         "model": model_cfg(model_name, family, extra),
         "train_dataset": dataset,
         "eval_dataset": dict(dataset),
         "true_gff": None,
-        "evaluation": {"use_reverse_complement": True},
         "training": smoke_training(work / name, bs, SMOKE_EPOCHS, SMOKE_LR, "segmentation"),
     }
     return write_json(work / "configs" / f"{name}.json", cfg)
@@ -315,16 +315,16 @@ def make_tt_train_config(
     family = "caduceus" if kind == "caduceus" else "plain"
     max_nt = 512
     max_tok = 512 if kind == "caduceus" else 64
-    bs = 2
+    bs = 1
     name = f"transcript_type_{model_name}_{family}"
     dataset = transcript_data(selection.selected_parquet_path, aliases, family, max_nt, max_tok)
     cfg = {
         "seed": 42,
+        "task": "transcript_type",
         "model": model_cfg(model_name, family),
         "train_dataset": dataset,
         "eval_dataset": dict(dataset),
         "true_gff": None,
-        "evaluation": {"use_reverse_complement": True},
         "training": smoke_training(work / name, bs, SMOKE_EPOCHS, SMOKE_LR, "transcript_type"),
     }
     return write_json(work / "configs" / f"{name}.json", cfg)
@@ -484,7 +484,7 @@ def build_jobs(
                         "name": f"train_finding_{task}_{model_name}_{variant}",
                         "kind": "train",
                         "output_dir": str(output_dir),
-                        "cmd": [sys.executable, "finding/train.py", "--task", task, "--config", str(cfg)],
+                        "cmd": [sys.executable, "finding/train.py", "--config", str(cfg)],
                         "deps": [],
                     }
                 )
