@@ -1,0 +1,15 @@
+config	partition	job_file	job_id	submitted_at	notes
+segmentation/configs/moderngena_base_rmt_unet.json	rnd/airi	segmentation/job_moderngena_base_rmt_unet_airi.sh	102275	2026-07-16T20:31:51+03:00	already running before shared batch
+segmentation/configs/caduceus_ph_middle_loss.json	rnd/shared	segmentation/jobs/job_caduceus_ph_middle_loss_shared.sh	102284	2026-07-16T20:32:24+03:00	submitted shared batch
+segmentation/configs/caduceus_ps_middle_loss.json	rnd/shared	segmentation/jobs/job_caduceus_ps_middle_loss_shared.sh	102285	2026-07-16T20:32:25+03:00	submitted shared batch
+segmentation/configs/gena_base_amt_unet.json	rnd/shared	segmentation/jobs/job_gena_base_amt_unet_shared.sh	102286	2026-07-16T20:32:25+03:00	submitted shared batch
+segmentation/configs/gena_base_rmt_unet.json	rnd/shared	segmentation/jobs/job_gena_base_rmt_unet_shared.sh	102287	2026-07-16T20:32:25+03:00	submitted shared batch
+segmentation/configs/gena_base_unet.json	rnd/shared	segmentation/jobs/job_gena_base_unet_shared.sh	102288	2026-07-16T20:32:25+03:00	submitted shared batch
+segmentation/configs/gena_large_amt_unet.json	rnd/shared	segmentation/jobs/job_gena_large_amt_unet_shared.sh	102289	2026-07-16T20:32:25+03:00	submitted shared batch
+segmentation/configs/gena_large_rmt_unet.json	rnd/shared	segmentation/jobs/job_gena_large_rmt_unet_shared.sh	102290	2026-07-16T20:32:25+03:00	submitted shared batch
+segmentation/configs/gena_large_unet.json	rnd/shared	segmentation/jobs/job_gena_large_unet_shared.sh	102292	2026-07-16T20:32:25+03:00	submitted shared batch
+segmentation/configs/moderngena_base_amt_unet.json	rnd/shared	segmentation/jobs/job_moderngena_base_amt_unet_shared.sh	102293	2026-07-16T20:32:25+03:00	submitted shared batch
+segmentation/configs/moderngena_base_unet.json	rnd/shared	segmentation/jobs/job_moderngena_base_unet_shared.sh	102295	2026-07-16T20:32:25+03:00	submitted shared batch
+segmentation/configs/moderngena_large_amt_unet.json	rnd/shared	segmentation/jobs/job_moderngena_large_amt_unet_shared.sh	102296	2026-07-16T20:32:26+03:00	submitted shared batch
+segmentation/configs/moderngena_large_rmt_unet.json	rnd/shared	segmentation/jobs/job_moderngena_large_rmt_unet_shared.sh	102297	2026-07-16T20:32:26+03:00	submitted shared batch
+segmentation/configs/moderngena_large_unet.json	rnd/shared	segmentation/jobs/job_moderngena_large_unet_shared.sh	102298	2026-07-16T20:32:26+03:00	submitted shared batch
