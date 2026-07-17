@@ -11,7 +11,7 @@
     "allow_unsafe_torch_load_with_torch_lt_2_6": true
   },
   "train_dataset": {
-    "path": "AIRI-Institute/genatator-gene-segmentation-dataset",
+    "path": "datasets/local_datasets/genatator-gene-segmentation-dataset",
     "config_name": "train-human",
     "split": "train",
     "genomes": [],
@@ -27,7 +27,7 @@
     "random_crop": true
   },
   "eval_dataset": {
-    "path": "AIRI-Institute/genatator-gene-segmentation-dataset",
+    "path": "datasets/local_datasets/genatator-gene-segmentation-dataset",
     "config_name": "val-human",
     "split": "validation",
     "genomes": [],
@@ -42,7 +42,7 @@
     "parquet_batch_size": 64,
     "random_crop": true
   },
-  "true_gff": null,
+  "true_gff": "datasets/chr20.gff",
   "training": {
     "output_dir": "runs/segmentation_caduceus_ph_middle_loss",
     "custom_prefix": "",

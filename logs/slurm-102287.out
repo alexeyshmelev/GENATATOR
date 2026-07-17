@@ -1,0 +1,462 @@
+Thu Jul 16 09:41:40 PM MSK 2026
+[2026-07-16 21:41:46,793] torch.distributed.run: [WARNING] 
+[2026-07-16 21:41:46,793] torch.distributed.run: [WARNING] *****************************************
+[2026-07-16 21:41:46,793] torch.distributed.run: [WARNING] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+[2026-07-16 21:41:46,793] torch.distributed.run: [WARNING] *****************************************
+Traceback (most recent call last):
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/utils/hub.py", line 479, in cached_files
+    hf_hub_download(
+Traceback (most recent call last):
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/utils/_validators.py", line 114, in _inner_fn
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/utils/hub.py", line 479, in cached_files
+    hf_hub_download(
+    return fn(*args, **kwargs)  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/utils/_validators.py", line 114, in _inner_fn
+
+    return fn(*args, **kwargs) 
+                   ^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^Traceback (most recent call last):
+^^
+^
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/file_download.py", line 1014, in hf_hub_download
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/utils/hub.py", line 479, in cached_files
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/file_download.py", line 1014, in hf_hub_download
+    hf_hub_download(
+        return _hf_hub_download_to_cache_dir(
+ return _hf_hub_download_to_cache_dir(
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/utils/_validators.py", line 114, in _inner_fn
+Traceback (most recent call last):
+           return fn(*args, **kwargs)
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/utils/hub.py", line 479, in cached_files
+               hf_hub_download(
+      ^^      File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/utils/_validators.py", line 114, in _inner_fn
+^^^^      ^^^^  return fn(*args, **kwargs)
+^^^^^^ ^^^^^^  ^^^^^^  ^^^^^^  ^^^^^^  ^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/file_download.py", line 1014, in hf_hub_download
+^^^^^^    Traceback (most recent call last):
+Traceback (most recent call last):
+Traceback (most recent call last):
+^^
+^^return _hf_hub_download_to_cache_dir(
+   File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/utils/hub.py", line 479, in cached_files
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/utils/hub.py", line 479, in cached_files
+^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/file_download.py", line 1121, in _hf_hub_download_to_cache_dir
+
+Traceback (most recent call last):
+        File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/utils/hub.py", line 479, in cached_files
+    ^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/file_download.py", line 1121, in _hf_hub_download_to_cache_dir
+      hf_hub_download(
+hf_hub_download(
+    ^^_raise_on_head_call_error(head_call_error, force_download, local_files_only)
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/utils/hub.py", line 479, in cached_files
+        File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/utils/_validators.py", line 114, in _inner_fn
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/utils/_validators.py", line 114, in _inner_fn
+hf_hub_download(
+^
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/file_download.py", line 1653, in _raise_on_head_call_error
+    _raise_on_head_call_error(head_call_error, force_download, local_files_only)
+            File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/utils/_validators.py", line 114, in _inner_fn
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/file_download.py", line 1014, in hf_hub_download
+hf_hub_download(
+      File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/file_download.py", line 1653, in _raise_on_head_call_error
+  return fn(*args, **kwargs)
+return fn(*args, **kwargs)
+        raise LocalEntryNotFoundError(
+huggingface_hub.errors^^  return fn(*args, **kwargs)
+return _hf_hub_download_to_cache_dir(
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/utils/_validators.py", line 114, in _inner_fn
+    raise LocalEntryNotFoundError(.LocalEntryNotFoundError^^          
+: Cannot find the requested files in the disk cache and outgoing traffic has been disabled. To enable hf.co look-ups and downloads online, set 'local_files_only' to False.^^        return fn(*args, **kwargs)
+huggingface_hub.errors
+
+^^         .LocalEntryNotFoundErrorThe above exception was the direct cause of the following exception:
+^^          : Cannot find the requested files in the disk cache and outgoing traffic has been disabled. To enable hf.co look-ups and downloads online, set 'local_files_only' to False.
+^^          
+
+Traceback (most recent call last):
+^^^^^^      The above exception was the direct cause of the following exception:
+  File "<frozen runpy>", line 198, in _run_module_as_main
+^^^^^^^^^^  
+  File "<frozen runpy>", line 88, in _run_code
+^^^^^^^^^^  Traceback (most recent call last):
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/segmentation/train.py", line 8, in <module>
+^^^^^^^^^^^^  File "<frozen runpy>", line 198, in _run_module_as_main
+    ^^^^^^^^^^^^  File "<frozen runpy>", line 88, in _run_code
+train_from_config(args.config, task="segmentation")
+^^^^^^^^^^^^  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/segmentation/train.py", line 8, in <module>
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/train_common.py", line 455, in train_from_config
+^^^^^^^^^^^^        ^^^^^^^^^^^^train_from_config(args.config, task="segmentation")
+tokenizer = make_tokenizer(model_cfg["tokenizer_path"], trust_remote_code=bool(model_cfg.get("trust_remote_code", True)))
+^^^^^^^^^^^^  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/train_common.py", line 455, in train_from_config
+ 
+^
+^
+^^^^^^        File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/file_download.py", line 1121, in _hf_hub_download_to_cache_dir
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/file_download.py", line 1014, in hf_hub_download
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/file_download.py", line 1014, in hf_hub_download
+^
+^^^^tokenizer = make_tokenizer(model_cfg["tokenizer_path"], trust_remote_code=bool(model_cfg.get("trust_remote_code", True)))
+                File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/file_download.py", line 1014, in hf_hub_download
+^^^^   _raise_on_head_call_error(head_call_error, force_download, local_files_only)
+return _hf_hub_download_to_cache_dir(
+return _hf_hub_download_to_cache_dir(
+    ^^^
+      File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/file_download.py", line 1653, in _raise_on_head_call_error
+   return _hf_hub_download_to_cache_dir(
+^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/file_download.py", line 1014, in hf_hub_download
+             ^^          raise LocalEntryNotFoundError(
+    ^^return _hf_hub_download_to_cache_dir(
+      huggingface_hub.errors    
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/file_download.py", line 1121, in _hf_hub_download_to_cache_dir
+   ^  .LocalEntryNotFoundError            ^^  : Cannot find the requested files in the disk cache and outgoing traffic has been disabled. To enable hf.co look-ups and downloads online, set 'local_files_only' to False. ^    _raise_on_head_call_error(head_call_error, force_download, local_files_only)
+  ^^^^
+
+^^      File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/file_download.py", line 1653, in _raise_on_head_call_error
+ ^^^^^The above exception was the direct cause of the following exception:
+^^^^      ^^^^^^
+^^^^  raise LocalEntryNotFoundError(
+^^^^^^Traceback (most recent call last):
+^^^^ ^huggingface_hub.errors^^^^^^  File "<frozen runpy>", line 198, in _run_module_as_main
+^^^^^^.LocalEntryNotFoundError^^^^^^  File "<frozen runpy>", line 88, in _run_code
+^^^^^^: Cannot find the requested files in the disk cache and outgoing traffic has been disabled. To enable hf.co look-ups and downloads online, set 'local_files_only' to False.^^^^^^  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/segmentation/train.py", line 8, in <module>
+^^^^^^
+
+^^^^^^    ^^^^^^The above exception was the direct cause of the following exception:
+^^^^^^train_from_config(args.config, task="segmentation")
+^^^^^^
+^^^^^^  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/train_common.py", line 455, in train_from_config
+^^^^^^Traceback (most recent call last):
+^^^^^^    ^^^^^^  File "<frozen runpy>", line 198, in _run_module_as_main
+^^^^^^tokenizer = make_tokenizer(model_cfg["tokenizer_path"], trust_remote_code=bool(model_cfg.get("trust_remote_code", True)))
+^^^^^^  File "<frozen runpy>", line 88, in _run_code
+^^^^^^ ^^^^^^  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/segmentation/train.py", line 8, in <module>
+^^^^^^  ^^^^^^    ^^^^^^  ^
+^^^^train_from_config(args.config, task="segmentation")
+^^^^
+    File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/file_download.py", line 1121, in _hf_hub_download_to_cache_dir
+^^^^  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/train_common.py", line 455, in train_from_config
+^^^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/file_download.py", line 1121, in _hf_hub_download_to_cache_dir
+      
+^^^^    ^^      _raise_on_head_call_error(head_call_error, force_download, local_files_only)
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/file_download.py", line 1121, in _hf_hub_download_to_cache_dir
+^^^^tokenizer = make_tokenizer(model_cfg["tokenizer_path"], trust_remote_code=bool(model_cfg.get("trust_remote_code", True)))
+^^_raise_on_head_call_error(head_call_error, force_download, local_files_only)
+    File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/file_download.py", line 1653, in _raise_on_head_call_error
+    ^
+^^ ^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/file_download.py", line 1653, in _raise_on_head_call_error
+  _raise_on_head_call_error(head_call_error, force_download, local_files_only)
+      File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/file_download.py", line 1121, in _hf_hub_download_to_cache_dir
+^^  ^^     ^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/file_download.py", line 1653, in _raise_on_head_call_error
+raise LocalEntryNotFoundError(
+    ^^  ^^raise LocalEntryNotFoundError(
+^^    huggingface_hub.errors._raise_on_head_call_error(head_call_error, force_download, local_files_only)
+^^  ^^huggingface_hub.errors^^raise LocalEntryNotFoundError(
+LocalEntryNotFoundError:   File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/huggingface_hub/file_download.py", line 1653, in _raise_on_head_call_error
+^^  ^^.LocalEntryNotFoundError^^huggingface_hub.errorsCannot find the requested files in the disk cache and outgoing traffic has been disabled. To enable hf.co look-ups and downloads online, set 'local_files_only' to False.
+    ^^  ^^: Cannot find the requested files in the disk cache and outgoing traffic has been disabled. To enable hf.co look-ups and downloads online, set 'local_files_only' to False.^^.LocalEntryNotFoundError
+raise LocalEntryNotFoundError(
+^^  ^^
+
+^^: Cannot find the requested files in the disk cache and outgoing traffic has been disabled. To enable hf.co look-ups and downloads online, set 'local_files_only' to False.The above exception was the direct cause of the following exception:
+huggingface_hub.errors^^  ^^The above exception was the direct cause of the following exception:
+^^
+
+
+.LocalEntryNotFoundError^^ ^^^
+^^The above exception was the direct cause of the following exception:
+Traceback (most recent call last):
+: Cannot find the requested files in the disk cache and outgoing traffic has been disabled. To enable hf.co look-ups and downloads online, set 'local_files_only' to False.^^^^^^Traceback (most recent call last):
+^^
+  File "<frozen runpy>", line 198, in _run_module_as_main
+
+
+^^^^^^  File "<frozen runpy>", line 198, in _run_module_as_main
+^^Traceback (most recent call last):
+  File "<frozen runpy>", line 88, in _run_code
+The above exception was the direct cause of the following exception:
+^^^^^^  File "<frozen runpy>", line 88, in _run_code
+^^  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/segmentation/train.py", line 8, in <module>
+
+^^^^^^  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/segmentation/train.py", line 8, in <module>
+^^  File "<frozen runpy>", line 88, in _run_code
+    Traceback (most recent call last):
+^^^^^^    ^^  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/segmentation/train.py", line 8, in <module>
+train_from_config(args.config, task="segmentation")
+  File "<frozen runpy>", line 198, in _run_module_as_main
+^^^^^^train_from_config(args.config, task="segmentation")
+^^      File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/train_common.py", line 455, in train_from_config
+  File "<frozen runpy>", line 88, in _run_code
+^^^^^^  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/train_common.py", line 455, in train_from_config
+^^train_from_config(args.config, task="segmentation")
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/segmentation/train.py", line 8, in <module>
+    ^^^^^^    ^^  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/train_common.py", line 455, in train_from_config
+    tokenizer = make_tokenizer(model_cfg["tokenizer_path"], trust_remote_code=bool(model_cfg.get("trust_remote_code", True)))
+^^^^^^tokenizer = make_tokenizer(model_cfg["tokenizer_path"], trust_remote_code=bool(model_cfg.get("trust_remote_code", True)))
+^^    train_from_config(args.config, task="segmentation")
+ ^^^^^^ ^^tokenizer = make_tokenizer(model_cfg["tokenizer_path"], trust_remote_code=bool(model_cfg.get("trust_remote_code", True)))
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/train_common.py", line 455, in train_from_config
+  ^^^^^^  ^^       ^^^^^^  ^^  tokenizer = make_tokenizer(model_cfg["tokenizer_path"], trust_remote_code=bool(model_cfg.get("trust_remote_code", True)))
+  ^^^^^^  ^^     ^^^^^^  ^^      ^^^^^^  ^^      ^^^^^^  ^^      ^^^^^^  ^^     ^^^^^^^ ^^^    ^^^^^^^^^^^^ ^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/data.py", line 1428, in make_tokenizer
+^^^^^^^^^^^^^^^^^^    ^^^^^^^^^^^^^^tok = AutoTokenizer.from_pretrained(local_or_remote(path_or_repo), trust_remote_code=trust_remote_code, use_fast=True)
+^^^^^^
+^^^^^^ ^^^^^^  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/data.py", line 1428, in make_tokenizer
+^^^^^^  ^^^^^^    ^^^^^^  ^^^^^^tok = AutoTokenizer.from_pretrained(local_or_remote(path_or_repo), trust_remote_code=trust_remote_code, use_fast=True)
+^^^^^^  ^^^^^^ ^^^^^^  ^^^^^^  ^^^^^^ ^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/data.py", line 1428, in make_tokenizer
+^^^^^^^^^^^^^^    ^^^^^^^^^^^^^^tok = AutoTokenizer.from_pretrained(local_or_remote(path_or_repo), trust_remote_code=trust_remote_code, use_fast=True)
+^^^^^^^^^^^^^^ ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/data.py", line 1428, in make_tokenizer
+^^  ^^^^^^^^^^    ^^  ^^^^^^^^^^tok = AutoTokenizer.from_pretrained(local_or_remote(path_or_repo), trust_remote_code=trust_remote_code, use_fast=True)
+^^ ^^^^^^^^^^^ ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/data.py", line 1428, in make_tokenizer
+^^^^
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/data.py", line 1428, in make_tokenizer
+^^^^^^^^    ^^^^    ^^^^
+^^tok = AutoTokenizer.from_pretrained(local_or_remote(path_or_repo), trust_remote_code=trust_remote_code, use_fast=True)
+^^^^tok = AutoTokenizer.from_pretrained(local_or_remote(path_or_repo), trust_remote_code=trust_remote_code, use_fast=True)
+^^^^  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/data.py", line 1428, in make_tokenizer
+^^ ^^^^ ^^^^    
+  ^^^^  ^^^^tok = AutoTokenizer.from_pretrained(local_or_remote(path_or_repo), trust_remote_code=trust_remote_code, use_fast=True)
+  File "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/genatator_core/data.py", line 1428, in make_tokenizer
+  ^^^^  ^^^^       ^^^^  ^^^^  tok = AutoTokenizer.from_pretrained(local_or_remote(path_or_repo), trust_remote_code=trust_remote_code, use_fast=True)
+  ^^^^  ^^^^    ^^^^^ ^^^^^    ^^^^^^^^^^^^    ^^^^^^^^^^^^ ^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/models/auto/tokenization_auto.py", line 1109, in from_pretrained
+^^^^^^^^^^^^^^    ^^^^^^^^^^^^^^config = AutoConfig.from_pretrained(
+^^^^^^^
+^^^^^^ ^^^^^^^^^^^^  ^^^^^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/models/auto/tokenization_auto.py", line 1109, in from_pretrained
+^^^^^^  ^^^^^^    ^^^^^^  ^^^^^^config = AutoConfig.from_pretrained(
+^^^^^^  ^^^^^^ ^^^^^^  ^^^^^^  ^^^^^^  ^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/models/auto/tokenization_auto.py", line 1109, in from_pretrained
+^
+^^^^^^^^^^^^      File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/models/auto/configuration_auto.py", line 1332, in from_pretrained
+^^^^^^^^^^^^config = AutoConfig.from_pretrained(
+    ^^^^^^^^^^^^  config_dict, unused_kwargs = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **kwargs)
+^^^^^^^^^^^^   ^^^^^^^
+^
+^^    ^^^^^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/models/auto/configuration_auto.py", line 1332, in from_pretrained
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/models/auto/tokenization_auto.py", line 1109, in from_pretrained
+^^    ^^^^^^        ^^    ^^^^^^config_dict, unused_kwargs = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **kwargs)
+config = AutoConfig.from_pretrained(
+^^    ^^^^^^  ^^ ^  ^^^^^^    ^^^^  ^^^^^^    ^^^^  ^^^^^^    ^^^^  ^^^^^^    ^^^^  ^^^^^^    ^^^^  ^^^^^^    ^^^^  ^^^^^^  ^^^^^^  ^^^^^^  ^^^^^^  ^^^^^^  ^^^^^^  ^^^^^^  ^^^^^^  ^^^^^^  ^^^^^^  ^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^
+  ^^^
+
+^^^^^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/models/auto/tokenization_auto.py", line 1109, in from_pretrained
+  ^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/models/auto/tokenization_auto.py", line 1109, in from_pretrained
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/models/auto/configuration_auto.py", line 1332, in from_pretrained
+^^^^^^      ^^        ^^^
+^^config = AutoConfig.from_pretrained(
+^^^^config = AutoConfig.from_pretrained(
+config_dict, unused_kwargs = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **kwargs)
+^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/models/auto/tokenization_auto.py", line 1109, in from_pretrained
+^^ ^^^^  ^^    ^
+  ^^^^    ^^config = AutoConfig.from_pretrained(
+   ^^^
+    ^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/models/auto/tokenization_auto.py", line 1109, in from_pretrained
+    ^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/models/auto/configuration_auto.py", line 1332, in from_pretrained
+    ^^        ^^        ^^config = AutoConfig.from_pretrained(
+    ^^config_dict, unused_kwargs = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **kwargs)
+    ^^     ^^     ^^    ^^^^  ^^  ^^    ^^^^  ^^  ^^  ^^^^^^  ^^  ^^  ^^^^^^  ^^  ^^  ^^^^^^  ^^  ^^  ^^^^^^  ^^  ^^^^^^^^^^  ^^  ^^^^^^^^^^  ^^  ^^^^^^^^^^  ^^  ^^^^^^^^^^  ^^  ^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^
+^^  ^
+^^^^^^^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/models/auto/configuration_auto.py", line 1332, in from_pretrained
+^^    File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/models/auto/configuration_auto.py", line 1332, in from_pretrained
+^^^^^^^
+    ^^      ^^^^^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/models/auto/configuration_auto.py", line 1332, in from_pretrained
+config_dict, unused_kwargs = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **kwargs)
+^^^^config_dict, unused_kwargs = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **kwargs)
+^^^^^^     ^^^^ ^^^^^^config_dict, unused_kwargs = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **kwargs)
+  ^^^^  ^^^^^
+   ^^^^  ^^^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/models/auto/configuration_auto.py", line 1332, in from_pretrained
+    ^^^^  ^^^^        ^^^^  ^^^^config_dict, unused_kwargs = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **kwargs)
+    ^^^^  ^^^^     ^^^^  ^^^
+      ^^^^  ^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/configuration_utils.py", line 662, in get_config_dict
+      ^^^^  ^^          ^^^^  ^^    config_dict, kwargs = cls._get_config_dict(pretrained_model_name_or_path, **kwargs)
+  ^^^^  ^^       ^
+^^  ^^          File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/configuration_utils.py", line 662, in get_config_dict
+^^  ^^            ^^  ^^        config_dict, kwargs = cls._get_config_dict(pretrained_model_name_or_path, **kwargs)
+^^  ^^         ^^  ^^          ^^  ^^      ^^  ^^^^^^      ^^  ^^^^^^  ^^  ^^  ^^^^^^  ^^  ^^  ^^^^^^  ^^  ^^  ^^^^^^  ^^  ^^  ^^^^^^^^^^  ^^  ^^^^^^^^^^ ^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^ ^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/configuration_utils.py", line 662, in get_config_dict
+^^^^^^^^^^^^^^    ^^^^^^^^^^^^^^config_dict, kwargs = cls._get_config_dict(pretrained_model_name_or_path, **kwargs)
+^^^^^^^^^^^^^^ ^^^^^^^^^^^
+^^  ^^^^^^^^^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/configuration_utils.py", line 662, in get_config_dict
+^^  ^^^^^^^^^^    ^^  ^^^^^^^^^^config_dict, kwargs = cls._get_config_dict(pretrained_model_name_or_path, **kwargs)
+^^  ^^^^^^^^^^ ^^  ^^^^^^^^^^  ^^  ^^^^^^^^^^  ^^  ^^^^^^^^^^  ^^  ^^^^^^^^^^  ^^  ^^^^^^^^^^  ^^  ^^^^^^^^^^  ^^  ^^^^^^^^^^  ^^  ^^^^^^^^^^  ^^ ^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^ ^^^^^^^^^^^^
+^^^^^
+^^^^^^^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/configuration_utils.py", line 662, in get_config_dict
+^^^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/configuration_utils.py", line 662, in get_config_dict
+^^^^^
+
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/configuration_utils.py", line 721, in _get_config_dict
+    ^^^^    ^^^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/configuration_utils.py", line 662, in get_config_dict
+    config_dict, kwargs = cls._get_config_dict(pretrained_model_name_or_path, **kwargs)
+^^^^config_dict, kwargs = cls._get_config_dict(pretrained_model_name_or_path, **kwargs)
+^^^^    resolved_config_file = cached_file(
+ ^^^^ ^^^^config_dict, kwargs = cls._get_config_dict(pretrained_model_name_or_path, **kwargs)
+    ^^^^  ^^^
+     
+^^  ^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/configuration_utils.py", line 662, in get_config_dict
+        File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/configuration_utils.py", line 721, in _get_config_dict
+^      ^^          ^^resolved_config_file = cached_file(
+  ^^config_dict, kwargs = cls._get_config_dict(pretrained_model_name_or_path, **kwargs)
+      ^^   ^^       ^^    ^^        ^^    ^^        ^^    ^^        ^^    ^^        ^^    ^^        ^^    ^^        ^^    ^^        ^^   ^^^    ^^^^^^  ^^^^   ^^^^^^^  ^^^^  ^^^^^^^^  ^^^^  ^^^^^^^^  ^^^^  ^^^^^^^^  ^^^^ ^^^^^^^^^^^^^^^^^^^^^
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/utils/hub.py", line 322, in cached_file
+^^^^^^^^^^^^^^    ^^^^^^
+^^^^^^file = cached_files(path_or_repo_id=path_or_repo_id, filenames=[filename], **kwargs)
+^^^^^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/configuration_utils.py", line 721, in _get_config_dict
+^^^^^^ ^^^^^^    ^^^^^^  ^^^^^^resolved_config_file = cached_file(
+^^^^^^  ^^
+^^ ^^^^^^  ^
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/utils/hub.py", line 322, in cached_file
+^^  ^^^^^^    File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/configuration_utils.py", line 721, in _get_config_dict
+    ^^  ^^^^^^      file = cached_files(path_or_repo_id=path_or_repo_id, filenames=[filename], **kwargs)
+^^  ^^^^^^^^resolved_config_file = cached_file(
+ ^^  ^^^^^^^^   ^^  ^^^^^^^^    ^^  ^^^^^^^^    ^^  ^^^^^^^^    ^^  ^^^^^^^^    ^^  ^^^^^^^^  ^^^^  ^^^^^^^^  ^^^^  ^^^^^^^^  ^^^^  ^^^^^^^^  ^^^^  ^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^
+^^^^^^
+^^^^^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/configuration_utils.py", line 721, in _get_config_dict
+^    ^^^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/configuration_utils.py", line 721, in _get_config_dict
+
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/utils/hub.py", line 322, in cached_file
+^    
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/configuration_utils.py", line 721, in _get_config_dict
+^^resolved_config_file = cached_file(
+^^^^    ^^file = cached_files(path_or_repo_id=path_or_repo_id, filenames=[filename], **kwargs)
+    ^^ ^^^^resolved_config_file = cached_file(
+^^ resolved_config_file = cached_file(
+^^  ^^^^ ^^   ^^  ^^^^  ^
+    ^^  
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/utils/hub.py", line 322, in cached_file
+^^      ^^      ^^    File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/configuration_utils.py", line 721, in _get_config_dict
+    ^^  file = cached_files(path_or_repo_id=path_or_repo_id, filenames=[filename], **kwargs)
+^^          ^^   ^^  resolved_config_file = cached_file(
+^^  ^^    ^^   ^^  ^^    ^^    ^^  ^^    ^^    ^^  ^^    ^^    ^^  ^^    ^^    ^^  ^^  ^^^^    ^^  ^^  ^^^^    ^^  ^^^^^^^^    ^^  ^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^  ^^^^^^
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/utils/hub.py", line 322, in cached_file
+^^^^^^  ^^^^
+    ^^^^
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/utils/hub.py", line 322, in cached_file
+^^^^
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/utils/hub.py", line 322, in cached_file
+file = cached_files(path_or_repo_id=path_or_repo_id, filenames=[filename], **kwargs)
+^^^^    ^^^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/utils/hub.py", line 553, in cached_files
+     ^^^^file = cached_files(path_or_repo_id=path_or_repo_id, filenames=[filename], **kwargs)
+^^^^    file = cached_files(path_or_repo_id=path_or_repo_id, filenames=[filename], **kwargs)
+  ^^^^ ^^^^raise OSError(
+   ^^^^  ^^^^OSError    ^^^
+  ^^^^: We couldn't connect to 'https://huggingface.co' to load the files, and couldn't find them in the cached files.
+Check your internet connection or see how to run the library in offline mode at 'https://huggingface.co/docs/transformers/installation#offline-mode'.    ^^  
+^^
+  ^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/utils/hub.py", line 553, in cached_files
+    File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/utils/hub.py", line 322, in cached_file
+^^   ^^^      ^^^^^^^^^^ ^^raise OSError(^    ^ ^^
+^file = cached_files(path_or_repo_id=path_or_repo_id, filenames=[filename], **kwargs)^^ ^^^^^^^
+^^^^^^^^OSError: ^^ ^^^^^^^^We couldn't connect to 'https://huggingface.co' to load the files, and couldn't find them in the cached files.
+Check your internet connection or see how to run the library in offline mode at 'https://huggingface.co/docs/transformers/installation#offline-mode'.
+^^  ^^^^^^^  ^^^^^^^  ^^^^^^^^^^  ^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/utils/hub.py", line 553, in cached_files
+^^^^^^^^^^    ^^^^^^^^^^raise OSError(
+^^^^^^^^^^OSError^^^^^
+^^^^: We couldn't connect to 'https://huggingface.co' to load the files, and couldn't find them in the cached files.
+Check your internet connection or see how to run the library in offline mode at 'https://huggingface.co/docs/transformers/installation#offline-mode'.^^^^^^^^
+^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/utils/hub.py", line 553, in cached_files
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/utils/hub.py", line 553, in cached_files
+^    ^^^^raise OSError(
+    ^^^^^^raise OSError(
+^^^^^^OSError: ^^^^^^We couldn't connect to 'https://huggingface.co' to load the files, and couldn't find them in the cached files.
+Check your internet connection or see how to run the library in offline mode at 'https://huggingface.co/docs/transformers/installation#offline-mode'.
+OSError: ^^^^We couldn't connect to 'https://huggingface.co' to load the files, and couldn't find them in the cached files.
+Check your internet connection or see how to run the library in offline mode at 'https://huggingface.co/docs/transformers/installation#offline-mode'.^^^^^^^^^^^^
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/utils/hub.py", line 553, in cached_files
+    raise OSError(
+OSError: We couldn't connect to 'https://huggingface.co' to load the files, and couldn't find them in the cached files.
+Check your internet connection or see how to run the library in offline mode at 'https://huggingface.co/docs/transformers/installation#offline-mode'.
+^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/utils/hub.py", line 553, in cached_files
+^^^    ^^raise OSError(
+^^^
+OSError: We couldn't connect to 'https://huggingface.co' to load the files, and couldn't find them in the cached files.
+Check your internet connection or see how to run the library in offline mode at 'https://huggingface.co/docs/transformers/installation#offline-mode'.
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/transformers/utils/hub.py", line 553, in cached_files
+    raise OSError(
+OSError: We couldn't connect to 'https://huggingface.co' to load the files, and couldn't find them in the cached files.
+Check your internet connection or see how to run the library in offline mode at 'https://huggingface.co/docs/transformers/installation#offline-mode'.
+[2026-07-16 21:42:11,805] torch.distributed.elastic.multiprocessing.api: [ERROR] failed (exitcode: 1) local_rank: 0 (pid: 2067074) of binary: /external/nfs/01-home/vsefishman/envs/genatator_pipeline/bin/python3.11
+Traceback (most recent call last):
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/bin/torchrun", line 6, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 347, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/torch/distributed/run.py", line 812, in main
+    run(args)
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/torch/distributed/run.py", line 803, in run
+    elastic_launch(
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 135, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/external/nfs/01-home/vsefishman/envs/genatator_pipeline/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 268, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+segmentation.train FAILED
+------------------------------------------------------------
+Failures:
+[1]:
+  time      : 2026-07-16_21:42:11
+  host      : hgx217.gigalearn.internal
+  rank      : 1 (local_rank: 1)
+  exitcode  : 1 (pid: 2067075)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[2]:
+  time      : 2026-07-16_21:42:11
+  host      : hgx217.gigalearn.internal
+  rank      : 2 (local_rank: 2)
+  exitcode  : 1 (pid: 2067076)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[3]:
+  time      : 2026-07-16_21:42:11
+  host      : hgx217.gigalearn.internal
+  rank      : 3 (local_rank: 3)
+  exitcode  : 1 (pid: 2067077)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[4]:
+  time      : 2026-07-16_21:42:11
+  host      : hgx217.gigalearn.internal
+  rank      : 4 (local_rank: 4)
+  exitcode  : 1 (pid: 2067078)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[5]:
+  time      : 2026-07-16_21:42:11
+  host      : hgx217.gigalearn.internal
+  rank      : 5 (local_rank: 5)
+  exitcode  : 1 (pid: 2067079)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[6]:
+  time      : 2026-07-16_21:42:11
+  host      : hgx217.gigalearn.internal
+  rank      : 6 (local_rank: 6)
+  exitcode  : 1 (pid: 2067080)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[7]:
+  time      : 2026-07-16_21:42:11
+  host      : hgx217.gigalearn.internal
+  rank      : 7 (local_rank: 7)
+  exitcode  : 1 (pid: 2067081)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-07-16_21:42:11
+  host      : hgx217.gigalearn.internal
+  rank      : 0 (local_rank: 0)
+  exitcode  : 1 (pid: 2067074)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================
