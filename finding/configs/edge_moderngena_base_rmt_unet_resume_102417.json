@@ -1,0 +1,72 @@
+{
+  "seed": 42,
+  "model": {
+    "family": "rmt",
+    "backbone_kind": "moderngena",
+    "backbone_path": "AIRI-Institute/moderngena-base",
+    "tokenizer_path": "AIRI-Institute/moderngena-base",
+    "trust_remote_code": true,
+    "checkpoint_path": null,
+    "allow_unsafe_torch_load_with_torch_lt_2_6": true,
+    "nucleotide_vocab_size": null,
+    "cycles": 1,
+    "rmt": {
+      "max_n_segments": 10000,
+      "num_mem_tokens": 10,
+      "bptt_depth": -1,
+      "segment_size": 1024
+    },
+    "unet_chunk_size": 8192
+  },
+  "train_dataset": {
+    "path": "datasets/local_datasets/genatator-gene-finding-dataset",
+    "split": "train",
+    "genomes": [],
+    "chromosomes": [],
+    "overlap": 0.5,
+    "target_group": "primary",
+    "max_bpe_tokens": 4096,
+    "average_bpe_token_length": 9.0
+  },
+  "eval_dataset": {
+    "path": "datasets/local_datasets/genatator-gene-finding-dataset",
+    "split": "validation",
+    "genomes": [],
+    "chromosomes": [],
+    "overlap": 0.5,
+    "target_group": "primary",
+    "max_bpe_tokens": 4096,
+    "average_bpe_token_length": 9.0
+  },
+  "true_gff": "datasets/chr20.gff",
+  "training": {
+    "output_dir": "runs/finding_edge_moderngena_base_rmt_unet",
+    "custom_prefix": "resume_102417_ckpt1000",
+    "overwrite_output_dir": false,
+    "max_steps": 500000,
+    "per_device_train_batch_size": 1,
+    "per_device_eval_batch_size": 1,
+    "gradient_accumulation_steps": 1,
+    "learning_rate": 5e-05,
+    "weight_decay": 0.0001,
+    "warmup_steps": 1000,
+    "lr_scheduler_type": "constant_with_warmup",
+    "logging_steps": 100,
+    "eval_steps": 1000,
+    "save_steps": 1000,
+    "save_total_limit": 3,
+    "load_best_model_at_end": true,
+    "metric_for_best_model": "loss",
+    "greater_is_better": false,
+    "dataloader_num_workers": 0,
+    "bf16": true,
+    "fp16": false,
+    "resume_from_checkpoint": "/external/nfs/01-home/vsefishman/DNALM/GENATATOR/runs/finding_edge_moderngena_base_rmt_unet/20260717_163012_971011/checkpoint-1000",
+    "save_safetensors": false,
+    "logging_interval": 100,
+    "eval_interval": 1000,
+    "save_interval": 1000,
+    "eval_accumulation_steps": 1
+  },
+  "task": "finding_edge"
+}
