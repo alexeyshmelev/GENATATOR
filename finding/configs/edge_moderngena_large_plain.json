@@ -10,7 +10,7 @@
     "allow_unsafe_torch_load_with_torch_lt_2_6": true
   },
   "train_dataset": {
-    "path": "AIRI-Institute/genatator-gene-finding-dataset",
+    "path": "datasets/local_datasets/genatator-gene-finding-dataset",
     "split": "train",
     "genomes": [],
     "chromosomes": [],
@@ -20,7 +20,7 @@
     "average_bpe_token_length": 9.0
   },
   "eval_dataset": {
-    "path": "AIRI-Institute/genatator-gene-finding-dataset",
+    "path": "datasets/local_datasets/genatator-gene-finding-dataset",
     "split": "validation",
     "genomes": [],
     "chromosomes": [],
@@ -29,7 +29,7 @@
     "max_bpe_tokens": 4096,
     "average_bpe_token_length": 9.0
   },
-  "true_gff": null,
+  "true_gff": "datasets/chr20.gff",
   "training": {
     "output_dir": "runs/finding_edge_moderngena_large_plain",
     "custom_prefix": "",

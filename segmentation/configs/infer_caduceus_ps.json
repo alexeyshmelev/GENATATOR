@@ -10,7 +10,7 @@
     "allow_unsafe_torch_load_with_torch_lt_2_6": true
   },
   "dataset": {
-    "path": "AIRI-Institute/genatator-gene-segmentation-dataset",
+    "path": "datasets/local_datasets/genatator-gene-segmentation-dataset",
     "config_name": "val-human",
     "split": "validation",
     "genomes": [
@@ -35,7 +35,7 @@
     "coordinate_mode": "transcript",
     "empty_segment_policy": "error",
     "output_gff": "segmentation_predictions.gff",
-    "true_gff": null,
+    "true_gff": "datasets/chr20.gff",
     "metrics_json": "segmentation_metrics.json"
   },
   "task": "segmentation"
