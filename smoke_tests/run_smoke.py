@@ -77,7 +77,7 @@ def model_cfg(model_name: str, family: str, extra: Optional[dict] = None) -> dic
     if family in {"unet", "rmt"} or (family == "amt" and bool((extra or {}).get("use_unet", False))):
         # Single-nucleotide IDs are read from the main model tokenizer.
         cfg.update({
-            "nucleotide_vocab_size": None,
+            "vocab_size": None,
             "unet_chunk_size": 8192,
         })
     if extra:
@@ -120,9 +120,10 @@ def smoke_training(
         "logging_interval": 1,
         "logging_steps": 1,
         "evaluation_strategy": "epoch",
-        "eval_interval": 1,
+        "eval_steps": 1,
         "save_strategy": "epoch",
-        "save_interval": 1,
+        "save_steps": 1,
+        "patience": 100,
         "save_total_limit": 1,
         "save_safetensors": False,
         "load_best_model_at_end": True,
@@ -199,23 +200,25 @@ def make_finding_train_config(
     if family == "unet":
         extra = {"unet_cycles": 1}
     elif family == "rmt":
+        memory_tokens = 10 if MODELS[model_name]["kind"] == "gena" else 20
         extra = {
             "cycles": 1,
             "rmt": {
                     "segment_size": 64,
                     "max_n_segments": 8,
-                    "num_mem_tokens": 4,
+                    "num_mem_tokens": memory_tokens,
                     "bptt_depth": -1,
                 },
         }
     elif family == "amt":
+        memory_tokens = 10 if MODELS[model_name]["kind"] == "gena" else 20
         extra = {
             "use_unet": False,
             "amt": {
                 "amt_repo_id": "irodkin/armt-neox-tiny",
-                "num_mem_tokens": 5,
+                "num_mem_tokens": memory_tokens,
                 "d_mem": 64,
-                "segment_size": 59,
+                "segment_size": 64 - memory_tokens,
                 "segment_alignment": "left",
                 "sliding_window": False,
                 "wrap_pos": False,
@@ -258,24 +261,26 @@ def make_seg_train_config(
         if family == "unet":
             extra = {"unet_cycles": 1}
         elif family == "rmt":
+            memory_tokens = 10 if MODELS[model_name]["kind"] == "gena" else 20
             extra = {
                 "cycles": 1,
                 "rmt": {
                     "segment_size": 64,
                     "max_n_segments": 8,
-                    "num_mem_tokens": 4,
+                    "num_mem_tokens": memory_tokens,
                     "bptt_depth": -1,
                 },
             }
         elif family == "amt":
+            memory_tokens = 10 if MODELS[model_name]["kind"] == "gena" else 20
             extra = {
                 "use_unet": True,
                 "unet_cycles": 1,
                 "amt": {
                     "amt_repo_id": "irodkin/armt-neox-tiny",
-                    "num_mem_tokens": 5,
+                    "num_mem_tokens": memory_tokens,
                     "d_mem": 64,
-                    "segment_size": 59,
+                    "segment_size": 64 - memory_tokens,
                     "segment_alignment": "left",
                     "sliding_window": False,
                     "wrap_pos": False,
@@ -368,18 +373,19 @@ def make_finding_infer_config(
         "edge": edge_cfg,
         "region": region_cfg,
         "postprocess": {
-            "lp_frac": 0.05,
-            "pk_prom": 0.1,
-            "pk_dist": 50,
-            "pk_height": None,
+            "low_pass_fraction": 0.05,
+            "peak_prominence": 0.15,
+            "peak_distance": 50,
+            "peak_height": None,
             "interval_window_size": 2_000_000,
             "max_pairs_per_seed": 10,
             "prob_threshold": 0.5,
             "zero_fraction_drop_threshold": 0.01,
-            "pairing_progress_every": None,
+            "pairing_progress_every": 1000,
         },
         "inference": {
             "device": "cuda",
+            "batch_size": 1,
             "use_reverse_complement": True,
             "output_gff": str(work / f"finding_{model_name}_{variant}.gff"),
             "true_gff": true_gff,

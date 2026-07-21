@@ -30,7 +30,7 @@ def prepare_tokenizers(model_cfg: Dict[str, Any]):
     nucleotide_tokenizer = prepare_nucleotide_tokenizer(model_cfg, tokenizer)
     logger.info("[infer.tokenizer] main pad=%s cls=%s sep=%s side=%s", tokenizer.pad_token_id, tokenizer.cls_token_id, tokenizer.sep_token_id, tokenizer.padding_side)
     if nucleotide_tokenizer is not None:
-        logger.info("[infer.tokenizer] nucleotide ids source=main path=%s vocab_size=%s", model_cfg["tokenizer_path"], model_cfg.get("nucleotide_vocab_size"))
+        logger.info("[infer.tokenizer] nucleotide ids source=main path=%s vocab_size=%s", model_cfg["tokenizer_path"], model_cfg.get("vocab_size"))
     return tokenizer, nucleotide_tokenizer
 
 

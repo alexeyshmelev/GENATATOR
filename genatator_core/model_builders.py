@@ -28,6 +28,69 @@ def default_memory_segment_size(backbone_kind: str) -> int:
     raise RuntimeError(f"Memory segment defaults are defined only for GENA/ModernGENA, got {backbone_kind!r}")
 
 
+def default_memory_token_count(backbone_kind: str) -> int:
+    if backbone_kind == "gena":
+        return 10
+    if backbone_kind == "moderngena":
+        return 20
+    raise RuntimeError(f"Memory-token defaults are defined only for GENA/ModernGENA, got {backbone_kind!r}")
+
+
+def default_amt_segment_size(backbone_kind: str, num_mem_tokens: int | None = None) -> int:
+    """Return AMT's data-token segment after reserving memory positions."""
+
+    memory_tokens = int(
+        default_memory_token_count(backbone_kind)
+        if num_mem_tokens is None
+        else num_mem_tokens
+    )
+    segment_size = default_memory_segment_size(backbone_kind) - memory_tokens
+    if segment_size <= 0:
+        raise RuntimeError(
+            "AMT memory tokens must leave at least one data-token position: "
+            f"backbone_kind={backbone_kind!r} num_mem_tokens={memory_tokens}"
+        )
+    return segment_size
+
+
+def normalize_memory_wrapper_config(model_cfg: Dict[str, Any]) -> None:
+    """Materialize and validate memory-wrapper rules for train and inference."""
+
+    family = model_cfg.get("family")
+    if family not in {"rmt", "amt"}:
+        return
+    backbone_kind = model_cfg.get("backbone_kind")
+    if backbone_kind not in {"gena", "moderngena"}:
+        raise RuntimeError(
+            f"{str(family).upper()} is only valid for GENA/ModernGENA. "
+            f"Got backbone_kind={backbone_kind}"
+        )
+    wrapper_cfg = model_cfg.setdefault(str(family), {})
+    expected_memory_tokens = default_memory_token_count(str(backbone_kind))
+    configured_memory_tokens = int(
+        wrapper_cfg.get("num_mem_tokens", expected_memory_tokens)
+    )
+    if configured_memory_tokens != expected_memory_tokens:
+        raise RuntimeError(
+            f"{str(family).upper()} with backbone_kind={backbone_kind!r} requires "
+            f"num_mem_tokens={expected_memory_tokens}, got {configured_memory_tokens}"
+        )
+    wrapper_cfg["num_mem_tokens"] = configured_memory_tokens
+    if family == "amt":
+        segment_size = int(
+            wrapper_cfg.get(
+                "segment_size",
+                default_amt_segment_size(str(backbone_kind), configured_memory_tokens),
+            )
+        )
+        wrapper_cfg["segment_size"] = segment_size
+        if backbone_kind == "gena" and segment_size + configured_memory_tokens > 512:
+            raise RuntimeError(
+                "GENA AMT data tokens plus memory tokens must fit its 512-position context: "
+                f"segment_size={segment_size} num_mem_tokens={configured_memory_tokens}"
+            )
+
+
 def model_uses_unet(model_cfg: Dict[str, Any]) -> bool:
     family = model_cfg.get("family")
     return family in {"unet", "rmt"} or (family == "amt" and bool(model_cfg.get("use_unet", False)))
@@ -52,16 +115,20 @@ def normalize_unet_chunk_size(model_cfg: Dict[str, Any]) -> int | None:
     return value
 
 
-def _nucleotide_vocab_size(model_cfg: Dict[str, Any]) -> int:
-    value = model_cfg.get("nucleotide_vocab_size")
+def _vocab_size(model_cfg: Dict[str, Any]) -> int:
+    value = model_cfg.get("vocab_size")
     if value in (None, "", "auto"):
-        raise RuntimeError("nucleotide_vocab_size was not inferred before build_model. Entry points must call prepare_nucleotide_tokenizer().")
+        raise RuntimeError(
+            "vocab_size was not inferred before build_model. "
+            "Entry points must call prepare_nucleotide_tokenizer()."
+        )
     return int(value)
 
 
 def build_model(cfg: Dict[str, Any], task: str):
     model_cfg = cfg["model"]
     family = model_cfg["family"]
+    normalize_memory_wrapper_config(model_cfg)
     if task == "transcript_type" and family not in {"plain", "caduceus"}:
         raise RuntimeError(
             "Transcript-type classification is implemented only for family='plain' and family='caduceus'; "
@@ -108,7 +175,7 @@ def build_model(cfg: Dict[str, Any], task: str):
             backbone_kind,
             num_labels=num_labels,
             trust_remote_code=trust_remote_code,
-            nucleotide_vocab_size=_nucleotide_vocab_size(model_cfg),
+            nucleotide_vocab_size=_vocab_size(model_cfg),
             unet_cycles=int(model_cfg.get("unet_cycles", 1)),
             unet_channels=model_cfg.get("unet_channels"),
             unet_chunk_size=int(unet_chunk_size),
@@ -134,11 +201,12 @@ def build_model(cfg: Dict[str, Any], task: str):
             if configured_segment_size is not None
             else (legacy_input_size if legacy_input_size is not None else default_memory_segment_size(backbone_kind))
         )
+        rmt_kwargs.setdefault("num_mem_tokens", default_memory_token_count(backbone_kind))
         rmt_kwargs.setdefault("max_n_segments", 10000)
         rmt_kwargs.update({
             "tokenizer": cfg["_tokenizer"],
             "num_labels": num_labels,
-            "nucleotide_vocab_size": _nucleotide_vocab_size(model_cfg),
+            "nucleotide_vocab_size": _vocab_size(model_cfg),
             "cycles": int(model_cfg.get("cycles", 1)),
             "unet_channels": model_cfg.get("unet_channels"),
             "unet_chunk_size": int(unet_chunk_size),
@@ -150,7 +218,11 @@ def build_model(cfg: Dict[str, Any], task: str):
             raise RuntimeError(f"AMT is allowed only for GENA/ModernGENA, got backbone_kind={backbone_kind}")
         use_unet = bool(model_cfg.get("use_unet", False))
         amt_kwargs = dict(model_cfg.get("amt", {}))
-        amt_kwargs.setdefault("segment_size", default_memory_segment_size(backbone_kind))
+        amt_kwargs.setdefault("num_mem_tokens", default_memory_token_count(backbone_kind))
+        amt_kwargs.setdefault(
+            "segment_size",
+            default_amt_segment_size(backbone_kind, amt_kwargs["num_mem_tokens"]),
+        )
         model = AMTTokenClassifier(
             backbone_path=backbone_path,
             backbone_kind=backbone_kind,
@@ -159,7 +231,7 @@ def build_model(cfg: Dict[str, Any], task: str):
             use_unet=use_unet,
             # This value is unused by plain AMT.  Do not require a nucleotide
             # tokenizer/vocabulary unless a UNET is actually present.
-            nucleotide_vocab_size=_nucleotide_vocab_size(model_cfg) if use_unet else 1,
+            nucleotide_vocab_size=_vocab_size(model_cfg) if use_unet else 1,
             unet_cycles=int(model_cfg.get("unet_cycles", 1)),
             unet_channels=model_cfg.get("unet_channels"),
             unet_chunk_size=int(unet_chunk_size) if use_unet else DEFAULT_UNET_CHUNK_SIZE,
