@@ -27,20 +27,33 @@ def test_all_shipped_training_configs_use_requested_contracts() -> None:
     for task in ("finding", "segmentation", "transcript_type"):
         for path, cfg in _training_paths(task):
             model = cfg["model"]
+            training = cfg["training"]
             assert cfg.get("true_gff") is None, path
-            assert cfg["training"].get("custom_prefix") is not None, path
+            assert training.get("custom_prefix") is not None, path
+            assert training["max_steps"] == 500_000, path
+            assert training["eval_steps"] == 1000, path
+            assert training["save_steps"] == 1000, path
+            assert training["patience"] == 100, path
+            assert "eval_interval" not in training, path
+            assert "save_interval" not in training, path
+            assert "nucleotide_vocab_size" not in model, path
             assert "cycles" not in path.name, path
             if model["family"] == "caduceus":
                 assert model["bidirectional_weight_tie"] is False, path
             if model["family"] == "rmt":
                 assert model["cycles"] == 1, path
                 assert model["rmt"]["segment_size"] == (512 if model["backbone_kind"] == "gena" else 1024), path
+                assert model["rmt"]["num_mem_tokens"] == (10 if model["backbone_kind"] == "gena" else 20), path
                 assert model["rmt"]["max_n_segments"] > 0, path
+            if model["family"] == "amt":
+                assert model["amt"]["num_mem_tokens"] == (10 if model["backbone_kind"] == "gena" else 20), path
+                assert model["amt"]["segment_size"] == (502 if model["backbone_kind"] == "gena" else 1004), path
             if model["family"] == "unet":
                 assert model["unet_cycles"] == 1, path
             if model["family"] == "amt" and model.get("use_unet"):
                 assert model["unet_cycles"] == 1, path
             if _uses_unet(model):
+                assert "vocab_size" in model, path
                 assert model["unet_chunk_size"] == 8192, path
 
             for dataset_name in ("train_dataset", "eval_dataset"):
@@ -115,6 +128,22 @@ def test_standalone_evaluation_templates_use_required_subsets() -> None:
         assert finding[stage]["dataset"]["genomes"] == FIXED_GENOME
         assert finding[stage]["dataset"]["chromosomes"] == FIXED_CHROMOSOME
     assert finding["inference"]["use_reverse_complement"] is True
+    assert finding["edge"]["inference"]["checkpoint_path"] == "<manually_insert_value_here>"
+    assert finding["region"]["inference"]["checkpoint_path"] == "<manually_insert_value_here>"
+    assert finding["inference"]["true_gff"] == "<manually_insert_value_here>"
+    assert finding["inference"]["k_values"] == [0, 50, 100, 250, 500]
+    assert finding["inference"]["use_strand"] is True
+    assert finding["postprocess"] == {
+        "low_pass_fraction": 0.05,
+        "peak_prominence": 0.15,
+        "peak_distance": 50,
+        "peak_height": None,
+        "interval_window_size": 2_000_000,
+        "max_pairs_per_seed": 10,
+        "prob_threshold": 0.5,
+        "zero_fraction_drop_threshold": 0.01,
+        "pairing_progress_every": 1000,
+    }
 
 
 class ShippedConfigSchemaTests(unittest.TestCase):

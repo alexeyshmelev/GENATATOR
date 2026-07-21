@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Sampler, SequentialSampler
 from tqdm.auto import tqdm
-from transformers import Trainer, TrainingArguments
+from transformers import EarlyStoppingCallback, Trainer, TrainingArguments
 
 from .config import load_json
 from .data import GenatatorCollator, GenatatorDataset, make_tokenizer, nucleotide_token_ids
@@ -27,7 +27,11 @@ from .metrics_training import (
     sigmoid,
 )
 from .intervals import f1_from_counts, interval_counts
-from .model_builders import build_model, normalize_unet_chunk_size
+from .model_builders import (
+    build_model,
+    normalize_memory_wrapper_config,
+    normalize_unet_chunk_size,
+)
 from .run_management import (
     BestCheckpointEvaluationConfigCallback,
     EvaluationConfigManager,
@@ -331,6 +335,15 @@ class GenatatorTrainer(Trainer):
                 time.sleep(5.0)
         if rank == 0:
             self.log(metrics)
+        # Match Trainer.evaluate's callback contract on every rank. In
+        # particular, EarlyStoppingCallback updates its patience counter only
+        # from on_evaluate, and every rank received the same small metrics dict.
+        self.control = self.callback_handler.on_evaluate(
+            self.args,
+            self.state,
+            self.control,
+            metrics,
+        )
         return metrics
 
     def _get_train_sampler(self, *args, **kwargs):
@@ -392,9 +405,36 @@ def tokenizer_vocab_size(tokenizer) -> int:
     return max(vals)
 
 
+def normalize_vocab_size_field(model_cfg: Dict[str, Any]) -> None:
+    """Migrate the legacy public field while serializing only ``vocab_size``."""
+
+    if "nucleotide_vocab_size" not in model_cfg:
+        return
+    legacy = model_cfg.pop("nucleotide_vocab_size")
+    if "vocab_size" not in model_cfg:
+        model_cfg["vocab_size"] = legacy
+    else:
+        configured = model_cfg["vocab_size"]
+        configured_auto = configured in (None, "", "auto")
+        legacy_auto = legacy in (None, "", "auto")
+        if configured_auto and not legacy_auto:
+            model_cfg["vocab_size"] = legacy
+        elif not configured_auto and not legacy_auto and int(configured) != int(legacy):
+            raise RuntimeError(
+                "Conflicting vocabulary sizes: "
+                f"model.vocab_size={configured} and legacy "
+                f"model.nucleotide_vocab_size={legacy}"
+            )
+    logger.warning(
+        "model.nucleotide_vocab_size is deprecated; use model.vocab_size. "
+        "The saved training and evaluation configs use only vocab_size."
+    )
+
+
 def prepare_nucleotide_tokenizer(model_cfg: Dict[str, Any], tokenizer):
     if not needs_nucleotide_tokenizer(model_cfg):
         return None
+    normalize_vocab_size_field(model_cfg)
     legacy_path = model_cfg.pop("nucleotide_tokenizer_path", None)
     if legacy_path and str(legacy_path) != str(model_cfg["tokenizer_path"]):
         logger.warning(
@@ -409,11 +449,11 @@ def prepare_nucleotide_tokenizer(model_cfg: Dict[str, Any], tokenizer):
         )
     ids = nucleotide_token_ids(tokenizer)
     vocab_size = tokenizer_vocab_size(tokenizer)
-    configured = model_cfg.get("nucleotide_vocab_size")
+    configured = model_cfg.get("vocab_size")
     if configured in (None, "", "auto"):
-        model_cfg["nucleotide_vocab_size"] = int(vocab_size)
+        model_cfg["vocab_size"] = int(vocab_size)
         logger.info(
-            "[tokenizer.nucleotide_ids] source=main tokenizer ids=%s auto nucleotide_vocab_size=%d",
+            "[tokenizer.nucleotide_ids] source=main tokenizer ids=%s auto vocab_size=%d",
             ids,
             vocab_size,
         )
@@ -421,11 +461,12 @@ def prepare_nucleotide_tokenizer(model_cfg: Dict[str, Any], tokenizer):
         configured_i = int(configured)
         if configured_i < vocab_size:
             raise RuntimeError(
-                f"model.nucleotide_vocab_size={configured_i} is smaller than main tokenizer vocab size {vocab_size}. "
+                f"model.vocab_size={configured_i} is smaller than main tokenizer vocab size {vocab_size}. "
                 "Set it to null/auto or to a value >= tokenizer vocab size."
             )
-        model_cfg["nucleotide_vocab_size"] = configured_i
+        model_cfg["vocab_size"] = configured_i
     return tokenizer
+
 
 def validate_rules(cfg: Dict[str, Any], task: str) -> None:
     model_cfg = cfg["model"]
@@ -435,6 +476,10 @@ def validate_rules(cfg: Dict[str, Any], task: str) -> None:
     tr = cfg["training"]
     train_bs = int(tr.get("per_device_train_batch_size", 1))
     eval_bs = int(tr.get("per_device_eval_batch_size", 1))
+    patience = int(tr.get("patience", 100))
+    if patience <= 0:
+        raise RuntimeError(f"training.patience must be positive, got {patience}")
+    tr["patience"] = patience
     if train_bs != 1 or eval_bs != 1:
         raise RuntimeError(
             "GENATATOR requires per_device_train_batch_size=1 and per_device_eval_batch_size=1 for every task/model"
@@ -465,8 +510,7 @@ def validate_rules(cfg: Dict[str, Any], task: str) -> None:
             "Transcript-type classification is implemented only for family='plain' and family='caduceus'; "
             f"got family={family!r}"
         )
-    if family in {"rmt", "amt"} and backbone_kind not in {"gena", "moderngena"}:
-        raise RuntimeError(f"{family.upper()} is only valid for GENA/ModernGENA. Got backbone_kind={backbone_kind}")
+    normalize_memory_wrapper_config(model_cfg)
     if family == "rmt" and backbone_kind == "caduceus":
         raise RuntimeError("RMT must not be adapted to Caduceus")
     if task == "segmentation" and backbone_kind in {"gena", "moderngena"}:
@@ -528,15 +572,13 @@ def train_from_config(config_path: str, task: str | None = None) -> None:
     nucleotide_tokenizer = prepare_nucleotide_tokenizer(model_cfg, tokenizer)
     logger.info("[tokenizer.main] path=%s pad=%s cls=%s sep=%s padding_side=%s", model_cfg["tokenizer_path"], tokenizer.pad_token_id, tokenizer.cls_token_id, tokenizer.sep_token_id, tokenizer.padding_side)
     if nucleotide_tokenizer is not None:
-        logger.info("[tokenizer.nucleotide_ids] source=main path=%s vocab_size=%s", model_cfg["tokenizer_path"], model_cfg.get("nucleotide_vocab_size"))
+        logger.info("[tokenizer.nucleotide_ids] source=main path=%s vocab_size=%s", model_cfg["tokenizer_path"], model_cfg.get("vocab_size"))
 
-    # At this point tokenizer-dependent values such as nucleotide_vocab_size
+    # At this point tokenizer-dependent values such as vocab_size
     # are resolved, while runtime-only objects have not yet entered cfg.
     evaluation_config_manager = EvaluationConfigManager(cfg, task=task, run_dir=output_dir)
     if is_world_process_zero():
         atomic_save_json(cfg, output_dir / "training_config.json")
-        # Keep the historical filename for callers that already consume it.
-        atomic_save_json(cfg, output_dir / "config.json")
     evaluation_config_manager.write_initial()
     cfg["_tokenizer"] = tokenizer
 
@@ -567,13 +609,15 @@ def train_from_config(config_path: str, task: str | None = None) -> None:
         list(metric_names_for_task(task)),
     )
     logging_interval = int(tr.get("logging_interval", tr.get("logging_steps", 100)))
-    eval_interval = int(tr.get("eval_interval", tr.get("eval_steps", logging_interval)))
-    save_interval = int(tr.get("save_interval", tr.get("save_steps", eval_interval)))
+    eval_steps = int(tr.get("eval_steps", logging_interval))
+    save_steps = int(tr.get("save_steps", eval_steps))
+    patience = int(tr["patience"])
     logger.info(
-        "[training.intervals] logging_interval=%d eval_interval=%d save_interval=%d",
+        "[training.steps] logging_steps=%d eval_steps=%d save_steps=%d patience=%d",
         logging_interval,
-        eval_interval,
-        save_interval,
+        eval_steps,
+        save_steps,
+        patience,
     )
     logger.info(
         "[training.evaluation_memory] eval_accumulation_steps=%s; validation logits/labels are flushed to CPU at this interval",
@@ -602,9 +646,9 @@ def train_from_config(config_path: str, task: str | None = None) -> None:
         lr_scheduler_type=tr.get("lr_scheduler_type", "constant_with_warmup"),
         logging_strategy=logging_strategy,
         logging_steps=logging_interval,
-        eval_steps=eval_interval,
+        eval_steps=eval_steps,
         save_strategy=save_strategy,
-        save_steps=save_interval,
+        save_steps=save_steps,
         save_total_limit=int(tr.get("save_total_limit", 3)),
         save_safetensors=bool(tr.get("save_safetensors", False)),
         load_best_model_at_end=bool(tr.get("load_best_model_at_end", False)),
@@ -643,7 +687,10 @@ def train_from_config(config_path: str, task: str | None = None) -> None:
             model_cfg.get("allow_unsafe_torch_load_with_torch_lt_2_6", True)
         ),
         genatator_task=task,
-        callbacks=[BestCheckpointEvaluationConfigCallback(evaluation_config_manager)],
+        callbacks=[
+            BestCheckpointEvaluationConfigCallback(evaluation_config_manager),
+            EarlyStoppingCallback(early_stopping_patience=patience),
+        ],
     )
     resume = tr.get("resume_from_checkpoint") or None
     if isinstance(resume, bool):

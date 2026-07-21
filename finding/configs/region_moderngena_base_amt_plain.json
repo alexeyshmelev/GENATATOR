@@ -11,9 +11,9 @@
     "use_unet": false,
     "amt": {
       "amt_repo_id": "irodkin/armt-neox-tiny",
-      "num_mem_tokens": 16,
+      "num_mem_tokens": 20,
       "d_mem": 32,
-      "segment_size": 1024
+      "segment_size": 1004
     }
   },
   "train_dataset": {
@@ -62,9 +62,8 @@
     "resume_from_checkpoint": null,
     "save_safetensors": false,
     "logging_interval": 100,
-    "eval_interval": 1000,
-    "save_interval": 1000,
-    "eval_accumulation_steps": 1
+    "eval_accumulation_steps": 1,
+    "patience": 100
   },
   "task": "finding_region"
 }

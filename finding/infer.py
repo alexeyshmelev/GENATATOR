@@ -29,7 +29,7 @@ from genatator_core.postprocess import (
     find_tss_polya_pairs_from_peak_indices,
     peak_finding_indices,
 )
-from genatator_core.run_management import atomic_save_json
+from genatator_core.run_management import MANUAL_CONFIG_PLACEHOLDER, atomic_save_json
 from genatator_core.train_common import dataset_family_from_model
 
 logger = logging.getLogger(__name__)
@@ -41,6 +41,78 @@ def _require_batch_size_one(inference_cfg: Dict) -> None:
     batch_size = int(inference_cfg.get("batch_size", 1))
     if batch_size != 1:
         raise RuntimeError("GENATATOR inference batch_size must be 1 for every task/model")
+
+
+def _contains_manual_placeholder(value) -> bool:
+    if isinstance(value, str) and (
+        value == MANUAL_CONFIG_PLACEHOLDER
+        or (value.startswith("<manually_insert_") and value.endswith(">"))
+    ):
+        return True
+    if isinstance(value, dict):
+        return any(
+            _contains_manual_placeholder(key) or _contains_manual_placeholder(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_contains_manual_placeholder(item) for item in value)
+    return False
+
+
+def _validate_full_pipeline_config(cfg: Dict) -> None:
+    unresolved = []
+    invalid = []
+    inference_cfg = cfg.get("inference")
+    if not isinstance(inference_cfg, dict):
+        if _contains_manual_placeholder(inference_cfg):
+            unresolved.append("inference")
+        else:
+            invalid.append("inference")
+    for stage in ("edge", "region"):
+        stage_cfg = cfg.get(stage)
+        if not isinstance(stage_cfg, dict):
+            if _contains_manual_placeholder(stage_cfg):
+                unresolved.append(stage)
+            else:
+                invalid.append(stage)
+            continue
+        for field in ("model", "dataset"):
+            value = stage_cfg.get(field)
+            if _contains_manual_placeholder(value):
+                unresolved.append(f"{stage}.{field}")
+            elif not isinstance(value, dict):
+                invalid.append(f"{stage}.{field}")
+        stage_model = stage_cfg.get("model")
+        stage_inference = stage_cfg.get("inference")
+        if not isinstance(stage_inference, dict):
+            if _contains_manual_placeholder(stage_inference):
+                unresolved.append(f"{stage}.inference")
+            else:
+                invalid.append(f"{stage}.inference")
+        if isinstance(stage_inference, dict):
+            checkpoint = stage_inference.get("checkpoint_path")
+            if _contains_manual_placeholder(checkpoint):
+                unresolved.append(f"{stage}.inference.checkpoint_path")
+            _require_batch_size_one(stage_inference)
+        if isinstance(stage_model, dict) and isinstance(stage_inference, dict):
+            if stage_model.get("checkpoint_path") and stage_inference.get("checkpoint_path"):
+                raise RuntimeError(
+                    f"Set only {stage}.inference.checkpoint_path for joint evaluation; "
+                    f"{stage}.model.checkpoint_path must be null."
+                )
+    true_gff = inference_cfg.get("true_gff") if isinstance(inference_cfg, dict) else None
+    if _contains_manual_placeholder(true_gff):
+        unresolved.append("inference.true_gff")
+    if unresolved:
+        raise RuntimeError(
+            "Complete the generated finding evaluation config before inference. "
+            f"Unresolved fields: {', '.join(unresolved)}"
+        )
+    if invalid:
+        raise RuntimeError(
+            "Full finding pipeline fields must be JSON objects. "
+            f"Invalid fields: {', '.join(invalid)}"
+        )
 
 
 def ensure_tracks(store: TrackStore, key: GenomeChromosome, length: int, n_channels: int) -> None:
@@ -259,6 +331,7 @@ def _run_single_stage(cfg: Dict) -> None:
 
 
 def _run_full_pipeline(cfg: Dict) -> None:
+    _validate_full_pipeline_config(cfg)
     inference_cfg = cfg.get("inference", {})
     _require_batch_size_one(inference_cfg)
     device = inference_cfg.get("device", "cuda")
@@ -290,7 +363,7 @@ def _run_full_pipeline(cfg: Dict) -> None:
     records = []
     post = cfg.get("postprocess", {})
     lp_frac = float(post.get("lp_frac", post.get("low_pass_fraction", 0.05)))
-    pk_prom = float(post.get("pk_prom", post.get("peak_prominence", 0.1)))
+    pk_prom = float(post.get("pk_prom", post.get("peak_prominence", 0.15)))
     pk_dist = int(post.get("pk_dist", post.get("peak_distance", 50)))
     pk_height = post.get("pk_height", post.get("peak_height"))
     for key in sorted(edge_tracks):
@@ -329,7 +402,7 @@ def _run_full_pipeline(cfg: Dict) -> None:
             chrom_name=chrom,
             window_size=int(post.get("interval_window_size", 2_000_000)),
             k=int(post.get("max_pairs_per_seed", 10)),
-            progress_every=post.get("pairing_progress_every"),
+            progress_every=post.get("pairing_progress_every", 1000),
             log=logger,
         )
         chrom_records = filter_intervals_by_intragenic_bool(

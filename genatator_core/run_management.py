@@ -15,6 +15,21 @@ from transformers import TrainerCallback
 
 
 _SAFE_PREFIX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+MANUAL_CONFIG_PLACEHOLDER = "<manually_insert_value_here>"
+MANUAL_DATASET_LENGTH_FIELDS_PLACEHOLDER = (
+    "<manually_insert_model_dependent_length_fields_here>"
+)
+FINDING_POSTPROCESS_DEFAULTS = {
+    "low_pass_fraction": 0.05,
+    "peak_prominence": 0.15,
+    "peak_distance": 50,
+    "peak_height": None,
+    "interval_window_size": 2_000_000,
+    "max_pairs_per_seed": 10,
+    "prob_threshold": 0.5,
+    "zero_fraction_drop_threshold": 0.01,
+    "pairing_progress_every": 1000,
+}
 
 
 def world_rank() -> int:
@@ -195,15 +210,69 @@ def build_evaluation_config(cfg: Dict[str, Any], *, task: str, run_dir: str | Pa
     }
 
     if task in {"finding_edge", "finding_region"}:
-        # Gene finding has a dedicated held-out test split.
+        # Gene finding has a dedicated held-out test split. Its final benchmark
+        # always runs the joint edge + region pipeline so it can emit GFF3 and
+        # the official annotation metrics, not only per-stage PR-AUC.
         dataset_cfg["split"] = "test"
         dataset_cfg.pop("statuses", None)
-        common["metrics_json"] = _absolute_output(run_dir, f"{task}_metrics.json")
-        return {
-            "task": task,
+        trained_stage = task.removeprefix("finding_")
+        manual_stage = "region" if trained_stage == "edge" else "edge"
+        generated["trained_stage"] = trained_stage
+        generated["manual_stage"] = manual_stage
+        trained_stage_config = {
             "model": model_cfg,
             "dataset": dataset_cfg,
-            "inference": common,
+            "inference": {
+                "checkpoint_path": None,
+                "batch_size": 1,
+            },
+        }
+        manual_dataset_config = copy.deepcopy(dataset_cfg)
+        # Dataset identity and benchmark filters are known. Only the length
+        # fields depend on whether the counterpart is nucleotide- or BPE-based.
+        for length_key in (
+            "max_nucleotides",
+            "max_bpe_tokens",
+            "average_bpe_token_length",
+        ):
+            manual_dataset_config.pop(length_key, None)
+        # Replace this marker entry with either max_nucleotides (Caduceus) or
+        # max_bpe_tokens + average_bpe_token_length (GENA/ModernGENA).
+        manual_dataset_config[MANUAL_DATASET_LENGTH_FIELDS_PLACEHOLDER] = (
+            MANUAL_CONFIG_PLACEHOLDER
+        )
+        manual_stage_config = {
+            # The counterpart may use any shipped architecture. A generic
+            # partial model object can silently instantiate the wrong class
+            # (for example plain AMT instead of AMT + UNET), so require the
+            # complete trained model block to be pasted here explicitly.
+            "model": MANUAL_CONFIG_PLACEHOLDER,
+            "dataset": manual_dataset_config,
+            "inference": {
+                "checkpoint_path": MANUAL_CONFIG_PLACEHOLDER,
+                "batch_size": 1,
+            },
+        }
+        stages = {
+            trained_stage: trained_stage_config,
+            manual_stage: manual_stage_config,
+        }
+        return {
+            "task": "finding",
+            "edge": stages["edge"],
+            "region": stages["region"],
+            "postprocess": copy.deepcopy(FINDING_POSTPROCESS_DEFAULTS),
+            "inference": {
+                "device": "cuda",
+                "batch_size": 1,
+                "use_reverse_complement": True,
+                "output_gff": _absolute_output(run_dir, "finding_predictions.gff"),
+                "true_gff": true_gff or MANUAL_CONFIG_PLACEHOLDER,
+                "metrics_json": _absolute_output(run_dir, "finding_metrics.json"),
+                "k_values": [0, 50, 100, 250, 500],
+                "use_strand": True,
+                "empty_gff_policy": "error",
+            },
             "_generated": generated,
         }
 
@@ -258,9 +327,16 @@ def build_evaluation_config(cfg: Dict[str, Any], *, task: str, run_dir: str | Pa
 
 class EvaluationConfigManager:
     def __init__(self, cfg: Dict[str, Any], *, task: str, run_dir: str | Path):
+        self.task = str(task)
         self.run_dir = Path(run_dir).resolve()
         self.path = self.run_dir / "evaluation_config.json"
         self.config = build_evaluation_config(cfg, task=task, run_dir=self.run_dir)
+
+    def _checkpoint_inference_config(self) -> Dict[str, Any]:
+        if self.task in {"finding_edge", "finding_region"}:
+            stage = self.task.removeprefix("finding_")
+            return self.config[stage]["inference"]
+        return self.config["inference"]
 
     def write_initial(self) -> None:
         if is_world_process_zero():
@@ -278,7 +354,7 @@ class EvaluationConfigManager:
         checkpoint_path = Path(checkpoint).expanduser().resolve()
         if not checkpoint_path.exists():
             return
-        self.config["inference"]["checkpoint_path"] = str(checkpoint_path)
+        self._checkpoint_inference_config()["checkpoint_path"] = str(checkpoint_path)
         generated = self.config.setdefault("_generated", {})
         generated["checkpoint_selection"] = str(selection)
         if selection == "best":

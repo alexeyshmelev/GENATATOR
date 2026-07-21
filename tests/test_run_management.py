@@ -9,6 +9,9 @@ from unittest.mock import patch
 try:
     from genatator_core.run_management import (
         EvaluationConfigManager,
+        FINDING_POSTPROCESS_DEFAULTS,
+        MANUAL_CONFIG_PLACEHOLDER,
+        MANUAL_DATASET_LENGTH_FIELDS_PLACEHOLDER,
         build_evaluation_config,
         create_timestamped_run_dir,
     )
@@ -26,7 +29,7 @@ class RunManagementTests(unittest.TestCase):
                 "backbone_path": "backbone",
                 "tokenizer_path": "tokenizer",
                 "checkpoint_path": None,
-                "nucleotide_vocab_size": 42,
+                "vocab_size": 42,
                 "unet_chunk_size": 8192,
             },
             "eval_dataset": {
@@ -92,11 +95,75 @@ class RunManagementTests(unittest.TestCase):
             cfg = self._config(Path(temporary) / "base")
             cfg["eval_dataset"].pop("config_name", None)
             evaluation = build_evaluation_config(cfg, task="finding_edge", run_dir=run_dir)
-            self.assertEqual(evaluation["dataset"]["split"], "test")
-            self.assertEqual(evaluation["dataset"]["genomes"], ["GCF_009914755.1"])
-            self.assertEqual(evaluation["dataset"]["chromosomes"], ["NC_060944.1"])
+            self.assertEqual(evaluation["task"], "finding")
+            self.assertEqual(evaluation["edge"]["dataset"]["split"], "test")
+            self.assertEqual(evaluation["edge"]["dataset"]["genomes"], ["GCF_009914755.1"])
+            self.assertEqual(evaluation["edge"]["dataset"]["chromosomes"], ["NC_060944.1"])
+            self.assertEqual(evaluation["edge"]["model"]["vocab_size"], 42)
+            self.assertNotIn("nucleotide_vocab_size", evaluation["edge"]["model"])
+            self.assertIsNone(evaluation["edge"]["inference"]["checkpoint_path"])
+            self.assertEqual(evaluation["region"]["model"], MANUAL_CONFIG_PLACEHOLDER)
+            self.assertEqual(evaluation["region"]["dataset"]["path"], "dataset")
+            self.assertEqual(evaluation["region"]["dataset"]["split"], "test")
+            self.assertEqual(
+                evaluation["region"]["dataset"][MANUAL_DATASET_LENGTH_FIELDS_PLACEHOLDER],
+                MANUAL_CONFIG_PLACEHOLDER,
+            )
+            self.assertNotIn("max_nucleotides", evaluation["region"]["dataset"])
+            self.assertNotIn("max_bpe_tokens", evaluation["region"]["dataset"])
+            self.assertNotIn(
+                "average_bpe_token_length", evaluation["region"]["dataset"]
+            )
+            self.assertEqual(
+                evaluation["region"]["dataset"]["genomes"],
+                ["GCF_009914755.1"],
+            )
+            self.assertEqual(
+                evaluation["region"]["inference"]["checkpoint_path"],
+                MANUAL_CONFIG_PLACEHOLDER,
+            )
+            self.assertEqual(evaluation["postprocess"], FINDING_POSTPROCESS_DEFAULTS)
             self.assertTrue(evaluation["inference"]["use_reverse_complement"])
             self.assertEqual(evaluation["inference"]["true_gff"], "/tmp/reference.gff")
+            self.assertEqual(evaluation["inference"]["k_values"], [0, 50, 100, 250, 500])
+            self.assertTrue(evaluation["inference"]["use_strand"])
+            self.assertNotIn("checkpoint_path", evaluation["inference"])
+
+    def test_region_finding_evaluation_reverses_trained_and_manual_stages(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "run"
+            run_dir.mkdir()
+            cfg = self._config(Path(temporary) / "base")
+            cfg["true_gff"] = None
+            evaluation = build_evaluation_config(cfg, task="finding_region", run_dir=run_dir)
+            self.assertIsInstance(evaluation["region"]["model"], dict)
+            self.assertEqual(evaluation["edge"]["model"], MANUAL_CONFIG_PLACEHOLDER)
+            self.assertEqual(
+                evaluation["inference"]["true_gff"],
+                MANUAL_CONFIG_PLACEHOLDER,
+            )
+
+    def test_finding_checkpoint_update_targets_only_the_trained_stage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "run"
+            run_dir.mkdir()
+            cfg = self._config(Path(temporary) / "base")
+            manager = EvaluationConfigManager(cfg, task="finding_edge", run_dir=run_dir)
+            manager.write_initial()
+            checkpoint = run_dir / "checkpoint-10"
+            checkpoint.mkdir()
+            manager.update_checkpoint(checkpoint, selection="best")
+
+            written = json.loads((run_dir / "evaluation_config.json").read_text())
+            self.assertEqual(
+                Path(written["edge"]["inference"]["checkpoint_path"]),
+                checkpoint.resolve(),
+            )
+            self.assertEqual(
+                written["region"]["inference"]["checkpoint_path"],
+                MANUAL_CONFIG_PLACEHOLDER,
+            )
+            self.assertNotIn("checkpoint_path", written["inference"])
 
     def test_external_resumed_best_is_referenced_but_never_modified(self):
         with tempfile.TemporaryDirectory() as temporary:
