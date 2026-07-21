@@ -88,8 +88,8 @@ Important architecture rules:
 
 - Caduceus always uses `bidirectional_weight_tie=false`; the loader forces it regardless of the downloaded checkpoint config.
 - Plain/direct GENA accepts at most 512 BPE positions. It never elongates the backbone by independently chunking and concatenating hidden states. Use RMT or AMT for longer GENA inputs.
-- The default RMT segment size is 512 BPE positions for GENA and 1,024 for ModernGENA. `model.rmt.segment_size` and `model.rmt.max_n_segments` remain configurable.
-- AMT segment length is configured with `model.amt.segment_size`.
+- RMT uses 10 memory tokens for GENA and 20 for ModernGENA. Its full segment defaults remain 512 and 1,024 BPE positions because RMT reserves memory positions internally.
+- AMT uses the same 10/20 memory-token rule, but its data-token segment must reserve those positions explicitly. The shipped GENA and ModernGENA defaults are therefore 502 and 1,004. ModernGENA contexts may still be extended beyond the 1,024-position default.
 - Every U-Net uses one cycle by default. The shipped configs use `unet_cycles=1` or `cycles=1` and an 8,192-nucleotide `unet_chunk_size`.
 - For BPE + U-Net models, each retained BPE hidden state is repeated over the nucleotide offsets covered by that token. A learned embedding of the actual nucleotide is concatenated with the repeated hidden state before U-Net processing.
 
@@ -134,7 +134,7 @@ Common fields:
 | `tokenizer_path` | local path or Hugging Face tokenizer ID |
 | `trust_remote_code` | passed to Hugging Face loaders |
 | `checkpoint_path` | optional model weights loaded before training; normally `null` |
-| `nucleotide_vocab_size` | inferred from the main tokenizer when `null` for U-Net paths |
+| `vocab_size` | full main-tokenizer vocabulary size, inferred when `null` for U-Net paths |
 | `unet_chunk_size` | independent nucleotide chunk processed by the U-Net |
 | `unet_cycles` / `cycles` | U-Net cycle count; shipped default is one |
 | `rmt` | RMT memory-token, segment-size and maximum-segment settings |
@@ -154,7 +154,7 @@ All shipped configurations and the runtime validator enforce:
 
 This invariant applies to every task and every model. `gradient_accumulation_steps` may still be used to change the optimizer-step batch. Finding additionally uses `dataloader_num_workers=0`, because worker subprocesses would otherwise create independent chromosome-sized RAM caches.
 
-Other important fields are `max_steps`, `num_train_epochs`, `learning_rate`, `weight_decay`, `warmup_steps`, logging/evaluation/save intervals, mixed precision, checkpoint retention, and `resume_from_checkpoint`.
+Every shipped config uses `max_steps=500000`, `eval_steps=1000`, `save_steps=1000`, and `patience=100`. Patience counts consecutive evaluations without improvement in the selected best-model metric before early stopping. Other important fields include `num_train_epochs`, `learning_rate`, `weight_decay`, `warmup_steps`, mixed precision, checkpoint retention, and `resume_from_checkpoint`.
 
 Reverse-complement processing is intentionally absent from training configs. Training and training-time validation always use one orientation only.
 
@@ -349,7 +349,6 @@ Each launch creates a timestamped child under `training.output_dir`. The run con
 
 ```text
 training_config.json
-config.json
 evaluation_config.json
 checkpoint-*/
 final_model/
@@ -375,15 +374,15 @@ They also expose:
 
 Reverse-complement averaging is inference-only and defaults to on. Set it to `false` in an inference config for a forward-only run.
 
-### Single edge or region stage
+### Generated complete gene-finding evaluation
 
-A generated finding evaluation config has top-level `task`, `model`, `dataset`, and `inference` fields. Run it with the same inference entry point:
+Training either an edge or region model now generates a complete edge + region pipeline config. The trained stage and shared benchmark dataset fields are filled automatically. For the opposite stage, replace the complete `model` placeholder, replace the model-dependent dataset-length marker (including its field name) with either `max_nucleotides` or the `max_bpe_tokens`/`average_bpe_token_length` pair, fill its checkpoint, and fill `inference.true_gff`. Then run:
 
 ```bash
 python finding/infer.py --config runs/.../evaluation_config.json
 ```
 
-It writes whole-chromosome PR-AUC metrics for that stage.
+It writes `finding_predictions.gff` and a combined metrics JSON containing both stages' whole-chromosome PR-AUC and the official Hugging Face annotation metrics.
 
 ### Complete gene-finding pipeline
 
