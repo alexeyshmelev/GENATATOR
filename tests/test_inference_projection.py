@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import unittest
 
 import numpy as np
@@ -8,6 +9,7 @@ try:
     from genatator_core.infer_common import (
         project_bpe_token_logits_to_nucleotides,
         project_masked_letter_logits_to_nucleotides,
+        suppress_repeated_rmt_inference_logs,
         undo_reverse_complement_logits,
     )
 except ImportError:
@@ -19,6 +21,20 @@ except ImportError:
     "torch/datasets/transformers/safetensors are not installed",
 )
 class InferenceProjectionTests(unittest.TestCase):
+    def test_rmt_inference_suppresses_repeated_backbone_info_logs(self) -> None:
+        backbone_logger = logging.getLogger("genatator_core.backbones")
+        original_level = backbone_logger.level
+        try:
+            backbone_logger.setLevel(logging.INFO)
+            with suppress_repeated_rmt_inference_logs({"family": "rmt"}):
+                self.assertEqual(backbone_logger.level, logging.WARNING)
+            self.assertEqual(backbone_logger.level, logging.INFO)
+
+            with suppress_repeated_rmt_inference_logs({"family": "amt"}):
+                self.assertEqual(backbone_logger.level, logging.INFO)
+        finally:
+            backbone_logger.setLevel(original_level)
+
     def test_plain_bpe_truncation_leaves_uncovered_nucleotides_nan(self) -> None:
         logits = np.arange(12, dtype=np.float32).reshape(3, 4)
         projected = project_bpe_token_logits_to_nucleotides(
@@ -49,4 +65,3 @@ class InferenceProjectionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

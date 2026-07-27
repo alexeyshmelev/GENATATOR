@@ -48,6 +48,7 @@ def test_all_shipped_training_configs_use_requested_contracts() -> None:
             if model["family"] == "amt":
                 assert model["amt"]["num_mem_tokens"] == (10 if model["backbone_kind"] == "gena" else 20), path
                 assert model["amt"]["segment_size"] == (502 if model["backbone_kind"] == "gena" else 1004), path
+                assert model["amt"]["d_mem"] == 64, path
             if model["family"] == "unet":
                 assert model["unet_cycles"] == 1, path
             if model["family"] == "amt" and model.get("use_unet"):
