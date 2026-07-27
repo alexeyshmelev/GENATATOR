@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
+from contextlib import contextmanager
 from typing import Any, Dict, List
 
 import numpy as np
@@ -14,6 +15,21 @@ from .model_builders import build_model, load_finetuned_weights
 from .train_common import dataset_family_from_model, prepare_nucleotide_tokenizer
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def suppress_repeated_rmt_inference_logs(model_cfg: Dict[str, Any]):
+    """Hide per-segment embedding diagnostics during RMT inference only."""
+    if model_cfg.get("family") != "rmt":
+        yield
+        return
+    backbone_logger = logging.getLogger("genatator_core.backbones")
+    previous_level = backbone_logger.level
+    backbone_logger.setLevel(max(previous_level, logging.WARNING))
+    try:
+        yield
+    finally:
+        backbone_logger.setLevel(previous_level)
 
 
 def sigmoid(x):
@@ -191,49 +207,50 @@ def _predict_once(cfg: Dict[str, Any], task: str, device: str, reverse_complemen
         raise RuntimeError("GENATATOR inference batch_size must be 1 for every task/model")
     loader = DataLoader(dataset, batch_size=1, collate_fn=GenatatorCollator())
     rows = []
-    with torch.no_grad():
-        for batch in tqdm(loader, desc=f"infer:{task}:rc={reverse_complement}"):
-            meta = batch.pop("metadata")
-            dna = batch.pop("dna_sequence")
-            local_start = batch.pop("local_start")
-            offset_mapping = batch.pop("offset_mapping")
-            batch.pop("reverse_complement")
-            tensor_batch = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
-            out = model(**tensor_batch)
-            logits = out["logits"] if isinstance(out, dict) else out.logits
-            logits = logits.detach().cpu().numpy()
-            family = data_cfg["model_family"]
-            if task == "transcript_type":
-                masks = None
-            elif family in {"nucleotide", "bpe_unet", "rmt_unet", "amt_unet"}:
-                masks = batch["letter_level_labels_mask"].detach().cpu().numpy().astype(bool)
-            else:
-                masks = batch.get("labels_mask")
-                masks = masks.detach().cpu().numpy().astype(bool) if masks is not None else None
-            for i in range(logits.shape[0]):
+    with suppress_repeated_rmt_inference_logs(cfg["model"]):
+        with torch.no_grad():
+            for batch in tqdm(loader, desc=f"infer:{task}:rc={reverse_complement}"):
+                meta = batch.pop("metadata")
+                dna = batch.pop("dna_sequence")
+                local_start = batch.pop("local_start")
+                offset_mapping = batch.pop("offset_mapping")
+                batch.pop("reverse_complement")
+                tensor_batch = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+                out = model(**tensor_batch)
+                logits = out["logits"] if isinstance(out, dict) else out.logits
+                logits = logits.detach().cpu().numpy()
+                family = data_cfg["model_family"]
                 if task == "transcript_type":
-                    row_logits = logits[i]
+                    masks = None
                 elif family in {"nucleotide", "bpe_unet", "rmt_unet", "amt_unet"}:
-                    row_logits = project_masked_letter_logits_to_nucleotides(
-                        logits[i],
-                        masks[i],
-                        len(dna[i]),
-                    )
+                    masks = batch["letter_level_labels_mask"].detach().cpu().numpy().astype(bool)
                 else:
-                    row_logits = logits[i][
-                        masks[i] if masks is not None else np.ones(logits.shape[1], dtype=bool)
-                    ]
-                if reverse_complement:
-                    row_logits = undo_reverse_complement_logits(row_logits, task)
-                rows.append({
-                    "metadata": meta[i],
-                    "dna_sequence": dna[i],
-                    "local_start": int(local_start[i]),
-                    "offset_mapping": offset_mapping[i],
-                    "model_family": family,
-                    "reverse_complement": bool(reverse_complement),
-                    "logits": row_logits,
-                })
+                    masks = batch.get("labels_mask")
+                    masks = masks.detach().cpu().numpy().astype(bool) if masks is not None else None
+                for i in range(logits.shape[0]):
+                    if task == "transcript_type":
+                        row_logits = logits[i]
+                    elif family in {"nucleotide", "bpe_unet", "rmt_unet", "amt_unet"}:
+                        row_logits = project_masked_letter_logits_to_nucleotides(
+                            logits[i],
+                            masks[i],
+                            len(dna[i]),
+                        )
+                    else:
+                        row_logits = logits[i][
+                            masks[i] if masks is not None else np.ones(logits.shape[1], dtype=bool)
+                        ]
+                    if reverse_complement:
+                        row_logits = undo_reverse_complement_logits(row_logits, task)
+                    rows.append({
+                        "metadata": meta[i],
+                        "dna_sequence": dna[i],
+                        "local_start": int(local_start[i]),
+                        "offset_mapping": offset_mapping[i],
+                        "model_family": family,
+                        "reverse_complement": bool(reverse_complement),
+                        "logits": row_logits,
+                    })
     if task == "segmentation" and bool(data_cfg.get("full_transcript_chunks", False)):
         return aggregate_full_segmentation_chunks(rows)
     return rows

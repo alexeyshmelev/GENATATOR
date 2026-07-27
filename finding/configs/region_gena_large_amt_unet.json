@@ -12,7 +12,7 @@
     "amt": {
       "amt_repo_id": "irodkin/armt-neox-tiny",
       "num_mem_tokens": 10,
-      "d_mem": 32,
+      "d_mem": 64,
       "segment_size": 502
     },
     "vocab_size": null,
