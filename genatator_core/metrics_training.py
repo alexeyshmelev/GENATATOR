@@ -12,26 +12,31 @@ from .intervals import f1_from_counts, interval_counts
 
 EDGE_CLASS_NAMES: tuple[str, ...] = ("TSS+", "TSS-", "PolyA+", "PolyA-")
 REGION_CLASS_NAMES: tuple[str, ...] = ("intragenic+", "intragenic-")
-SEGMENTATION_CLASS_INDEX = {"exon": 1, "CDS": 4}
+SEGMENTATION_CLASS_NAMES: tuple[str, ...] = ("5UTR", "exon", "intron", "3UTR", "CDS")
+SEGMENTATION_CLASS_INDEX = {
+    class_name: SEGMENTATION_CLASS_NAMES.index(class_name)
+    for class_name in ("exon", "CDS")
+}
 SEGMENTATION_INTERVAL_COMPARISON_GROUPS = {
-    # The interval metric is decoded from raw per-nucleotide class scores.
-    # Exon is positive only when EXON wins against 5UTR and 3UTR.
-    "exon": (1, (1, 0, 3)),
-    # CDS is positive only when CDS wins against INTRON.
-    "CDS": (4, (4, 2)),
+    # These are multilabel outputs, so each requested track competes only with
+    # the biologically relevant alternative classes used by the benchmark.
+    "exon": tuple(SEGMENTATION_CLASS_NAMES.index(name) for name in ("exon", "intron")),
+    "CDS": tuple(
+        SEGMENTATION_CLASS_NAMES.index(name)
+        for name in ("CDS", "intron", "5UTR", "3UTR")
+    ),
 }
 
 
 def segmentation_interval_predictions(logits: np.ndarray, class_name: str) -> np.ndarray:
-    """Decode one segmentation interval track by argmax within its comparison group."""
+    """Decode one segmentation interval track within its benchmark class set."""
     try:
-        positive_channel, comparison_channels = SEGMENTATION_INTERVAL_COMPARISON_GROUPS[class_name]
+        comparison_channels = SEGMENTATION_INTERVAL_COMPARISON_GROUPS[class_name]
     except KeyError as exc:
         raise RuntimeError(f"Unsupported segmentation interval class: {class_name!r}") from exc
-    scores = np.asarray(logits)[..., list(comparison_channels)]
-    winner_in_group = np.argmax(scores, axis=-1)
-    positive_position = comparison_channels.index(positive_channel)
-    return (winner_in_group == positive_position).astype(np.int8)
+    scores = sigmoid(np.asarray(logits))[..., list(comparison_channels)]
+    max_scores = np.max(scores, axis=-1)
+    return (scores[..., 0] == max_scores).astype(np.int8)
 
 
 def _pred_array(predictions: Any) -> np.ndarray:
@@ -255,4 +260,3 @@ def metric_names_for_task(task: str) -> tuple[str, ...]:
     if task == "transcript_type":
         return ("accuracy",)
     raise ValueError(f"Unsupported task: {task}")
-
