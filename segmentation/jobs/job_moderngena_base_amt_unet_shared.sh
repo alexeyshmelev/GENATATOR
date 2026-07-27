@@ -22,7 +22,7 @@ export HF_HUB_OFFLINE=1
 export TOKENIZERS_PARALLELISM=0
 export PYTHONPATH=$PWD
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --nproc_per_node=8 -m segmentation.train \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun --master_addr 127.0.0.1 --nproc_per_node=8 segmentation/train.py \
   --config segmentation/configs/moderngena_base_amt_unet.json
 
 date
