@@ -21,6 +21,9 @@ python -m pip install -r requirements.txt
 python -m pip install -e .
 ```
 
+ModernGENA with AMT requires PyTorch 2.4 or newer. All other shipped
+model/task combinations work with the currently provided environment.
+
 For multi-GPU training, launch with `torchrun`. On systems without IPv6 support, explicitly use IPv4 to avoid the harmless `[::]:29500` socket warnings:
 
 ```bash
@@ -104,7 +107,7 @@ Every training config contains these top-level fields:
   "model": {},
   "train_dataset": {},
   "eval_dataset": {},
-  "true_gff": null,
+  "true_gff": "datasets/chr20.gff",
   "training": {}
 }
 ```
@@ -154,7 +157,23 @@ All shipped configurations and the runtime validator enforce:
 
 This invariant applies to every task and every model. `gradient_accumulation_steps` may still be used to change the optimizer-step batch. Finding additionally uses `dataloader_num_workers=0`, because worker subprocesses would otherwise create independent chromosome-sized RAM caches.
 
-Every shipped config uses `max_steps=500000`, `eval_steps=1000`, `save_steps=1000`, and `patience=100`. Patience counts consecutive evaluations without improvement in the selected best-model metric before early stopping. Other important fields include `num_train_epochs`, `learning_rate`, `weight_decay`, `warmup_steps`, mixed precision, checkpoint retention, and `resume_from_checkpoint`.
+Every shipped config uses `max_steps=500000`, `eval_steps=5000`, `save_steps=5000`, and `patience=50`. Patience counts consecutive evaluations without improvement in the selected best-model metric before early stopping. Other important fields include `num_train_epochs`, `learning_rate`, `weight_decay`, `warmup_steps`, mixed precision, checkpoint retention, and `resume_from_checkpoint`.
+
+Every shipped training config also sets:
+
+```json
+"automatic_restart": true
+```
+
+Every invocation still creates a new timestamped run directory. With automatic
+restart enabled and no explicit `resume_from_checkpoint`, the launcher checks
+only the immediately previous run recorded for that configured output directory.
+If its effective JSON configuration is identical, training resumes in the new
+run from the newest complete checkpoint available from that previous run. It
+never searches older sibling runs for another match. A changed or invalid
+previous configuration starts fresh. An explicit `resume_from_checkpoint` takes
+precedence; set `automatic_restart=false` to start fresh when no explicit
+checkpoint is supplied.
 
 Reverse-complement processing is intentionally absent from training configs. Training and training-time validation always use one orientation only.
 
@@ -376,13 +395,16 @@ Reverse-complement averaging is inference-only and defaults to on. Set it to `fa
 
 ### Generated complete gene-finding evaluation
 
-Training either an edge or region model now generates a complete edge + region pipeline config. The trained stage and shared benchmark dataset fields are filled automatically. For the opposite stage, replace the complete `model` placeholder, replace the model-dependent dataset-length marker (including its field name) with either `max_nucleotides` or the `max_bpe_tokens`/`average_bpe_token_length` pair, fill its checkpoint, and fill `inference.true_gff`. Then run:
+Training either an edge or region model now generates a complete edge + region pipeline config. The trained stage and shared benchmark dataset fields are filled automatically. For the opposite stage, replace the complete `model` placeholder, replace the model-dependent dataset-length marker (including its field name) with either `max_nucleotides` or the `max_bpe_tokens`/`average_bpe_token_length` pair, fill its checkpoint, and verify the default `inference.true_gff` path. Then run:
 
 ```bash
 python finding/infer.py --config runs/.../evaluation_config.json
 ```
 
-It writes `finding_predictions.gff` and a combined metrics JSON containing both stages' whole-chromosome PR-AUC and the official Hugging Face annotation metrics.
+It writes `finding_predictions.gff`, a combined metrics JSON containing both
+stages' whole-chromosome PR-AUC and the official Hugging Face annotation
+metrics, and `finding_auc_metrics.csv` containing per-class PR-AUC and ROC-AUC
+for the paired edge and region models.
 
 ### Complete gene-finding pipeline
 
@@ -402,7 +424,9 @@ Set the edge and region checkpoint paths in their respective `inference.checkpoi
 6. filters candidates with intragenic tracks;
 7. writes GFF3;
 8. computes whole-chromosome PR-AUC;
-9. when `true_gff` is set, computes the official boundary/interval metrics as well.
+9. writes per-class edge/region PR-AUC and ROC-AUC to
+   `inference.metrics_csv`;
+10. when `true_gff` is set, computes the official boundary/interval metrics as well.
 
 ### Segmentation
 
@@ -419,7 +443,9 @@ Important inference switches:
 }
 ```
 
-`use_cds_heuristic` defaults to on. It replaces the directly decoded mRNA CDS with the benchmark-compatible longest complete ORF inferred from predicted exons. Set it to `false` to keep the model's direct CDS track.
+`use_cds_heuristic` defaults to on. It replaces the model's directly decoded
+mRNA CDS with the benchmark-compatible longest complete ORF inferred from
+predicted exons. Set it to `false` to keep the model's direct CDS track.
 
 The script writes a GFF3 file and runs the official segmentation metric when `true_gff` is non-null.
 
@@ -437,26 +463,32 @@ The script writes a TSV containing probabilities and classes and always writes a
 
 | Task | Metric |
 |---|---|
-| `finding_edge` | PR-AUC for TSS+/TSS-/PolyA+/PolyA- and their mean |
-| `finding_region` | PR-AUC for intragenic+/intragenic- and their mean |
+| `finding_edge` | Per-class PR-AUC and ROC-AUC for TSS+/TSS-/PolyA+/PolyA- |
+| `finding_region` | Per-class PR-AUC and ROC-AUC for intragenic+/intragenic- |
 | `segmentation` | exact interval-level F1 for exon and CDS |
 | `transcript_type` | accuracy |
 
-Segmentation interval decoding uses raw-score argmax, not independent 0.5 thresholds:
+Training validation and direct segmentation GFF inference use the same
+raw-score competition sets, not independent 0.5 thresholds:
 
 ```text
-exon prediction: argmax among [exon, 5UTR, 3UTR]; positive only when exon wins
-CDS prediction:  argmax among [CDS, intron]; positive only when CDS wins
+exon prediction: argmax among [exon, intron]; positive only when exon wins
+CDS prediction:  argmax among [CDS, intron, 5UTR, 3UTR]; positive only when CDS wins
 ```
 
-Contiguous positive bases become half-open intervals. A predicted interval is a true positive only when it exactly equals a reference interval. Counts are pooled across validation samples before F1 is computed.
+The target class wins ties. Contiguous positive bases become half-open
+intervals. A predicted interval is a true positive only when it exactly equals a
+reference interval. Counts are pooled across validation samples before F1 is
+computed.
 
 Training-time validation never applies reverse-complement averaging.
 
 ### Inference metrics
 
 - **Finding single-stage:** whole-chromosome per-channel and pooled PR-AUC.
-- **Finding complete pipeline:** the same PR-AUC plus official gene-boundary metrics when a reference GFF is provided.
+- **Finding complete pipeline:** per-class PR-AUC and ROC-AUC in a separate CSV,
+  plus the existing JSON and official gene-boundary metrics when a reference GFF
+  is provided.
 - **Segmentation:** official gene/interval metrics from prediction and reference GFF files when `true_gff` is provided.
 - **Transcript type:** accuracy over every selected transcript.
 
