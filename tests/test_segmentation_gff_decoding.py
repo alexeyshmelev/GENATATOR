@@ -16,10 +16,10 @@ class SegmentationGffDecodingTests(unittest.TestCase):
         # Columns: 5UTR, EXON, INTRON, 3UTR, CDS.
         scores = np.asarray(
             [
-                [10.0, 9.0, 0.0, 1.0, -5.0],  # 5UTR wins: not exon; intron wins: not CDS
-                [1.0, 2.0, 5.0, 0.0, 4.0],   # EXON wins its group; intron beats CDS
-                [0.0, 3.0, 1.0, 2.0, 4.0],   # EXON and CDS win
-                [0.0, 1.0, 2.0, 4.0, 3.0],   # 3UTR wins: not exon; CDS wins
+                [10.0, 9.0, 0.0, 1.0, -5.0],  # UTR is ignored for exon; exon wins intron
+                [1.0, 2.0, 5.0, 0.0, 4.0],   # Intron beats both exon and CDS
+                [0.0, 3.0, 1.0, 2.0, 4.0],   # Exon and CDS both win
+                [0.0, 2.0, 2.0, 4.0, 4.0],   # Target wins exon tie and CDS/3UTR tie
             ],
             dtype=np.float32,
         )
@@ -33,7 +33,7 @@ class SegmentationGffDecodingTests(unittest.TestCase):
             strand="+",
         )
         record = labels_to_segmentation_record(meta, scores, threshold=0.999999)
-        self.assertEqual(record["exons"], [(1, 3)])
+        self.assertEqual(record["exons"], [(0, 1), (2, 4)])
         self.assertEqual(record["cds"], [(2, 4)])
 
 

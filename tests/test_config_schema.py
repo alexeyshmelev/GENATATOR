@@ -28,12 +28,13 @@ def test_all_shipped_training_configs_use_requested_contracts() -> None:
         for path, cfg in _training_paths(task):
             model = cfg["model"]
             training = cfg["training"]
-            assert cfg.get("true_gff") is None, path
+            assert cfg.get("true_gff") == "datasets/chr20.gff", path
             assert training.get("custom_prefix") is not None, path
             assert training["max_steps"] == 500_000, path
-            assert training["eval_steps"] == 1000, path
-            assert training["save_steps"] == 1000, path
-            assert training["patience"] == 100, path
+            assert training["eval_steps"] == 5000, path
+            assert training["save_steps"] == 5000, path
+            assert training["patience"] == 50, path
+            assert training["automatic_restart"] is True, path
             assert "eval_interval" not in training, path
             assert "save_interval" not in training, path
             assert "nucleotide_vocab_size" not in model, path
@@ -114,6 +115,8 @@ def test_standalone_evaluation_templates_use_required_subsets() -> None:
     assert "statuses" not in segmentation["dataset"]
     assert segmentation["dataset"]["full_transcript_chunks"] is True
     assert segmentation["inference"]["use_reverse_complement"] is True
+    assert segmentation["inference"]["use_cds_heuristic"] is True
+    assert segmentation["inference"]["true_gff"] == "datasets/chr20.gff"
 
     transcript = json.loads((REPO / "transcript_type/configs/infer_moderngena_base.json").read_text())
     assert transcript["dataset"]["config_name"] == "val-human"
@@ -122,6 +125,7 @@ def test_standalone_evaluation_templates_use_required_subsets() -> None:
     assert transcript["dataset"]["chromosomes"] == FIXED_CHROMOSOME
     assert "statuses" not in transcript["dataset"]
     assert transcript["inference"]["use_reverse_complement"] is True
+    assert transcript["inference"]["true_gff"] == "datasets/chr20.gff"
 
     finding = json.loads((REPO / "finding/configs/infer_moderngena_base_plain.json").read_text())
     for stage in ("edge", "region"):
@@ -131,7 +135,8 @@ def test_standalone_evaluation_templates_use_required_subsets() -> None:
     assert finding["inference"]["use_reverse_complement"] is True
     assert finding["edge"]["inference"]["checkpoint_path"] == "<manually_insert_value_here>"
     assert finding["region"]["inference"]["checkpoint_path"] == "<manually_insert_value_here>"
-    assert finding["inference"]["true_gff"] == "<manually_insert_value_here>"
+    assert finding["inference"]["true_gff"] == "datasets/chr20.gff"
+    assert finding["inference"]["metrics_csv"] == "finding_auc_metrics.csv"
     assert finding["inference"]["k_values"] == [0, 50, 100, 250, 500]
     assert finding["inference"]["use_strand"] is True
     assert finding["postprocess"] == {

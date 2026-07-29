@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import tempfile
 import unittest
@@ -94,6 +95,7 @@ class FindingPipelineConfigTests(unittest.TestCase):
             temporary = Path(temporary)
             gff_path = temporary / "predictions.gff"
             metrics_path = temporary / "metrics.json"
+            metrics_csv_path = metrics_path.with_suffix(".csv")
             cfg = self._complete_config()
             cfg["postprocess"] = {
                 "low_pass_fraction": 0.05,
@@ -159,6 +161,48 @@ class FindingPipelineConfigTests(unittest.TestCase):
             self.assertIn("edge", metrics["pr_auc"])
             self.assertIn("region", metrics["pr_auc"])
             self.assertEqual(metrics["annotation"], {"official_metric": 1.0})
+            self.assertTrue(metrics_csv_path.is_file())
+            with open(metrics_csv_path, encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                self.assertEqual(
+                    reader.fieldnames,
+                    ["stage", "class", "pr_auc", "roc_auc"],
+                )
+                auc_rows = list(reader)
+            self.assertEqual(
+                [(row["stage"], row["class"]) for row in auc_rows],
+                [
+                    ("edge", "TSS+"),
+                    ("edge", "TSS-"),
+                    ("edge", "PolyA+"),
+                    ("edge", "PolyA-"),
+                    ("region", "intragenic+"),
+                    ("region", "intragenic-"),
+                ],
+            )
+            self.assertEqual(
+                [(row["pr_auc"], row["roc_auc"]) for row in auc_rows],
+                [
+                    ("1.0", "1.0"),
+                    ("", ""),
+                    ("1.0", "1.0"),
+                    ("", ""),
+                    ("1.0", "1.0"),
+                    ("", ""),
+                ],
+            )
+
+    def test_auc_helpers_filter_nonfinite_values_and_handle_undefined_classes(self) -> None:
+        truth = np.asarray([0.0, 1.0, np.nan, 0.0, 1.0])
+        scores = np.asarray([0.1, 0.9, 0.8, np.inf, 0.7])
+        self.assertEqual(finding_infer.average_precision(truth, scores), 1.0)
+        self.assertEqual(finding_infer.roc_auc(truth, scores), 1.0)
+        self.assertIsNone(
+            finding_infer.roc_auc(
+                np.asarray([0.0, 0.0]),
+                np.asarray([0.1, 0.2]),
+            )
+        )
 
 
 if __name__ == "__main__":

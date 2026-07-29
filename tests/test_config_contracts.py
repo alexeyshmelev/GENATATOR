@@ -40,6 +40,11 @@ class StaticConfigContractsTest(unittest.TestCase):
                 if "inference" in cfg:
                     self.assertEqual(cfg["inference"]["batch_size"], 1, path)
                     self.assertIs(cfg["inference"]["use_reverse_complement"], True, path)
+                    self.assertEqual(
+                        cfg["inference"]["true_gff"],
+                        "datasets/chr20.gff",
+                        path,
+                    )
                     if task_dir == "segmentation":
                         self.assertIs(cfg["inference"]["use_cds_heuristic"], True, path)
                 for stage in ("edge", "region"):
@@ -55,7 +60,8 @@ class StaticConfigContractsTest(unittest.TestCase):
                 cfg = json.loads(path.read_text())
                 if isinstance(cfg.get("training"), dict):
                     self.assertIn("true_gff", cfg)
-                    self.assertIsNone(cfg["true_gff"])
+                    self.assertEqual(cfg["true_gff"], "datasets/chr20.gff")
+                    self.assertIs(cfg["training"]["automatic_restart"], True)
 
 
 if __name__ == "__main__":

@@ -42,7 +42,7 @@
     "parquet_batch_size": 64,
     "random_crop": true
   },
-  "true_gff": null,
+  "true_gff": "datasets/chr20.gff",
   "training": {
     "output_dir": "runs/segmentation_caduceus_ps_middle_loss",
     "custom_prefix": "",
@@ -56,8 +56,8 @@
     "warmup_steps": 1000,
     "lr_scheduler_type": "constant_with_warmup",
     "logging_steps": 100,
-    "eval_steps": 1000,
-    "save_steps": 1000,
+    "eval_steps": 5000,
+    "save_steps": 5000,
     "save_total_limit": 3,
     "load_best_model_at_end": true,
     "metric_for_best_model": "interval_f1_exon",
@@ -66,10 +66,11 @@
     "bf16": true,
     "fp16": false,
     "resume_from_checkpoint": null,
+    "automatic_restart": true,
     "save_safetensors": false,
     "logging_interval": 100,
     "eval_accumulation_steps": 1,
-    "patience": 100
+    "patience": 50
   },
   "task": "segmentation"
 }

@@ -35,7 +35,7 @@
     "coordinate_mode": "transcript",
     "empty_segment_policy": "error",
     "output_gff": "segmentation_predictions.gff",
-    "true_gff": null,
+    "true_gff": "datasets/chr20.gff",
     "metrics_json": "segmentation_metrics.json"
   },
   "task": "segmentation"
