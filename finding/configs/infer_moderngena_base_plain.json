@@ -72,8 +72,9 @@
     "device": "cuda",
     "use_reverse_complement": true,
     "output_gff": "finding_predictions.gff",
-    "true_gff": "<manually_insert_value_here>",
+    "true_gff": "datasets/chr20.gff",
     "metrics_json": "finding_metrics.json",
+    "metrics_csv": "finding_auc_metrics.csv",
     "k_values": [
       0,
       50,

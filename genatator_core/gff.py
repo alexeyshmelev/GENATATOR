@@ -6,6 +6,7 @@ from typing import Dict, List
 import numpy as np
 
 from .intervals import binary_intervals
+from .segmentation_decoding import segmentation_competition_predictions
 
 
 def _norm_tx_type(value: str) -> str:
@@ -115,8 +116,8 @@ def labels_to_segmentation_record(meta, probs, threshold=0.5, force_nonempty: bo
     scores = np.asarray(probs)
     if scores.ndim != 2 or scores.shape[1] < 5:
         raise RuntimeError(f"Segmentation decoding expects [length, 5] scores, got {scores.shape}")
-    exon_track = np.argmax(scores[:, [1, 0, 3]], axis=1) == 0
-    cds_track = np.argmax(scores[:, [4, 2]], axis=1) == 0
+    exon_track = segmentation_competition_predictions(scores, "exon")
+    cds_track = segmentation_competition_predictions(scores, "CDS")
     exons = binary_intervals(exon_track)
     cds = binary_intervals(cds_track)
     if force_nonempty and not exons and probs.shape[1] > 1:

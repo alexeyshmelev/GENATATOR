@@ -21,6 +21,7 @@ from .metrics_training import (
     REGION_CLASS_NAMES,
     SEGMENTATION_CLASS_INDEX,
     _safe_binary_average_precision,
+    _safe_binary_roc_auc,
     metric_for_task,
     metric_names_for_task,
     segmentation_interval_predictions,
@@ -36,13 +37,48 @@ from .run_management import (
     BestCheckpointEvaluationConfigCallback,
     EvaluationConfigManager,
     atomic_save_json,
-    create_timestamped_run_dir,
+    create_training_run,
     is_world_process_zero,
 )
 from .torch_compat import allow_transformers_torch_load_on_legacy_torch
 from .utils import set_seed
 
 logger = logging.getLogger(__name__)
+
+
+def filter_training_logs(logs: Dict[str, Any], task: str) -> Dict[str, Any]:
+    """Keep only task metrics requested for routine training logs."""
+    filtered = {
+        key: value
+        for key, value in dict(logs).items()
+        if "flos" not in key.lower()
+    }
+    if "train_loss" in filtered:
+        filtered.setdefault("loss", filtered.pop("train_loss"))
+
+    if task.startswith("finding"):
+        if any(key.startswith("eval_") for key in filtered):
+            class_names = (
+                EDGE_CLASS_NAMES
+                if task == "finding_edge"
+                else REGION_CLASS_NAMES
+            )
+            allowed = {"eval_loss"} | {
+                metric
+                for class_name in class_names
+                for metric in (
+                    f"eval_pr_auc_{class_name}",
+                    f"eval_roc_auc_{class_name}",
+                )
+            }
+            return {
+                key: value
+                for key, value in filtered.items()
+                if key in allowed
+            }
+        allowed = {"loss", "epoch", "grad_norm", "learning_rate"}
+        return {key: value for key, value in filtered.items() if key in allowed}
+    return filtered
 
 
 class FindingWindowSampler(Sampler[int]):
@@ -124,6 +160,16 @@ class GenatatorTrainer(Trainer):
     def _load_from_checkpoint(self, *args, **kwargs):
         self._enable_trusted_checkpoint_loading("GenatatorTrainer._load_from_checkpoint")
         return super()._load_from_checkpoint(*args, **kwargs)
+
+    def log(self, logs: Dict[str, float], start_time: float | None = None) -> None:
+        filtered = filter_training_logs(logs, self.genatator_task)
+        if not filtered:
+            return
+        base_log = super().log
+        if "start_time" in inspect.signature(base_log).parameters:
+            base_log(filtered, start_time=start_time)
+        else:
+            base_log(filtered)
 
     @staticmethod
     def _output_value(outputs, name: str):
@@ -228,23 +274,14 @@ class GenatatorTrainer(Trainer):
         metrics[f"{metric_key_prefix}_loss"] = float(state.get("loss_sum", 0.0) / loss_count)
         task = self.genatator_task
         if task in {"finding_edge", "finding_region"}:
-            defined_values = []
-            total_dropped = 0
             for c, class_name in enumerate(state["class_names"]):
                 refs = np.concatenate(state["refs"][c], axis=0) if state["refs"][c] else np.asarray([], dtype=np.float32)
                 scores = np.concatenate(state["scores"][c], axis=0) if state["scores"][c] else np.asarray([], dtype=np.float32)
-                ap, defined, positives, negatives, dropped = _safe_binary_average_precision(refs, scores)
-                total_dropped += dropped
+                ap, _, _, _, _ = _safe_binary_average_precision(refs, scores)
                 metrics[f"{metric_key_prefix}_pr_auc_{class_name}"] = float(ap)
-                metrics[f"{metric_key_prefix}_pr_auc_{class_name}_defined"] = float(defined)
-                metrics[f"{metric_key_prefix}_pr_auc_{class_name}_positives"] = float(positives)
-                metrics[f"{metric_key_prefix}_pr_auc_{class_name}_negatives"] = float(negatives)
-                metrics[f"{metric_key_prefix}_pr_auc_{class_name}_dropped_nonfinite"] = float(dropped)
-                if defined:
-                    defined_values.append(ap)
-            metrics[f"{metric_key_prefix}_pr_auc_defined_channels"] = float(len(defined_values))
-            metrics[f"{metric_key_prefix}_pr_auc_mean"] = float(np.mean(defined_values)) if defined_values else 0.0
-            metrics[f"{metric_key_prefix}_pr_auc_dropped_nonfinite_total"] = float(total_dropped)
+                metrics[f"{metric_key_prefix}_roc_auc_{class_name}"] = float(
+                    _safe_binary_roc_auc(refs, scores)
+                )
         elif task == "segmentation":
             for class_name, (tp, fp, fn) in state["counts"].items():
                 metrics[f"{metric_key_prefix}_interval_f1_{class_name}"] = float(f1_from_counts(tp, fp, fn))
@@ -290,7 +327,10 @@ class GenatatorTrainer(Trainer):
                 pbar.update(1)
         pbar.close()
         metrics = self._finalize_streaming_state(state, metric_key_prefix)
-        metrics[f"{metric_key_prefix}_samples"] = float(len(dataset)) if hasattr(dataset, "__len__") else 0.0
+        if self.genatator_task == "transcript_type":
+            metrics[f"{metric_key_prefix}_samples"] = (
+                float(len(dataset)) if hasattr(dataset, "__len__") else 0.0
+            )
         if hasattr(dataset, "release_finding_cache"):
             dataset.release_finding_cache()
         return metrics
@@ -476,10 +516,14 @@ def validate_rules(cfg: Dict[str, Any], task: str) -> None:
     tr = cfg["training"]
     train_bs = int(tr.get("per_device_train_batch_size", 1))
     eval_bs = int(tr.get("per_device_eval_batch_size", 1))
-    patience = int(tr.get("patience", 100))
+    patience = int(tr.get("patience", 50))
     if patience <= 0:
         raise RuntimeError(f"training.patience must be positive, got {patience}")
     tr["patience"] = patience
+    automatic_restart = tr.get("automatic_restart", True)
+    if type(automatic_restart) is not bool:
+        raise RuntimeError("training.automatic_restart must be true or false")
+    tr["automatic_restart"] = automatic_restart
     if train_bs != 1 or eval_bs != 1:
         raise RuntimeError(
             "GENATATOR requires per_device_train_batch_size=1 and per_device_eval_batch_size=1 for every task/model"
@@ -550,16 +594,6 @@ def train_from_config(config_path: str, task: str | None = None) -> None:
     set_seed(int(cfg.get("seed", 42)))
     tr = cfg["training"]
     configured_output_dir = str(Path(tr["output_dir"]).expanduser().resolve())
-    output_dir = create_timestamped_run_dir(tr, config_path=config_path)
-    tr["output_base_dir"] = configured_output_dir
-    tr["output_dir"] = str(output_dir)
-    tr["overwrite_output_dir"] = False
-    logger.info(
-        "[training.run] base_output_dir=%s effective_output_dir=%s custom_prefix=%s",
-        configured_output_dir,
-        output_dir,
-        tr.get("custom_prefix", ""),
-    )
 
     model_cfg = cfg["model"]
     dataset_family = dataset_family_from_model(model_cfg)
@@ -576,10 +610,35 @@ def train_from_config(config_path: str, task: str | None = None) -> None:
 
     # At this point tokenizer-dependent values such as vocab_size
     # are resolved, while runtime-only objects have not yet entered cfg.
+    run_plan = create_training_run(cfg, config_path=config_path)
+    output_dir = run_plan.run_dir
+    tr["output_base_dir"] = configured_output_dir
+    tr["output_dir"] = str(output_dir)
+    tr["overwrite_output_dir"] = False
+    logger.info(
+        "[training.run] base_output_dir=%s effective_output_dir=%s custom_prefix=%s "
+        "automatic_restart=%s source_run=%s resume_checkpoint=%s",
+        configured_output_dir,
+        output_dir,
+        tr.get("custom_prefix", ""),
+        tr["automatic_restart"],
+        run_plan.source_run_dir,
+        run_plan.resume_from_checkpoint,
+    )
+
     evaluation_config_manager = EvaluationConfigManager(cfg, task=task, run_dir=output_dir)
     if is_world_process_zero():
         atomic_save_json(cfg, output_dir / "training_config.json")
     evaluation_config_manager.write_initial()
+    if run_plan.resume_from_checkpoint is not None:
+        evaluation_config_manager.update_checkpoint(
+            run_plan.resume_from_checkpoint,
+            selection=(
+                "automatic_restart"
+                if run_plan.source_run_dir is not None
+                else "explicit_resume"
+            ),
+        )
     cfg["_tokenizer"] = tokenizer
 
     train_data_cfg = dict(cfg["train_dataset"])
@@ -609,8 +668,8 @@ def train_from_config(config_path: str, task: str | None = None) -> None:
         list(metric_names_for_task(task)),
     )
     logging_interval = int(tr.get("logging_interval", tr.get("logging_steps", 100)))
-    eval_steps = int(tr.get("eval_steps", logging_interval))
-    save_steps = int(tr.get("save_steps", eval_steps))
+    eval_steps = int(tr.get("eval_steps", 5000))
+    save_steps = int(tr.get("save_steps", 5000))
     patience = int(tr["patience"])
     logger.info(
         "[training.steps] logging_steps=%d eval_steps=%d save_steps=%d patience=%d",
@@ -666,6 +725,8 @@ def train_from_config(config_path: str, task: str | None = None) -> None:
         seed=int(cfg.get("seed", 42)),
     )
     ta_params = inspect.signature(TrainingArguments.__init__).parameters
+    if "restore_callback_states_from_checkpoint" in ta_params:
+        ta_kwargs["restore_callback_states_from_checkpoint"] = True
     if "eval_strategy" in ta_params:
         ta_kwargs["eval_strategy"] = evaluation_strategy
     elif "evaluation_strategy" in ta_params:
@@ -692,19 +753,21 @@ def train_from_config(config_path: str, task: str | None = None) -> None:
             EarlyStoppingCallback(early_stopping_patience=patience),
         ],
     )
-    resume = tr.get("resume_from_checkpoint") or None
-    if isinstance(resume, bool):
-        raise RuntimeError(
-            "training.resume_from_checkpoint must be an explicit checkpoint path. "
-            "Boolean auto-resume cannot search a newly created timestamped run directory."
-        )
+    resume = (
+        str(run_plan.resume_from_checkpoint)
+        if run_plan.resume_from_checkpoint is not None
+        else None
+    )
     logger.info("[training] resume_from_checkpoint=%s", resume)
     train_result = trainer.train(resume_from_checkpoint=resume)
     final_model_dir = output_dir / "final_model"
     trainer.save_model(str(final_model_dir))
     trainer.save_state()
     if trainer.is_world_process_zero():
-        atomic_save_json(dict(train_result.metrics), output_dir / "train_metrics.json")
+        atomic_save_json(
+            filter_training_logs(dict(train_result.metrics), task),
+            output_dir / "train_metrics.json",
+        )
         best = getattr(trainer.state, "best_model_checkpoint", None)
         if best and Path(best).expanduser().exists():
             evaluation_config_manager.update_checkpoint(best, selection="best", copy_to=final_model_dir)
