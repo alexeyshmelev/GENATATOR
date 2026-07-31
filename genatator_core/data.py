@@ -6,6 +6,9 @@ import json
 import logging
 import math
 import os
+import shutil
+import tempfile
+from array import array
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -417,9 +420,10 @@ def _materialize_streaming_dataset(iterable, cfg: Dict[str, Any]) -> Materialize
 # -----------------------------------------------------------------------------
 # Hugging Face `datasets.load_dataset(...)` may fail on these transcript parquet
 # files with a PyArrow "List index overflow" while it is preparing an Arrow
-# cache. The model logic does not require the HF Dataset object here, so for the
-# GENATATOR segmentation dataset we read parquet files directly with PyArrow in
-# bounded record batches and materialize the requested rows into RAM ourselves.
+# cache. The model logic does not require the HF Dataset object here. Segmentation
+# therefore keeps only compact parquet row locations in RAM and reads one selected
+# transcript from disk whenever it is requested. Transcript-type loading retains
+# its existing bounded-batch materialization path.
 
 def _looks_like_segmentation_dataset_ref(path: str, cfg: Dict[str, Any]) -> bool:
     ref = str(path)
@@ -569,6 +573,568 @@ def _arrow_2d_scalar_to_numpy(scalar: Any, dtype=np.float32) -> np.ndarray:
         return np.asarray(value, dtype=dtype)
 
 
+_SEGMENTATION_ROW_CACHE_VERSION = 1
+_SEGMENTATION_ROWS_PER_CACHE_SHARD = 64
+
+
+def _segmentation_row_cache_root(cfg: Dict[str, Any]) -> Path:
+    cache_root = Path(
+        cfg.get("segmentation_index_cache_dir")
+        or cfg.get("finding_index_cache_dir")
+        or os.environ.get("GENATATOR_CACHE_DIR")
+        or (Path.home() / ".cache" / "genatator")
+    ).expanduser().resolve() / "segmentation_rows"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    return cache_root
+
+
+def _segmentation_row_cache_fingerprint(
+    files: Sequence[Path],
+    cfg: Dict[str, Any],
+) -> str:
+    chromosomes = set()
+    for value in (cfg.get("chromosomes") or []):
+        chromosomes |= _chrom_aliases(value)
+    statuses = cfg.get("statuses")
+    identity = {
+        "version": _SEGMENTATION_ROW_CACHE_VERSION,
+        "path": str(cfg.get("path", "")),
+        "config_name": cfg.get("config_name"),
+        "split": str(cfg.get("split", "train")),
+        "revision": cfg.get("revision"),
+        "genomes": sorted(_norm_id(value) for value in (cfg.get("genomes") or [])),
+        "chromosomes": sorted(chromosomes),
+        "statuses": sorted(int(value) for value in statuses) if statuses is not None else None,
+        "max_rows": int(cfg["max_rows"]) if cfg.get("max_rows") else None,
+        "sources": [],
+    }
+    for file_path in files:
+        resolved = Path(file_path).expanduser().resolve()
+        stat = resolved.stat()
+        identity["sources"].append(
+            {
+                "path": str(resolved),
+                "size": int(stat.st_size),
+                "mtime_ns": int(stat.st_mtime_ns),
+            }
+        )
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _validated_segmentation_row_cache_manifest(
+    cache_dir: Path,
+    fingerprint: str,
+) -> Optional[Dict[str, Any]]:
+    """Return a complete cache manifest, or None for a missing/incomplete cache."""
+    import pyarrow.parquet as pq
+
+    manifest_path = cache_dir / "manifest.json"
+    if not manifest_path.is_file():
+        return None
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if int(payload.get("version", -1)) != _SEGMENTATION_ROW_CACHE_VERSION:
+            return None
+        if str(payload.get("fingerprint", "")) != fingerprint:
+            return None
+        parts = payload.get("parts")
+        if not isinstance(parts, list) or not parts:
+            return None
+
+        selected_rows = 0
+        for part in parts:
+            if not isinstance(part, dict):
+                return None
+            name = str(part.get("name", ""))
+            rows = int(part.get("rows", 0))
+            if not name or Path(name).name != name or rows < 1:
+                return None
+            if rows > _SEGMENTATION_ROWS_PER_CACHE_SHARD:
+                return None
+            part_path = cache_dir / name
+            if not part_path.is_file():
+                return None
+            parquet = pq.ParquetFile(
+                str(part_path),
+                memory_map=False,
+                pre_buffer=False,
+            )
+            try:
+                if parquet.num_row_groups != rows:
+                    return None
+                for row_group_index in range(parquet.num_row_groups):
+                    if int(parquet.metadata.row_group(row_group_index).num_rows) != 1:
+                        return None
+            finally:
+                close = getattr(parquet, "close", None)
+                if callable(close):
+                    close()
+            selected_rows += rows
+        if selected_rows != int(payload.get("selected_rows", -1)):
+            return None
+        return payload
+    except Exception as exc:
+        logger.warning(
+            "[direct_parquet.cache.invalid] path=%s reason=%s",
+            cache_dir,
+            exc,
+        )
+        return None
+
+
+def _build_segmentation_row_cache(
+    files: Sequence[Path],
+    cfg: Dict[str, Any],
+    build_dir: Path,
+    fingerprint: str,
+) -> Dict[str, Any]:
+    """Stream selected transcripts into bounded shards with one row per row group."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    genomes = set(_norm_id(value) for value in (cfg.get("genomes") or []))
+    chromosomes = set()
+    for value in (cfg.get("chromosomes") or []):
+        chromosomes |= _chrom_aliases(value)
+    statuses = cfg.get("statuses")
+    statuses = set(int(value) for value in statuses) if statuses is not None else None
+    max_rows = int(cfg["max_rows"]) if cfg.get("max_rows") else None
+    batch_size = int(cfg.get("parquet_batch_size") or cfg.get("metadata_batch_size") or 64)
+    if batch_size < 1:
+        raise RuntimeError(f"parquet_batch_size must be positive, got {batch_size}")
+
+    parts: List[Dict[str, Any]] = []
+    selected_count = 0
+    matching_rows = 0
+    total_rows = 0
+    total_nt = 0
+    has_status_any = False
+    observed: List[Dict[str, Any]] = []
+    chrom_counts: Dict[str, int] = {}
+    type_counts: Dict[str, int] = {}
+    writer = None
+    writer_rows = 0
+    writer_part_index: Optional[int] = None
+
+    def close_writer() -> None:
+        nonlocal writer, writer_rows, writer_part_index
+        if writer is None:
+            return
+        writer.close()
+        if writer_part_index is None or writer_rows < 1:
+            raise RuntimeError("Segmentation row-cache writer closed without a populated shard")
+        parts[writer_part_index]["rows"] = int(writer_rows)
+        writer = None
+        writer_rows = 0
+        writer_part_index = None
+
+    disk_size = sum(path.stat().st_size for path in files if path.exists())
+    logger.info(
+        "[direct_parquet.cache.build] files=%d disk_size=%s chromosomes=%s genomes=%s "
+        "statuses=%s batch_size=%d rows_per_shard=%d",
+        len(files), _human_bytes(disk_size), sorted(chromosomes), sorted(genomes),
+        statuses, batch_size, _SEGMENTATION_ROWS_PER_CACHE_SHARD,
+    )
+
+    max_reached = False
+    pbar_files = tqdm(files, desc="build selected transcript parquet cache", unit="file")
+    try:
+        for path in pbar_files:
+            # Rotate at every source boundary as well as the shard-size boundary so
+            # source files with compatible-but-not-identical Arrow schemas never
+            # share one ParquetWriter.
+            close_writer()
+            parquet = pq.ParquetFile(
+                str(path),
+                memory_map=False,
+                pre_buffer=False,
+            )
+            try:
+                schema_names = set(parquet.schema_arrow.names)
+                required = {"dna_sequence", "metadata", "labels"}
+                missing = sorted(required - schema_names)
+                if missing:
+                    raise RuntimeError(
+                        f"Transcript parquet {path} is missing required columns: {missing}"
+                    )
+                has_status = "status" in schema_names
+                has_status_any = has_status_any or has_status
+                if statuses is not None and not has_status:
+                    raise RuntimeError(
+                        f"statuses filter was requested but transcript parquet {path} "
+                        "has no status column"
+                    )
+                columns = ["dna_sequence", "metadata", "labels"]
+                if has_status:
+                    columns.append("status")
+
+                for batch in parquet.iter_batches(
+                    batch_size=batch_size,
+                    columns=columns,
+                    use_threads=False,
+                ):
+                    names = batch.schema.names
+                    col_metadata = batch.column(names.index("metadata"))
+                    col_status = (
+                        batch.column(names.index("status")) if "status" in names else None
+                    )
+                    total_rows += batch.num_rows
+                    for batch_row_index in range(batch.num_rows):
+                        metadata_value = col_metadata[batch_row_index].as_py()
+                        status_value = (
+                            int(col_status[batch_row_index].as_py())
+                            if col_status is not None
+                            else None
+                        )
+                        if len(observed) < 2000:
+                            observed.append(
+                                {"metadata": metadata_value, "status": status_value}
+                            )
+                        metadata = parse_metadata(metadata_value)
+                        if not _matches_any(metadata.genome, genomes):
+                            continue
+                        if not _matches_any(metadata.chrom, chromosomes, is_chrom=True):
+                            continue
+                        if statuses is not None and status_value not in statuses:
+                            continue
+
+                        matching_rows += 1
+                        if max_rows is not None and selected_count >= max_rows:
+                            max_reached = True
+                            break
+                        if (
+                            writer is None
+                            or writer_rows >= _SEGMENTATION_ROWS_PER_CACHE_SHARD
+                        ):
+                            close_writer()
+                            writer_part_index = len(parts)
+                            part_name = f"part-{writer_part_index:06d}.parquet"
+                            one_row = batch.slice(batch_row_index, 1)
+                            parts.append({"name": part_name, "rows": 0})
+                            writer = pq.ParquetWriter(
+                                str(build_dir / part_name),
+                                one_row.schema,
+                                compression="zstd",
+                                use_dictionary=False,
+                                write_statistics=False,
+                            )
+
+                        one_row = batch.slice(batch_row_index, 1)
+                        writer.write_table(
+                            pa.Table.from_batches([one_row]),
+                            row_group_size=1,
+                        )
+                        writer_rows += 1
+                        selected_count += 1
+                        chrom_counts[metadata.chrom] = chrom_counts.get(metadata.chrom, 0) + 1
+                        type_counts[metadata.transcript_type] = (
+                            type_counts.get(metadata.transcript_type, 0) + 1
+                        )
+                        total_nt += max(0, int(metadata.end) - int(metadata.start))
+                        if max_rows is not None and selected_count >= max_rows:
+                            max_reached = True
+                            break
+                    pbar_files.set_postfix(rows=total_rows, selected=selected_count)
+                    if max_reached:
+                        break
+            finally:
+                close = getattr(parquet, "close", None)
+                if callable(close):
+                    close()
+            if max_reached:
+                break
+        close_writer()
+    finally:
+        if writer is not None:
+            writer.close()
+
+    if selected_count == 0:
+        summary = _metadata_summary_from_rows(observed)
+        raise RuntimeError(
+            "Direct parquet loader selected zero transcript rows. "
+            f"filters: genomes={cfg.get('genomes')} chromosomes={cfg.get('chromosomes')} "
+            f"statuses={cfg.get('statuses')}. Observed metadata summary from first "
+            f"{len(observed)} rows: {json.dumps(summary, ensure_ascii=False)}"
+        )
+
+    manifest: Dict[str, Any] = {
+        "version": _SEGMENTATION_ROW_CACHE_VERSION,
+        "fingerprint": fingerprint,
+        "selected_rows": selected_count,
+        "has_status": has_status_any,
+        "parts": parts,
+        "stats": {
+            "matching_rows_scanned": matching_rows,
+            "source_rows_scanned": total_rows,
+            "total_nt_from_metadata": total_nt,
+            "chrom_counts": chrom_counts,
+            "transcript_types": type_counts,
+        },
+    }
+    temporary_manifest = build_dir / "manifest.json.tmp"
+    temporary_manifest.write_text(
+        json.dumps(manifest, sort_keys=True),
+        encoding="utf-8",
+    )
+    os.replace(temporary_manifest, build_dir / "manifest.json")
+    return manifest
+
+
+def _publish_segmentation_row_cache(build_dir: Path, cache_dir: Path) -> None:
+    """Atomically publish a complete cache directory, retaining rollback on failure."""
+    stale_dir: Optional[Path] = None
+    if cache_dir.exists():
+        stale_dir = cache_dir.parent / f".{cache_dir.name}.stale-{build_dir.name}"
+        os.replace(cache_dir, stale_dir)
+    try:
+        os.replace(build_dir, cache_dir)
+    except Exception:
+        if stale_dir is not None and stale_dir.exists() and not cache_dir.exists():
+            os.replace(stale_dir, cache_dir)
+        raise
+    else:
+        if stale_dir is not None and stale_dir.exists():
+            shutil.rmtree(stale_dir)
+
+
+def _load_or_build_segmentation_row_cache(
+    files: Sequence[Path],
+    cfg: Dict[str, Any],
+) -> Tuple[List[Path], array, bool, Dict[str, Any]]:
+    from filelock import FileLock
+
+    cache_root = _segmentation_row_cache_root(cfg)
+    fingerprint = _segmentation_row_cache_fingerprint(files, cfg)
+    cache_dir = cache_root / fingerprint
+    lock = FileLock(str(cache_root / f"{fingerprint}.lock"))
+
+    with lock:
+        manifest = _validated_segmentation_row_cache_manifest(cache_dir, fingerprint)
+        if manifest is None:
+            build_dir = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{fingerprint}.tmp-",
+                    dir=str(cache_root),
+                )
+            )
+            try:
+                _build_segmentation_row_cache(files, cfg, build_dir, fingerprint)
+                _publish_segmentation_row_cache(build_dir, cache_dir)
+            finally:
+                if build_dir.exists():
+                    shutil.rmtree(build_dir)
+            manifest = _validated_segmentation_row_cache_manifest(cache_dir, fingerprint)
+            if manifest is None:
+                raise RuntimeError(
+                    f"New segmentation row cache failed validation: {cache_dir}"
+                )
+        else:
+            logger.info(
+                "[direct_parquet.cache.reuse] path=%s selected_rows=%d",
+                cache_dir,
+                int(manifest["selected_rows"]),
+            )
+
+    cache_files: List[Path] = []
+    selected_indices = array("I")
+    for file_index, part in enumerate(manifest["parts"]):
+        cache_files.append((cache_dir / str(part["name"])).resolve())
+        for row_group_index in range(int(part["rows"])):
+            selected_indices.extend((file_index, row_group_index, 0))
+    if len(selected_indices) // 3 != int(manifest["selected_rows"]):
+        raise RuntimeError(
+            f"Segmentation cache index length mismatch for {cache_dir}: "
+            f"locations={len(selected_indices) // 3} "
+            f"manifest={manifest['selected_rows']}"
+        )
+    return (
+        cache_files,
+        selected_indices,
+        bool(manifest.get("has_status", False)),
+        dict(manifest.get("stats") or {}),
+    )
+
+
+def _read_direct_parquet_transcript_row(
+    parquet_path: str,
+    row_group_index: int,
+    row_offset_in_group: int,
+    *,
+    include_labels: bool,
+) -> Dict[str, Any]:
+    """Read one cached transcript without retaining its payload or an open handle."""
+    import pyarrow.parquet as pq
+
+    parquet = pq.ParquetFile(
+        str(parquet_path),
+        memory_map=False,
+        pre_buffer=False,
+    )
+    try:
+        if row_group_index < 0 or row_group_index >= parquet.num_row_groups:
+            raise RuntimeError(
+                f"Transcript parquet row-group index is out of range for {parquet_path}: "
+                f"row_group={row_group_index} available={parquet.num_row_groups}"
+            )
+        row_group_rows = int(parquet.metadata.row_group(row_group_index).num_rows)
+        if row_group_rows != 1 or row_offset_in_group != 0:
+            raise RuntimeError(
+                f"Segmentation row-cache invariant failed for {parquet_path}: "
+                f"row_group={row_group_index} row={row_offset_in_group} "
+                f"row_group_rows={row_group_rows}; expected one row at offset zero"
+            )
+
+        schema_names = set(parquet.schema_arrow.names)
+        required = {"dna_sequence", "metadata"}
+        if include_labels:
+            required.add("labels")
+        missing = sorted(required - schema_names)
+        if missing:
+            raise RuntimeError(f"Transcript parquet {parquet_path} is missing required columns: {missing}")
+
+        columns = ["dna_sequence", "metadata"]
+        if include_labels:
+            columns.append("labels")
+        if "status" in schema_names:
+            columns.append("status")
+
+        selected_table = parquet.read_row_group(
+            row_group_index,
+            columns=columns,
+            use_threads=False,
+        )
+        if selected_table.num_rows != 1:
+            raise RuntimeError(
+                f"Could not read indexed transcript row from {parquet_path}: "
+                f"row_group={row_group_index} row={row_offset_in_group}"
+            )
+
+        names = selected_table.schema.names
+        dna = str(selected_table.column(names.index("dna_sequence"))[0].as_py()).upper()
+        metadata = selected_table.column(names.index("metadata"))[0].as_py()
+        row: Dict[str, Any] = {
+            "dna_sequence": dna,
+            "metadata": metadata,
+            "source_parquet": str(parquet_path),
+        }
+        if include_labels:
+            labels = _arrow_2d_scalar_to_numpy(
+                selected_table.column(names.index("labels"))[0],
+                dtype=np.float32,
+            )
+            if len(dna) != labels.shape[0]:
+                raise RuntimeError(
+                    f"DNA/labels length mismatch in {parquet_path}: "
+                    f"row_group={row_group_index} row={row_offset_in_group} "
+                    f"dna={len(dna)} labels={labels.shape}"
+                )
+            row["labels"] = labels
+        if "status" in names:
+            row["status"] = int(selected_table.column(names.index("status"))[0].as_py())
+        return row
+    finally:
+        close = getattr(parquet, "close", None)
+        if callable(close):
+            close()
+
+
+class DirectParquetTranscriptIndex:
+    """Compact segmentation index; transcript payloads always remain on disk."""
+
+    def __init__(
+        self,
+        files: Sequence[Path],
+        selected_indices: Sequence[Any],
+        *,
+        has_status: bool,
+    ):
+        self.files = tuple(str(Path(path).expanduser().resolve()) for path in files)
+        locations = np.asarray(selected_indices)
+        if locations.size == 0:
+            locations = np.empty((0, 3), dtype=np.uint64)
+        elif locations.ndim == 1:
+            if locations.size % 3 != 0:
+                raise RuntimeError(
+                    "Flat direct parquet transcript index length must be divisible by 3, "
+                    f"got {locations.size}"
+                )
+            locations = locations.reshape(-1, 3)
+        elif locations.ndim != 2 or locations.shape[1] != 3:
+            raise RuntimeError(
+                "Direct parquet transcript indices must have shape "
+                f"[rows, 3], got {locations.shape}"
+            )
+        if not np.issubdtype(locations.dtype, np.integer):
+            raise RuntimeError(
+                f"Direct parquet transcript indices must be integers, got {locations.dtype}"
+            )
+        if np.issubdtype(locations.dtype, np.signedinteger) and np.any(locations < 0):
+            raise RuntimeError("Direct parquet transcript indices must be non-negative")
+        if locations.size and np.any(locations > np.iinfo(np.uint32).max):
+            raise RuntimeError("Direct parquet transcript index exceeds uint32 capacity")
+        self.selected_indices = np.ascontiguousarray(locations, dtype=np.uint32)
+        self.selected_indices.setflags(write=False)
+        self.column_names = ["dna_sequence", "metadata", "labels"]
+        if has_status:
+            self.column_names.append("status")
+
+    def __len__(self) -> int:
+        return int(self.selected_indices.shape[0])
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self.selected_indices.setflags(write=False)
+
+    def read_row(self, index: int, *, include_labels: bool = True) -> Dict[str, Any]:
+        index = int(index)
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        file_index, row_group_index, row_offset_in_group = (
+            int(value) for value in self.selected_indices[index]
+        )
+        if file_index < 0 or file_index >= len(self.files):
+            raise RuntimeError(
+                f"Transcript parquet file index is out of range: "
+                f"file={file_index} available={len(self.files)}"
+            )
+        return _read_direct_parquet_transcript_row(
+            self.files[file_index],
+            row_group_index,
+            row_offset_in_group,
+            include_labels=include_labels,
+        )
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        return self.read_row(index, include_labels=True)
+
+
+def _direct_parquet_transcript_index_from_files(
+    files: List[Path],
+    cfg: Dict[str, Any],
+) -> DirectParquetTranscriptIndex:
+    """Build/reuse a row-addressable disk cache and retain compact locations."""
+    cache_files, selected_indices, has_status_any, stats = (
+        _load_or_build_segmentation_row_cache(files, cfg)
+    )
+    index = DirectParquetTranscriptIndex(
+        cache_files,
+        selected_indices,
+        has_status=has_status_any,
+    )
+    logger.info(
+        "[direct_parquet.selected_index] rows=%d matching_rows_scanned=%s "
+        "source_rows_scanned=%s index_ram=%s total_nt_from_metadata=%s "
+        "chrom_counts=%s transcript_types=%s cache_shards=%d; DNA and labels remain on disk",
+        len(index), stats.get("matching_rows_scanned"), stats.get("source_rows_scanned"),
+        _human_bytes(index.selected_indices.nbytes), stats.get("total_nt_from_metadata"),
+        stats.get("chrom_counts"), stats.get("transcript_types"), len(cache_files),
+    )
+    return index
+
+
 def _direct_parquet_transcript_rows_from_files(files: List[Path], cfg: Dict[str, Any]) -> MaterializedRows:
     import pyarrow.parquet as pq
 
@@ -676,7 +1242,7 @@ def _direct_parquet_transcript_rows_from_files(files: List[Path], cfg: Dict[str,
     return MaterializedRows(rows)
 
 
-def _load_segmentation_direct_parquet(cfg: Dict[str, Any]) -> MaterializedRows:
+def _load_segmentation_direct_parquet(cfg: Dict[str, Any]) -> Any:
     path = cfg["path"]
     ref = local_or_remote(path)
     if is_local(path):
@@ -690,6 +1256,8 @@ def _load_segmentation_direct_parquet(cfg: Dict[str, Any]) -> MaterializedRows:
             ref, cfg.get("config_name"), len(filenames), filenames[:5],
         )
         files = _download_or_reuse_hf_parquets(str(ref), filenames, cfg)
+    if str(cfg.get("_task", "segmentation")) == "segmentation":
+        return _direct_parquet_transcript_index_from_files(files, cfg)
     return _direct_parquet_transcript_rows_from_files(files, cfg)
 
 
@@ -1358,7 +1926,7 @@ class GenatatorDataset(torch.utils.data.Dataset):
         if self.full_transcript_chunks and (not self.for_inference or self.task != "segmentation"):
             raise RuntimeError("full_transcript_chunks is supported only for standalone segmentation inference")
         self.prewindowed = bool(cfg.get("prewindowed", False))
-        self.windows: List[Any] = []
+        self.windows: Sequence[Any] = []
         self.finding_window_groups: Dict[Tuple[str, str], List[int]] = {}
         self.finding_store: Optional[FindingChromosomeStore] = None
 
@@ -1371,10 +1939,21 @@ class GenatatorDataset(torch.utils.data.Dataset):
             self._build_finding_windows()
         else:
             self.raw = load_dataset_auto(cfg)
-            self.row_indices = filter_row_indices(self.raw, cfg)
-            _log_selected_dataset_stats(task, cfg, self.raw, self.row_indices, self.target_indices)
-            self.raw = _preload_selected_rows_to_ram(task, self.raw, self.row_indices, self.target_indices)
-            self.row_indices = list(range(len(self.raw)))
+            if task == "segmentation" and isinstance(self.raw, DirectParquetTranscriptIndex):
+                # The direct scanner has already applied every dataset filter. Keep
+                # one constant-size range plus the compact physical parquet index;
+                # never materialize selected transcript payloads in this process.
+                self.row_indices = range(len(self.raw))
+                logger.info(
+                    "[dataset.disk] task=segmentation selected_rows=%d index_ram=%s; "
+                    "each DNA/label row is read from parquet in __getitem__",
+                    len(self.raw), _human_bytes(self.raw.selected_indices.nbytes),
+                )
+            else:
+                self.row_indices = filter_row_indices(self.raw, cfg)
+                _log_selected_dataset_stats(task, cfg, self.raw, self.row_indices, self.target_indices)
+                self.raw = _preload_selected_rows_to_ram(task, self.raw, self.row_indices, self.target_indices)
+                self.row_indices = list(range(len(self.raw)))
             if task.startswith("finding"):
                 self.target_indices = list(range(len(channel_indices(task, cfg))))
             if task.startswith("finding"):
@@ -1500,10 +2079,22 @@ class GenatatorDataset(torch.utils.data.Dataset):
         return self._bpe_full_transcript_chunk_bounds(dna)
 
     def _build_transcript_indices(self) -> None:
+        if isinstance(self.raw, DirectParquetTranscriptIndex) and not self.full_transcript_chunks:
+            # A range is sufficient because each logical transcript has exactly one
+            # physical parquet locator. The sampler shuffles these logical indices.
+            self.windows = range(len(self.raw))
+            return
+
         self.windows = []
         by_chrom: Dict[str, Dict[str, int]] = {}
         for row_i in self.row_indices:
-            row = self.raw[row_i]
+            if isinstance(self.raw, DirectParquetTranscriptIndex):
+                # Complete-transcript inference needs sequence length to establish
+                # tokenizer-aware chunk bounds. Read DNA/metadata once here, discard
+                # them immediately, and read the row again for every requested chunk.
+                row = self.raw.read_row(row_i, include_labels=False)
+            else:
+                row = self.raw[row_i]
             meta = parse_metadata(row.get("metadata", {}))
             chrom = meta.chrom or "<empty>"
             d = by_chrom.setdefault(chrom, {"count": 0, "min_start": None, "max_end": None})
