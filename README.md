@@ -42,6 +42,9 @@ torchrun \
 ```text
 GENATATOR-main/
 ├── genatator_core/          shared models, data loading, metrics, inference and run management
+├── experiments/
+│   └── small_finding_evaluation_v1/
+│       └── evaluation_config.json   joint ModernGENA-base edge + region evaluation
 ├── finding/
 │   ├── configs/             edge, region and complete-pipeline inference configs
 │   ├── train.py             training entry point; task comes from the JSON config
@@ -501,3 +504,141 @@ The shipped JSON files cover the logical model/task combinations:
 - Transcript type: Caduceus PH/PS; plain GENA and ModernGENA Base/Large.
 
 The configs represent model choices, not a hyperparameter grid. Copy the closest model config when changing dataset filters, optimization settings, overlap, context length, RMT/AMT segment settings, inference RC averaging, or segmentation CDS postprocessing.
+
+## Sampling and shuffling examples
+
+### Gene finding across two GPUs
+
+Assume three chromosomes, each with four precomputed window indices:
+
+```text
+chrA: A1 A2 A3 A4
+chrB: B1 B2 B3 B4
+chrC: C1 C2 C3 C4
+```
+
+At the beginning of one epoch, suppose the sampler produces:
+
+```text
+shuffled chromosomes: chrB → chrC → chrA
+
+shuffled windows inside each chromosome:
+chrB: B3 B1 B4 B2
+chrC: C2 C3 C1 C4
+chrA: A4 A1 A3 A2
+```
+
+The chromosome-grouped order is therefore:
+
+```text
+B3 B1 B4 B2 | C2 C3 C1 C4 | A4 A1 A3 A2
+```
+
+For two GPUs, the sampler divides that order into two equal contiguous lanes:
+
+```text
+GPU 0: B3 B1 B4 B2 C2 C3
+GPU 1: C1 C4 A4 A1 A3 A2
+```
+
+Training then proceeds synchronously:
+
+| DDP step | GPU 0 sample | GPU 0 chromosome cache | GPU 1 sample | GPU 1 chromosome cache |
+|---:|---|---|---|---|
+| 1 | B3 | assemble chrB | C1 | assemble chrC |
+| 2 | B1 | reuse chrB | C4 | reuse chrC |
+| 3 | B4 | reuse chrB | A4 | release chrC; assemble chrA |
+| 4 | B2 | reuse chrB | A1 | reuse chrA |
+| 5 | C2 | release chrB; assemble chrC | A3 | reuse chrA |
+| 6 | C3 | reuse chrC | A2 | reuse chrA |
+
+The lane boundary falls inside chrC, so each GPU assembles its own chrC copy once. Within each GPU, however, that GPU's chrC windows remain consecutive. The sampler internally interleaves the lanes so Accelerate can shard them:
+
+```text
+B3 C1 B1 C4 B4 A4 B2 A1 C2 A3 C3 A2
+```
+
+GPU 0 receives the even positions and GPU 1 receives the odd positions. At the next epoch, both chromosome order and the window order inside each chromosome are reshuffled.
+
+### Segmentation across two GPUs
+
+Suppose the source Parquet rows contain several isoforms per gene:
+
+| Gene | Transcript | Status | Training filter result |
+|---|---|---:|---|
+| gene A | A1 | 1 | keep |
+| gene A | A2 | 0 | drop |
+| gene B | B1 | 0 | drop |
+| gene B | B2 | 1 | keep |
+| gene B | B3 | 0 | drop |
+| gene C | C1 | 1 | keep |
+| gene D | D1 | 0 | drop |
+| gene D | D2 | 1 | keep |
+| gene E | E1 | 1 | keep |
+| gene E | E2 | 0 | drop |
+| gene F | F1 | 0 | drop |
+| gene F | F2 | 1 | keep |
+
+With `statuses=[1]`, the loader streams the source Parquet files once in bounded
+batches, filters the rows, and writes the selected transcripts into an automatic
+row-addressable Parquet sidecar. Each sidecar shard contains at most 64 selected
+transcripts, with exactly one transcript per row group. A completed sidecar is
+reused by later runs and by DDP ranks that share the same cache directory.
+
+After that one-time build, the persistent in-memory dataset state contains only
+compact sidecar locations. The transcript names below are explanatory labels;
+DNA, labels, and per-row metadata are not retained in the index:
+
+```text
+dataset index 0 → (cache shard 0, row group 0, row 0) → A1
+dataset index 1 → (cache shard 0, row group 1, row 0) → B2
+dataset index 2 → (cache shard 0, row group 2, row 0) → C1
+dataset index 3 → (cache shard 0, row group 3, row 0) → D2
+dataset index 4 → (cache shard 0, row group 4, row 0) → E1
+dataset index 5 → (cache shard 0, row group 5, row 0) → F2
+```
+
+The loader does not independently choose an isoform per gene. It keeps every row matching the configured status; the dataset is responsible for marking its representative transcript with `status=1`. If two rows for one gene have status 1, both are kept; if none do, that gene is absent.
+
+Suppose the standard random sampler creates this epoch permutation:
+
+```text
+indices:     4, 1, 5, 0, 3, 2
+transcripts: E1 B2 F2 A1 D2 C1
+```
+
+With two GPUs and `per_device_train_batch_size=1`, alternating samples are assigned to the ranks:
+
+```text
+GPU 0: E1 F2 D2
+GPU 1: B2 A1 C1
+```
+
+| DDP step | GPU 0 | GPU 1 |
+|---:|---|---|
+| 1 | E1 | B2 |
+| 2 | F2 | A1 |
+| 3 | D2 | C1 |
+
+For each selected index, that GPU opens the referenced sidecar shard and reads
+its one-row Parquet row group from disk on demand, then applies the unchanged
+processing sequence:
+
+```text
+read one transcript row
+→ choose the transcript crop
+→ slice DNA and the [length, 5] labels with identical coordinates
+→ tokenize and pad
+→ create tensors
+→ run forward/backward
+```
+
+No application-level transcript payload or open Parquet handle is retained
+between samples. Each rank's persistent dataset state holds only its compact
+locations; cropping, tokenization, padding, and GPU transfer happen after
+shuffling when a sample is requested. DataLoader prefetching may temporarily
+hold a bounded number of in-flight samples, and the operating system may keep
+disk pages in its own cache. A new deterministic permutation is generated for
+the next epoch. With an odd number of retained transcripts, the standard
+distributed loader repeats one sample so both GPUs execute the same number of
+steps.
