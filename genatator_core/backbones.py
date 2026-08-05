@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import logging
 from typing import Any
 
@@ -58,6 +59,285 @@ def get_word_embeddings(model: nn.Module, *, context: str) -> nn.Embedding:
             infer_vocab_size_from_embeddings(obj, context=context)
             return obj
     raise RuntimeError(f"Could not detect word embeddings for {context}; model class={type(model).__name__}")
+
+
+def _validate_gena_token_classifier_transfer(missing, unexpected) -> None:
+    """Accept only the task-head differences expected from an MLM checkpoint."""
+
+    compatibility_suffixes = ("position_ids", "token_type_ids")
+    allowed_pretraining_heads = ("cls.", "lm_head.", "predictions.")
+
+    def compatibility_buffer(name: str) -> bool:
+        return any(
+            name == suffix or name.endswith(f".{suffix}")
+            for suffix in compatibility_suffixes
+        )
+
+    disallowed_missing = [
+        key
+        for key in missing
+        if not key.startswith("classifier.") and not compatibility_buffer(key)
+    ]
+    disallowed_unexpected = [
+        key
+        for key in unexpected
+        if not key.startswith(allowed_pretraining_heads)
+        and not compatibility_buffer(key)
+    ]
+    if disallowed_missing or disallowed_unexpected:
+        raise RuntimeError(
+            "GENA BertForTokenClassification transfer is incomplete; refusing to "
+            "continue with randomly initialized encoder parameters. "
+            f"missing={disallowed_missing[:20]} (total={len(disallowed_missing)}), "
+            f"unexpected={disallowed_unexpected[:20]} "
+            f"(total={len(disallowed_unexpected)})."
+        )
+
+
+def _load_gena_token_classifier_owner(
+    backbone_path: str,
+    *,
+    trust_remote_code: bool,
+    num_labels: int,
+) -> nn.Module:
+    """Instantiate the checkpoint's concrete remote BertForTokenClassification."""
+
+    raw = AutoModel.from_pretrained(
+        backbone_path,
+        trust_remote_code=trust_remote_code,
+    )
+    config = raw.config
+    config.num_labels = int(num_labels)
+    module_name = raw.__class__.__module__
+    gena_module = importlib.import_module(module_name)
+    owner_class = getattr(gena_module, "BertForTokenClassification", None)
+    if owner_class is None:
+        raise RuntimeError(
+            f"GENA remote module {module_name} has no BertForTokenClassification"
+        )
+    owner = owner_class(config)
+    if owner.__class__.__name__ != "BertForTokenClassification":
+        raise RuntimeError(
+            "GENA transcript classification must use BertForTokenClassification, "
+            f"got {owner.__class__.__name__}"
+        )
+    missing, unexpected = owner.load_state_dict(raw.state_dict(), strict=False)
+    _validate_gena_token_classifier_transfer(missing, unexpected)
+    logger.info(
+        "[transcript.backbone] GENA transfer accepted task-head/buffer differences "
+        "missing=%s unexpected=%s",
+        missing,
+        unexpected,
+    )
+    del raw
+    return owner
+
+
+class TranscriptTokenClassificationBackbone(nn.Module):
+    """Token-classification container used by transcript sequence classifiers.
+
+    The concrete owner is always ``BertForTokenClassification`` for GENA or
+    ``ModernBertForTokenClassification`` for ModernGENA.  Its encoder produces
+    contextual token states, and its own classification projection is applied
+    once to the asserted/pooled CLS state by :meth:`classify`.
+    """
+
+    def __init__(
+        self,
+        backbone_path: str,
+        backbone_kind: str,
+        *,
+        trust_remote_code: bool = True,
+        allow_unsafe_torch_load: bool = True,
+        num_labels: int = 1,
+        attn_implementation: str | None = None,
+    ):
+        super().__init__()
+        if int(num_labels) != 1:
+            raise RuntimeError(
+                "Transcript sequence classification requires exactly one binary logit"
+            )
+        if backbone_kind not in {"gena", "moderngena"}:
+            raise RuntimeError(
+                "TranscriptTokenClassificationBackbone supports only GENA/ModernGENA, "
+                f"got {backbone_kind!r}"
+            )
+        self.backbone_kind = str(backbone_kind)
+        self.backbone_path = local_or_remote(backbone_path)
+        allow_transformers_torch_load_on_legacy_torch(
+            allow_unsafe_torch_load,
+            context=(
+                "TranscriptTokenClassificationBackbone:"
+                f"{self.backbone_kind}:{self.backbone_path}"
+            ),
+        )
+
+        if self.backbone_kind == "gena":
+            owner = _load_gena_token_classifier_owner(
+                self.backbone_path,
+                trust_remote_code=trust_remote_code,
+                num_labels=1,
+            )
+            expected_class = "BertForTokenClassification"
+            encoder_candidates = ("bert",)
+        else:
+            load_kwargs = {
+                "num_labels": 1,
+                "trust_remote_code": trust_remote_code,
+            }
+            if attn_implementation is not None:
+                load_kwargs["attn_implementation"] = str(attn_implementation)
+            owner = ModernBertForTokenClassification.from_pretrained(
+                self.backbone_path,
+                **load_kwargs,
+            )
+            expected_class = "ModernBertForTokenClassification"
+            encoder_candidates = ("model", "modernbert", "bert")
+        if owner.__class__.__name__ != expected_class:
+            raise RuntimeError(
+                f"{self.backbone_kind} transcript classification must use "
+                f"{expected_class}, got {owner.__class__.__name__}"
+            )
+        if not hasattr(owner, "classifier"):
+            raise RuntimeError(
+                f"{expected_class} has no classifier projection for transcript output"
+            )
+
+        self.owner = owner
+        self.encoder_attr = next(
+            (name for name in encoder_candidates if hasattr(owner, name)),
+            None,
+        )
+        if self.encoder_attr is None:
+            raise RuntimeError(
+                f"{expected_class} has no known encoder attribute; "
+                f"children={list(dict(owner.named_children()).keys())}"
+            )
+        self.config = owner.config
+        self.hidden_size = infer_hidden_size(
+            self.config,
+            context=f"TranscriptTokenClassificationBackbone:{self.backbone_kind}",
+        )
+        embeddings = get_word_embeddings(
+            self.owner,
+            context=f"TranscriptTokenClassificationBackbone:{self.backbone_kind}",
+        )
+        _, embedding_hidden = infer_vocab_size_from_embeddings(
+            embeddings,
+            context=f"TranscriptTokenClassificationBackbone:{self.backbone_kind}",
+        )
+        if embedding_hidden != self.hidden_size:
+            raise RuntimeError(
+                "Transcript token-classification embedding width mismatch: "
+                f"embedding={embedding_hidden} hidden_size={self.hidden_size}"
+            )
+        if self.backbone_kind == "moderngena" and hasattr(self.config, "deterministic_flash_attn"):
+            self.config.deterministic_flash_attn = True
+        if self.backbone_kind == "moderngena" and hasattr(self.config, "use_sdpa_attn_mask"):
+            self.config.use_sdpa_attn_mask = True
+        logger.info(
+            "[transcript.backbone] kind=%s owner=%s encoder_attr=%s hidden_size=%d",
+            self.backbone_kind,
+            type(self.owner).__name__,
+            self.encoder_attr,
+            self.hidden_size,
+        )
+
+    @property
+    def layers_attr(self) -> str:
+        if self.backbone_kind == "gena":
+            return f"owner.{self.encoder_attr}.encoder.layer"
+        return f"owner.{self.encoder_attr}.layers"
+
+    def _encoder(self) -> nn.Module:
+        return getattr(self.owner, self.encoder_attr)
+
+    def get_input_embeddings(self):
+        return get_word_embeddings(
+            self.owner,
+            context="TranscriptTokenClassificationBackbone.get_input_embeddings",
+        )
+
+    def resize_token_embeddings(self, new_num_tokens: int):
+        if not hasattr(self.owner, "resize_token_embeddings"):
+            raise RuntimeError(
+                f"{type(self.owner).__name__} cannot resize token embeddings"
+            )
+        resized = self.owner.resize_token_embeddings(int(new_num_tokens))
+        _ = self.get_input_embeddings()
+        return resized
+
+    def classify(self, pooled_hidden: torch.Tensor) -> torch.Tensor:
+        if pooled_hidden.ndim != 2 or pooled_hidden.shape[-1] != self.hidden_size:
+            raise RuntimeError(
+                "Transcript classifier expects [batch, hidden] pooled states, got "
+                f"{tuple(pooled_hidden.shape)}"
+            )
+        value = pooled_hidden
+        # ModernBertForTokenClassification includes a prediction head before its
+        # dropout/classifier projection; BertForTokenClassification does not.
+        prediction_head = getattr(self.owner, "head", None)
+        if isinstance(prediction_head, nn.Module):
+            value = prediction_head(value)
+        dropout = getattr(self.owner, "drop", None)
+        if not isinstance(dropout, nn.Module):
+            dropout = getattr(self.owner, "dropout", None)
+        if isinstance(dropout, nn.Module):
+            value = dropout(value)
+        logits = self.owner.classifier(value)
+        if logits.ndim != 2 or tuple(logits.shape) != (pooled_hidden.shape[0], 1):
+            raise RuntimeError(
+                "Transcript token-classification projection must return [batch, 1], "
+                f"got {tuple(logits.shape)}"
+            )
+        return logits
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        token_type_ids=None,
+        inputs_embeds=None,
+        output_hidden_states=True,
+        return_dict=True,
+        **kwargs,
+    ):
+        if self.backbone_kind == "gena":
+            sequence_length = int(
+                input_ids.shape[1]
+                if input_ids is not None
+                else inputs_embeds.shape[1]
+            )
+            position_limit = int(getattr(self.config, "max_position_embeddings", 512))
+            if sequence_length > position_limit:
+                raise RuntimeError(
+                    "GENA token-classification segment exceeds its position limit: "
+                    f"received={sequence_length} maximum={position_limit}"
+                )
+        common = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "inputs_embeds": inputs_embeds,
+            "output_hidden_states": output_hidden_states,
+            "return_dict": True,
+        }
+        if self.backbone_kind == "gena":
+            common["token_type_ids"] = token_type_ids
+        output = self._encoder()(**common)
+        hidden = getattr(output, "last_hidden_state", None)
+        if hidden is None:
+            hidden = output[0]
+        if hidden.ndim != 3 or hidden.shape[-1] != self.hidden_size:
+            raise RuntimeError(
+                "Transcript token-classification encoder returned an invalid hidden tensor: "
+                f"{tuple(hidden.shape)}"
+            )
+        return TokenClassifierOutput(
+            loss=None,
+            logits=hidden,
+            hidden_states=getattr(output, "hidden_states", None),
+            attentions=getattr(output, "attentions", None),
+        )
 
 
 class HiddenStateBackbone(nn.Module):

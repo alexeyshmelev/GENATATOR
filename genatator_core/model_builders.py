@@ -9,11 +9,24 @@ from safetensors.torch import load_file as safe_load_file
 from transformers import AutoConfig, AutoModel
 
 from .amt_models import AMTTokenClassifier
-from .backbones import HiddenStateBackbone
+from .backbones import HiddenStateBackbone, TranscriptTokenClassificationBackbone
 from .config import local_or_remote
-from .legacy_caduceus import CaduceusMiddleLossTokenClassifier, CaduceusTranscriptTypeMiddleLossClassifier, infer_caduceus_hidden_size
+from .gpt_head import DEFAULT_GPT_CONTEXT_SIZE, DEFAULT_GPT_ENCODER_LOOKAHEAD
+from .gpt_models import (
+    AMTGPTSegmentationModel,
+    CaduceusGPTSegmentationModel,
+    GenaModernGPTSegmentationModel,
+    RMTGPTSegmentationModel,
+)
+from .legacy_caduceus import CaduceusMiddleLossTokenClassifier, infer_caduceus_hidden_size
 from .legacy_rmt import RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater
-from .token_models import PlainTokenClassifier, TokenClassifierWithUNet, TranscriptTypeClassifier
+from .sequence_models import (
+    AMTTranscriptTypeClassifier,
+    CaduceusTranscriptTypeMiddleLossSequenceClassifier,
+    GenaModernTranscriptTypeClassifier,
+    RMTTranscriptTypeClassifier,
+)
+from .token_models import PlainTokenClassifier, TokenClassifierWithUNet
 from .torch_compat import allow_transformers_torch_load_on_legacy_torch, trusted_torch_load
 from .unet import DEFAULT_UNET_CHUNK_SIZE
 
@@ -91,15 +104,21 @@ def normalize_memory_wrapper_config(model_cfg: Dict[str, Any]) -> None:
             )
 
 
-def model_uses_unet(model_cfg: Dict[str, Any]) -> bool:
+def model_uses_unet(
+    model_cfg: Dict[str, Any], task: str | None = None
+) -> bool:
+    if task == "transcript_type" or str(model_cfg.get("head_kind", "default")) == "gpt":
+        return False
     family = model_cfg.get("family")
     return family in {"unet", "rmt"} or (family == "amt" and bool(model_cfg.get("use_unet", False)))
 
 
-def normalize_unet_chunk_size(model_cfg: Dict[str, Any]) -> int | None:
+def normalize_unet_chunk_size(
+    model_cfg: Dict[str, Any], task: str | None = None
+) -> int | None:
     """Materialize one uniform UNET chunk-size field in the model config."""
 
-    if not model_uses_unet(model_cfg):
+    if not model_uses_unet(model_cfg, task=task):
         return None
     configured = model_cfg.get("unet_chunk_size")
     legacy = model_cfg.get("rmt", {}).get("unet_sub_model_input_size") if model_cfg.get("family") == "rmt" else None
@@ -125,16 +144,34 @@ def _vocab_size(model_cfg: Dict[str, Any]) -> int:
     return int(value)
 
 
+def _gpt_config(model_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    config = dict(model_cfg.get("gpt", {}))
+    config.setdefault("context_size", DEFAULT_GPT_CONTEXT_SIZE)
+    config.setdefault("encoder_lookahead", DEFAULT_GPT_ENCODER_LOOKAHEAD)
+    if int(config["context_size"]) != DEFAULT_GPT_CONTEXT_SIZE:
+        raise RuntimeError(
+            "The segmentation GPT decoder context is fixed to 8192 nucleotides"
+        )
+    if int(config["encoder_lookahead"]) != DEFAULT_GPT_ENCODER_LOOKAHEAD:
+        raise RuntimeError(
+            "The segmentation GPT cross-attention lookahead is fixed to 8192 nucleotides"
+        )
+    return config
+
+
 def build_model(cfg: Dict[str, Any], task: str):
     model_cfg = cfg["model"]
     family = model_cfg["family"]
+    head_kind = str(model_cfg.get("head_kind", "default"))
+    if head_kind == "gpt" and task != "segmentation":
+        raise RuntimeError("head_kind='gpt' is implemented only for segmentation")
     normalize_memory_wrapper_config(model_cfg)
-    if task == "transcript_type" and family not in {"plain", "caduceus"}:
+    if task == "transcript_type" and family not in {"plain", "caduceus", "rmt", "amt"}:
         raise RuntimeError(
-            "Transcript-type classification is implemented only for family='plain' and family='caduceus'; "
+            "Transcript-type classification is implemented for plain, Caduceus, RMT, and AMT families; "
             f"got family={family!r}"
         )
-    unet_chunk_size = normalize_unet_chunk_size(model_cfg)
+    unet_chunk_size = normalize_unet_chunk_size(model_cfg, task=task)
     backbone_kind = model_cfg.get("backbone_kind", family)
     backbone_path = local_or_remote(model_cfg["backbone_path"])
     trust_remote_code = bool(model_cfg.get("trust_remote_code", True))
@@ -157,17 +194,74 @@ def build_model(cfg: Dict[str, Any], task: str):
         if "hidden_size" in model_cfg:
             logger.info("[caduceus.shape] using explicit model.hidden_size=%d from config", hidden_size)
         backbone = AutoModel.from_pretrained(backbone_path, config=config, trust_remote_code=trust_remote_code)
-        model = CaduceusTranscriptTypeMiddleLossClassifier(backbone, hidden_size=hidden_size) if task == "transcript_type" else CaduceusMiddleLossTokenClassifier(backbone, num_labels=num_labels, hidden_size=hidden_size)
+        if head_kind == "gpt":
+            if "_tokenizer" not in cfg:
+                raise RuntimeError(
+                    "Caduceus GPT build requires cfg['_tokenizer'] set by the entrypoint"
+                )
+            model = CaduceusGPTSegmentationModel(
+                backbone,
+                hidden_size=hidden_size,
+                tokenizer=cfg["_tokenizer"],
+                nucleotide_vocab_size=_vocab_size(model_cfg),
+                num_labels=num_labels,
+                gpt_config=_gpt_config(model_cfg),
+            )
+        elif task == "transcript_type":
+            if "_tokenizer" not in cfg:
+                raise RuntimeError(
+                    "Caduceus transcript-type build requires cfg['_tokenizer'] set by the entrypoint"
+                )
+            model = CaduceusTranscriptTypeMiddleLossSequenceClassifier(
+                backbone,
+                hidden_size=hidden_size,
+                tokenizer=cfg["_tokenizer"],
+            )
+        else:
+            model = CaduceusMiddleLossTokenClassifier(
+                backbone,
+                num_labels=num_labels,
+                hidden_size=hidden_size,
+            )
 
     elif family == "plain":
         if backbone_kind not in {"gena", "moderngena"}:
             raise RuntimeError(f"plain family is for GENA/ModernGENA only, got backbone_kind={backbone_kind}")
-        if task == "transcript_type":
-            model = TranscriptTypeClassifier(backbone_path, backbone_kind, trust_remote_code=trust_remote_code, allow_unsafe_torch_load=allow_unsafe_torch_load)
+        if head_kind == "gpt":
+            if "_tokenizer" not in cfg:
+                raise RuntimeError(
+                    "GENA/ModernGENA GPT build requires cfg['_tokenizer'] set by the entrypoint"
+                )
+            model = GenaModernGPTSegmentationModel(
+                backbone_path,
+                backbone_kind,
+                cfg["_tokenizer"],
+                nucleotide_vocab_size=_vocab_size(model_cfg),
+                num_labels=num_labels,
+                trust_remote_code=trust_remote_code,
+                allow_unsafe_torch_load=allow_unsafe_torch_load,
+                gpt_config=_gpt_config(model_cfg),
+            )
+        elif task == "transcript_type":
+            if "_tokenizer" not in cfg:
+                raise RuntimeError(
+                    "Plain transcript-type build requires cfg['_tokenizer'] set by the entrypoint"
+                )
+            model = GenaModernTranscriptTypeClassifier(
+                backbone_path,
+                backbone_kind,
+                cfg["_tokenizer"],
+                trust_remote_code=trust_remote_code,
+                allow_unsafe_torch_load=allow_unsafe_torch_load,
+            )
         else:
             model = PlainTokenClassifier(backbone_path, backbone_kind, num_labels=num_labels, trust_remote_code=trust_remote_code, allow_unsafe_torch_load=allow_unsafe_torch_load)
 
     elif family == "unet":
+        if head_kind == "gpt":
+            raise RuntimeError(
+                "Direct GPT segmentation uses family='plain', not family='unet'"
+            )
         if backbone_kind not in {"gena", "moderngena"}:
             raise RuntimeError(f"UNET family is for GENA/ModernGENA only, got backbone_kind={backbone_kind}")
         model = TokenClassifierWithUNet(
@@ -187,7 +281,22 @@ def build_model(cfg: Dict[str, Any], task: str):
             raise RuntimeError(f"RMT is allowed only for GENA/ModernGENA, got backbone_kind={backbone_kind}")
         if "_tokenizer" not in cfg:
             raise RuntimeError("RMT build requires cfg['_tokenizer'] set by train/infer entrypoint")
-        base_model = HiddenStateBackbone(backbone_path, backbone_kind, trust_remote_code=trust_remote_code, modernbert_num_labels=num_labels, allow_unsafe_torch_load=allow_unsafe_torch_load)
+        if task == "transcript_type":
+            base_model = TranscriptTokenClassificationBackbone(
+                backbone_path,
+                backbone_kind,
+                trust_remote_code=trust_remote_code,
+                allow_unsafe_torch_load=allow_unsafe_torch_load,
+                num_labels=1,
+            )
+        else:
+            base_model = HiddenStateBackbone(
+                backbone_path,
+                backbone_kind,
+                trust_remote_code=trust_remote_code,
+                modernbert_num_labels=num_labels,
+                allow_unsafe_torch_load=allow_unsafe_torch_load,
+            )
         rmt_kwargs = dict(model_cfg.get("rmt", {}))
         legacy_input_size = rmt_kwargs.pop("input_size", None)
         configured_segment_size = rmt_kwargs.get("segment_size")
@@ -203,15 +312,33 @@ def build_model(cfg: Dict[str, Any], task: str):
         )
         rmt_kwargs.setdefault("num_mem_tokens", default_memory_token_count(backbone_kind))
         rmt_kwargs.setdefault("max_n_segments", 10000)
-        rmt_kwargs.update({
-            "tokenizer": cfg["_tokenizer"],
-            "num_labels": num_labels,
-            "nucleotide_vocab_size": _vocab_size(model_cfg),
-            "cycles": int(model_cfg.get("cycles", 1)),
-            "unet_channels": model_cfg.get("unet_channels"),
-            "unet_chunk_size": int(unet_chunk_size),
-        })
-        model = RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater(base_model, **rmt_kwargs)
+        if head_kind == "gpt":
+            model = RMTGPTSegmentationModel(
+                base_model,
+                cfg["_tokenizer"],
+                nucleotide_vocab_size=_vocab_size(model_cfg),
+                num_labels=num_labels,
+                rmt_config=rmt_kwargs,
+                gpt_config=_gpt_config(model_cfg),
+            )
+        elif task == "transcript_type":
+            model = RMTTranscriptTypeClassifier(
+                base_model,
+                cfg["_tokenizer"],
+                **rmt_kwargs,
+            )
+        else:
+            rmt_kwargs.update({
+                "tokenizer": cfg["_tokenizer"],
+                "num_labels": num_labels,
+                "nucleotide_vocab_size": _vocab_size(model_cfg),
+                "cycles": int(model_cfg.get("cycles", 1)),
+                "unet_channels": model_cfg.get("unet_channels"),
+                "unet_chunk_size": int(unet_chunk_size),
+            })
+            model = RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater(
+                base_model, **rmt_kwargs
+            )
 
     elif family == "amt":
         if backbone_kind not in {"gena", "moderngena"}:
@@ -223,21 +350,51 @@ def build_model(cfg: Dict[str, Any], task: str):
             "segment_size",
             default_amt_segment_size(backbone_kind, amt_kwargs["num_mem_tokens"]),
         )
-        model = AMTTokenClassifier(
-            backbone_path=backbone_path,
-            backbone_kind=backbone_kind,
-            num_labels=num_labels,
-            trust_remote_code=trust_remote_code,
-            use_unet=use_unet,
-            # This value is unused by plain AMT.  Do not require a nucleotide
-            # tokenizer/vocabulary unless a UNET is actually present.
-            nucleotide_vocab_size=_vocab_size(model_cfg) if use_unet else 1,
-            unet_cycles=int(model_cfg.get("unet_cycles", 1)),
-            unet_channels=model_cfg.get("unet_channels"),
-            unet_chunk_size=int(unet_chunk_size) if use_unet else DEFAULT_UNET_CHUNK_SIZE,
-            allow_unsafe_torch_load=allow_unsafe_torch_load,
-            **amt_kwargs,
-        )
+        if head_kind == "gpt":
+            if "_tokenizer" not in cfg:
+                raise RuntimeError(
+                    "AMT GPT build requires cfg['_tokenizer'] set by the entrypoint"
+                )
+            model = AMTGPTSegmentationModel(
+                backbone_path=backbone_path,
+                backbone_kind=backbone_kind,
+                tokenizer=cfg["_tokenizer"],
+                nucleotide_vocab_size=_vocab_size(model_cfg),
+                num_labels=num_labels,
+                trust_remote_code=trust_remote_code,
+                allow_unsafe_torch_load=allow_unsafe_torch_load,
+                amt_config=amt_kwargs,
+                gpt_config=_gpt_config(model_cfg),
+            )
+        elif task == "transcript_type":
+            if "_tokenizer" not in cfg:
+                raise RuntimeError(
+                    "AMT transcript-type build requires cfg['_tokenizer'] set by the entrypoint"
+                )
+            model = AMTTranscriptTypeClassifier.from_pretrained(
+                backbone_path=backbone_path,
+                backbone_kind=backbone_kind,
+                tokenizer=cfg["_tokenizer"],
+                trust_remote_code=trust_remote_code,
+                allow_unsafe_torch_load=allow_unsafe_torch_load,
+                **amt_kwargs,
+            )
+        else:
+            model = AMTTokenClassifier(
+                backbone_path=backbone_path,
+                backbone_kind=backbone_kind,
+                num_labels=num_labels,
+                trust_remote_code=trust_remote_code,
+                use_unet=use_unet,
+                # This value is unused by plain AMT.  Do not require a nucleotide
+                # tokenizer/vocabulary unless a UNET is actually present.
+                nucleotide_vocab_size=_vocab_size(model_cfg) if use_unet else 1,
+                unet_cycles=int(model_cfg.get("unet_cycles", 1)),
+                unet_channels=model_cfg.get("unet_channels"),
+                unet_chunk_size=int(unet_chunk_size) if use_unet else DEFAULT_UNET_CHUNK_SIZE,
+                allow_unsafe_torch_load=allow_unsafe_torch_load,
+                **amt_kwargs,
+            )
     else:
         raise RuntimeError(f"Unsupported model family: {family}")
 

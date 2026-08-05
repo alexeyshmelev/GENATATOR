@@ -56,7 +56,8 @@ class RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater(nn.Module
     def __init__(self, base_model, **rmt_kwargs):
         super().__init__()
         self.model = base_model
-        self.num_labels = int(rmt_kwargs.pop("num_labels"))
+        self.encoder_only = bool(rmt_kwargs.pop("encoder_only", False))
+        self.num_labels = int(rmt_kwargs.pop("num_labels", 0))
         self.cycles = int(rmt_kwargs.pop("cycles", 1))
         configured_chunk = rmt_kwargs.pop("unet_chunk_size", None)
         legacy_chunk = rmt_kwargs.pop("unet_sub_model_input_size", None)
@@ -65,33 +66,46 @@ class RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater(nn.Module
                 "Conflicting RMT UNET chunk sizes: model.unet_chunk_size="
                 f"{configured_chunk} and model.rmt.unet_sub_model_input_size={legacy_chunk}"
             )
-        self.unet_chunk_size = int(
-            configured_chunk if configured_chunk is not None else (
-                legacy_chunk if legacy_chunk is not None else DEFAULT_UNET_CHUNK_SIZE
+        self.unet_chunk_size = None
+        if not self.encoder_only:
+            self.unet_chunk_size = int(
+                configured_chunk if configured_chunk is not None else (
+                    legacy_chunk if legacy_chunk is not None else DEFAULT_UNET_CHUNK_SIZE
+                )
             )
-        )
-        if self.unet_chunk_size <= 0:
-            raise RuntimeError("unet_chunk_size must be positive")
+            if self.unet_chunk_size <= 0:
+                raise RuntimeError("unet_chunk_size must be positive")
         self.hidden_size = infer_hidden_size(self.model.config, context="RMT.backbone")
         word_embeddings = get_word_embeddings(self.model, context="RMT.backbone")
         _, emb_hidden = infer_vocab_size_from_embeddings(word_embeddings, context="RMT.backbone")
         if emb_hidden != self.hidden_size:
             raise RuntimeError(f"RMT backbone config hidden_size={self.hidden_size}, embedding dim={emb_hidden}")
-        self.nucleotide_embedding = nn.Embedding(int(rmt_kwargs.pop("nucleotide_vocab_size", 1000)), self.hidden_size)
-        self.unet_input_dim = self.hidden_size * 2
-        channels = rmt_kwargs.pop("unet_channels", None)
-        self.sub_model = UNET1DSegmentationHead(
-            embed_dim=self.unet_input_dim,
-            num_classes=self.unet_input_dim,
-            output_channels_list=channels,
-            num_conv_layers_per_block=2,
-        )
-        self.activation_fn = nn.SiLU()
-        self.fc = nn.Linear(self.unet_input_dim, self.num_labels)
-        logger.info(
-            "[RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater] hidden_size=%d num_labels=%d unet_input_dim=%d cycles=%d unet_chunk=%d",
-            self.hidden_size, self.num_labels, self.unet_input_dim, self.cycles, self.unet_chunk_size,
-        )
+        if self.encoder_only:
+            # The GPT segmentation wrapper reuses only recurrent BPE encoding.
+            # Do not allocate a throwaway UNET/classifier or register parameters
+            # that can never participate in its forward pass.
+            logger.info(
+                "[RMTEncoder] hidden_size=%d encoder_only=true",
+                self.hidden_size,
+            )
+        else:
+            if self.num_labels <= 0:
+                raise RuntimeError("RMT+UNET requires a positive num_labels")
+            self.nucleotide_embedding = nn.Embedding(int(rmt_kwargs.pop("nucleotide_vocab_size", 1000)), self.hidden_size)
+            self.unet_input_dim = self.hidden_size * 2
+            channels = rmt_kwargs.pop("unet_channels", None)
+            self.sub_model = UNET1DSegmentationHead(
+                embed_dim=self.unet_input_dim,
+                num_classes=self.unet_input_dim,
+                output_channels_list=channels,
+                num_conv_layers_per_block=2,
+            )
+            self.activation_fn = nn.SiLU()
+            self.fc = nn.Linear(self.unet_input_dim, self.num_labels)
+            logger.info(
+                "[RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater] hidden_size=%d num_labels=%d unet_input_dim=%d cycles=%d unet_chunk=%d",
+                self.hidden_size, self.num_labels, self.unet_input_dim, self.cycles, self.unet_chunk_size,
+            )
         self.set_params(**rmt_kwargs)
         self.rmt_config["sum_loss"] = True
 
@@ -205,8 +219,12 @@ class RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater(nn.Module
         segmented_batch = [[s[::-1][i] if len(s) > i else None for s in segmented_batch] for i in range(actual_n_segments)][::-1]
         if segmented_batch_labels:
             segmented_batch_labels = [[s[::-1][i] if len(s) > i else None for s in segmented_batch_labels] for i in range(actual_n_segments)][::-1]
+        else:
+            segmented_batch_labels = [None] * actual_n_segments
         if segmented_batch_labels_mask:
             segmented_batch_labels_mask = [[s[::-1][i] if len(s) > i else None for s in segmented_batch_labels_mask] for i in range(actual_n_segments)][::-1]
+        else:
+            segmented_batch_labels_mask = [None] * actual_n_segments
         return segmented_batch, segmented_batch_labels, segmented_batch_labels_mask
 
     def _encode_rmt_tokens(self, input_ids, labels=None, labels_mask=None, token_type_ids=None, position_ids=None, head_mask=None, inputs_embeds=None, output_attentions=None, output_hidden_states=None, return_dict=None):
@@ -247,6 +265,10 @@ class RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater(nn.Module
         return token_logits, token_mask
 
     def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, position_ids=None, head_mask=None, inputs_embeds=None, labels=None, labels_mask=None, pos_weight=None, output_attentions=None, output_hidden_states=None, return_dict=None, embedding_repeater=None, letter_level_tokens=None, letter_level_labels=None, letter_level_labels_mask=None, letter_level_token_types_ids=None, letter_level_attention_mask=None):
+        if self.encoder_only:
+            raise RuntimeError(
+                "This RMT instance is encoder-only; call _encode_rmt_tokens from its enclosing head"
+            )
         if embedding_repeater is None or letter_level_tokens is None:
             raise RuntimeError("RMT repeater requires embedding_repeater and letter_level_tokens.")
         token_logits, token_mask = self._encode_rmt_tokens(input_ids, labels=labels, labels_mask=labels_mask, token_type_ids=token_type_ids, position_ids=position_ids, head_mask=head_mask, inputs_embeds=inputs_embeds, output_attentions=output_attentions, output_hidden_states=output_hidden_states, return_dict=return_dict)

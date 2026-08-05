@@ -10,7 +10,11 @@ from torch.nn import BCEWithLogitsLoss
 from transformers import AutoModel, AutoModelForCausalLM, ModernBertModel
 from transformers.modeling_outputs import TokenClassifierOutput
 
-from .backbones import infer_hidden_size, get_word_embeddings
+from .backbones import (
+    TranscriptTokenClassificationBackbone,
+    get_word_embeddings,
+    infer_hidden_size,
+)
 from .config import local_or_remote
 from .unet import DEFAULT_UNET_CHUNK_SIZE, UNET1DSegmentationHead, run_samplewise_chunked_unet
 from .torch_compat import allow_transformers_torch_load_on_legacy_torch
@@ -85,9 +89,18 @@ def _patch_forward_return_hidden_as_logits(model: nn.Module) -> None:
     model.forward = types.MethodType(_forward, model)
 
 
-def _load_amt_base_model(backbone_path: str, backbone_kind: str, trust_remote_code: bool, allow_unsafe_torch_load: bool) -> tuple[nn.Module, object, int, str]:
+def _load_amt_base_model(
+    backbone_path: str,
+    backbone_kind: str,
+    trust_remote_code: bool,
+    allow_unsafe_torch_load: bool,
+    *,
+    transcript_type: bool = False,
+) -> tuple[nn.Module, object, int, str]:
     """Load the base model in the same style as the provided AMT code.
 
+    Transcript type: exact BertForTokenClassification/ModernBertForTokenClassification
+    container with hidden-state output and a reusable one-logit projection.
     ModernGENA: ModernBertModel -> forward patched to expose hidden states as logits.
     GENA: AutoModel checkpoint -> remote BertForTokenClassification with Identity
     classifier, so AMT receives a model with get_input_embeddings() and logits equal
@@ -95,6 +108,29 @@ def _load_amt_base_model(backbone_path: str, backbone_kind: str, trust_remote_co
     """
     path = local_or_remote(backbone_path)
     allow_transformers_torch_load_on_legacy_torch(allow_unsafe_torch_load, context=f"AMT.base:{backbone_kind}:{path}")
+
+    if transcript_type:
+        base_model = TranscriptTokenClassificationBackbone(
+            path,
+            backbone_kind,
+            trust_remote_code=trust_remote_code,
+            allow_unsafe_torch_load=allow_unsafe_torch_load,
+            num_labels=1,
+            attn_implementation="sdpa" if backbone_kind == "moderngena" else None,
+        )
+        logger.info(
+            "[AMT.sequence.base] kind=%s owner=%s layers_attr=%s hidden_size=%d",
+            backbone_kind,
+            type(base_model.owner).__name__,
+            base_model.layers_attr,
+            base_model.hidden_size,
+        )
+        return (
+            base_model,
+            base_model.config,
+            int(base_model.hidden_size),
+            base_model.layers_attr,
+        )
 
     if backbone_kind == "moderngena":
         logger.info("[AMT.base] loading ModernBertModel path=%s attn_implementation=sdpa", path)
@@ -153,12 +189,15 @@ class AMTTokenClassifier(nn.Module):
     No parameters are frozen.
     """
 
-    def __init__(self, backbone_path: str, backbone_kind: str, num_labels: int, trust_remote_code: bool = True, amt_repo_id: str = "irodkin/armt-neox-tiny", use_unet: bool = False, nucleotide_vocab_size: int = 1000, unet_cycles: int = 1, unet_channels=None, unet_chunk_size: int = DEFAULT_UNET_CHUNK_SIZE, allow_unsafe_torch_load: bool = True, **amt_kwargs):
+    def __init__(self, backbone_path: str, backbone_kind: str, num_labels: int, trust_remote_code: bool = True, amt_repo_id: str = "irodkin/armt-neox-tiny", use_unet: bool = False, nucleotide_vocab_size: int = 1000, unet_cycles: int = 1, unet_channels=None, unet_chunk_size: int = DEFAULT_UNET_CHUNK_SIZE, allow_unsafe_torch_load: bool = True, encoder_only: bool = False, **amt_kwargs):
         super().__init__()
         if backbone_kind not in {"gena", "moderngena"}:
             raise RuntimeError(f"AMT is allowed only for GENA/ModernGENA, got backbone_kind={backbone_kind}")
         self.num_labels = int(num_labels)
         self.use_unet = bool(use_unet)
+        self.encoder_only = bool(encoder_only)
+        if self.encoder_only and self.use_unet:
+            raise RuntimeError("AMT encoder_only and use_unet cannot both be true")
 
         base_model, encoder_cfg, hidden_size, default_layers_attr = _load_amt_base_model(backbone_path, backbone_kind, trust_remote_code, allow_unsafe_torch_load)
         self.hidden_size = int(hidden_size)
@@ -225,7 +264,12 @@ class AMTTokenClassifier(nn.Module):
         if amt_kwargs:
             raise RuntimeError(f"Unused AMT parameters: {sorted(amt_kwargs.keys())}")
 
-        if self.use_unet:
+        if self.encoder_only:
+            logger.info(
+                "[AMTTokenClassifier] encoder_only=true hidden=%d",
+                self.hidden_size,
+            )
+        elif self.use_unet:
             self.unet_cycles = int(unet_cycles)
             if self.unet_cycles < 1:
                 raise RuntimeError("unet_cycles must be >= 1")
@@ -242,11 +286,19 @@ class AMTTokenClassifier(nn.Module):
             self.classifier = nn.Linear(self.hidden_size, self.num_labels)
             logger.info("[AMTTokenClassifier] plain hidden=%d labels=%d", self.hidden_size, self.num_labels)
 
-    def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, labels=None, labels_mask=None, pos_weight=None, embedding_repeater=None, letter_level_tokens=None, letter_level_labels=None, letter_level_labels_mask=None, letter_level_attention_mask=None, **kwargs):
+    def encode_hidden(self, input_ids=None, attention_mask=None) -> torch.Tensor:
         out = self.amt(input_ids=input_ids, attention_mask=attention_mask)
         hidden = out.logits
         if hidden.shape[-1] != self.hidden_size:
             raise RuntimeError(f"AMT hidden size mismatch: expected {self.hidden_size}, got {hidden.shape[-1]}")
+        return hidden
+
+    def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, labels=None, labels_mask=None, pos_weight=None, embedding_repeater=None, letter_level_tokens=None, letter_level_labels=None, letter_level_labels_mask=None, letter_level_attention_mask=None, **kwargs):
+        if self.encoder_only:
+            raise RuntimeError(
+                "This AMT instance is encoder-only; call encode_hidden from its enclosing head"
+            )
+        hidden = self.encode_hidden(input_ids=input_ids, attention_mask=attention_mask)
         if not self.use_unet:
             logits = self.classifier(hidden)
             mask = labels_mask if labels_mask is not None else attention_mask.bool()

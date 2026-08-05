@@ -36,14 +36,14 @@ def sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
 
 
-def prepare_tokenizers(model_cfg: Dict[str, Any]):
+def prepare_tokenizers(model_cfg: Dict[str, Any], task: str | None = None):
     tokenizer = make_tokenizer(model_cfg["tokenizer_path"], trust_remote_code=bool(model_cfg.get("trust_remote_code", True)))
     if model_cfg.get("padding_side"):
         tokenizer.padding_side = model_cfg["padding_side"]
     elif model_cfg.get("backbone_kind") == "caduceus":
         tokenizer.padding_side = "left"
         logger.info("[infer.tokenizer] using Caduceus default padding_side=left")
-    nucleotide_tokenizer = prepare_nucleotide_tokenizer(model_cfg, tokenizer)
+    nucleotide_tokenizer = prepare_nucleotide_tokenizer(model_cfg, tokenizer, task=task)
     logger.info("[infer.tokenizer] main pad=%s cls=%s sep=%s side=%s", tokenizer.pad_token_id, tokenizer.cls_token_id, tokenizer.sep_token_id, tokenizer.padding_side)
     if nucleotide_tokenizer is not None:
         logger.info("[infer.tokenizer] nucleotide ids source=main path=%s vocab_size=%s", model_cfg["tokenizer_path"], model_cfg.get("vocab_size"))
@@ -60,7 +60,7 @@ def prepare_model(cfg: Dict[str, Any], task: str, device: str):
             "model.checkpoint_path and inference.checkpoint_path would load two finetuned "
             "checkpoints into the same model."
         )
-    tokenizer, nucleotide_tokenizer = prepare_tokenizers(cfg["model"])
+    tokenizer, nucleotide_tokenizer = prepare_tokenizers(cfg["model"], task=task)
     cfg["_tokenizer"] = tokenizer
     model = build_model(cfg, task=task)
     checkpoint = cfg.get("inference", {}).get("checkpoint_path")
@@ -199,7 +199,7 @@ def aggregate_full_segmentation_chunks(rows: List[Dict[str, Any]]) -> List[Dict[
 def _predict_once(cfg: Dict[str, Any], task: str, device: str, reverse_complement: bool) -> List[Dict[str, Any]]:
     model, tokenizer, nucleotide_tokenizer = prepare_model(cfg, task, device)
     data_cfg = dict(cfg["dataset"])
-    data_cfg["model_family"] = dataset_family_from_model(cfg["model"])
+    data_cfg["model_family"] = dataset_family_from_model(cfg["model"], task=task)
     data_cfg["reverse_complement"] = reverse_complement
     dataset = GenatatorDataset(data_cfg, task=task, tokenizer=tokenizer, nucleotide_tokenizer=nucleotide_tokenizer, for_inference=True)
     configured_batch_size = int(cfg.get("inference", {}).get("batch_size", 1))
@@ -222,7 +222,7 @@ def _predict_once(cfg: Dict[str, Any], task: str, device: str, reverse_complemen
                 family = data_cfg["model_family"]
                 if task == "transcript_type":
                     masks = None
-                elif family in {"nucleotide", "bpe_unet", "rmt_unet", "amt_unet"}:
+                elif family in {"nucleotide", "bpe_unet", "rmt_unet", "amt_unet", "bpe_gpt"}:
                     masks = batch["letter_level_labels_mask"].detach().cpu().numpy().astype(bool)
                 else:
                     masks = batch.get("labels_mask")
@@ -230,7 +230,7 @@ def _predict_once(cfg: Dict[str, Any], task: str, device: str, reverse_complemen
                 for i in range(logits.shape[0]):
                     if task == "transcript_type":
                         row_logits = logits[i]
-                    elif family in {"nucleotide", "bpe_unet", "rmt_unet", "amt_unet"}:
+                    elif family in {"nucleotide", "bpe_unet", "rmt_unet", "amt_unet", "bpe_gpt"}:
                         row_logits = project_masked_letter_logits_to_nucleotides(
                             logits[i],
                             masks[i],

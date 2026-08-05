@@ -5,38 +5,24 @@ from typing import Any, Callable, Dict, Sequence
 
 import evaluate
 import numpy as np
-from sklearn.metrics import average_precision_score
+from sklearn.metrics import average_precision_score, roc_auc_score
 
 from .intervals import f1_from_counts, interval_counts
+from .segmentation_decoding import (
+    SEGMENTATION_CLASS_INDEX,
+    SEGMENTATION_CLASS_NAMES,
+    SEGMENTATION_INTERVAL_COMPARISON_GROUPS,
+    segmentation_competition_predictions,
+)
 
 
 EDGE_CLASS_NAMES: tuple[str, ...] = ("TSS+", "TSS-", "PolyA+", "PolyA-")
 REGION_CLASS_NAMES: tuple[str, ...] = ("intragenic+", "intragenic-")
-SEGMENTATION_CLASS_NAMES: tuple[str, ...] = ("5UTR", "exon", "intron", "3UTR", "CDS")
-SEGMENTATION_CLASS_INDEX = {
-    class_name: SEGMENTATION_CLASS_NAMES.index(class_name)
-    for class_name in ("exon", "CDS")
-}
-SEGMENTATION_INTERVAL_COMPARISON_GROUPS = {
-    # These are multilabel outputs, so each requested track competes only with
-    # the biologically relevant alternative classes used by the benchmark.
-    "exon": tuple(SEGMENTATION_CLASS_NAMES.index(name) for name in ("exon", "intron")),
-    "CDS": tuple(
-        SEGMENTATION_CLASS_NAMES.index(name)
-        for name in ("CDS", "intron", "5UTR", "3UTR")
-    ),
-}
 
 
 def segmentation_interval_predictions(logits: np.ndarray, class_name: str) -> np.ndarray:
     """Decode one segmentation interval track within its benchmark class set."""
-    try:
-        comparison_channels = SEGMENTATION_INTERVAL_COMPARISON_GROUPS[class_name]
-    except KeyError as exc:
-        raise RuntimeError(f"Unsupported segmentation interval class: {class_name!r}") from exc
-    scores = sigmoid(np.asarray(logits))[..., list(comparison_channels)]
-    max_scores = np.max(scores, axis=-1)
-    return (scores[..., 0] == max_scores).astype(np.int8)
+    return segmentation_competition_predictions(sigmoid(np.asarray(logits)), class_name)
 
 
 def _pred_array(predictions: Any) -> np.ndarray:
@@ -128,18 +114,37 @@ def _safe_binary_average_precision(
     return float(average_precision_score(references, scores)), 1.0, positives, negatives, dropped
 
 
+def _safe_binary_roc_auc(
+    references: np.ndarray,
+    scores: np.ndarray,
+) -> float:
+    """Return a finite ROC-AUC value for one finding channel."""
+    references = np.asarray(references)
+    scores = np.asarray(scores, dtype=np.float64)
+    finite = np.isfinite(scores) & np.isfinite(
+        references.astype(np.float64, copy=False)
+    )
+    references = (references[finite] > 0).astype(np.int8)
+    scores = scores[finite]
+    positives = int(references.sum())
+    negatives = int(references.size - positives)
+    if references.size == 0 or positives == 0 or negatives == 0:
+        return 0.0
+    return float(roc_auc_score(references, scores))
+
+
 def finding_pr_auc_metrics(
     eval_pred: Any,
     *,
     class_names: Sequence[str],
     task_name: str,
 ) -> Dict[str, float]:
-    """Compute ordered PR-AUC independently for each finding class.
+    """Compute ordered PR-AUC and ROC-AUC independently for each finding class.
 
     Edge channel order is ``TSS+``, ``TSS-``, ``PolyA+``, ``PolyA-``. Region
     channel order is ``intragenic+``, ``intragenic-``. Boundary targets are
-    smooth signals in the released dataset; for PR-AUC they are treated as
-    positive wherever the target signal is greater than zero.
+    smooth signals in the released dataset; for both metrics they are treated
+    as positive wherever the target signal is greater than zero.
     """
     logits = _pred_array(eval_pred.predictions)
     labels, mask = _labels_and_mask(eval_pred.label_ids)
@@ -147,23 +152,15 @@ def finding_pr_auc_metrics(
     probabilities = sigmoid(logits)
 
     metrics: Dict[str, float] = {}
-    defined_values = []
-    total_dropped = 0
     for channel_index, class_name in enumerate(class_names):
         references = labels[:, :, channel_index][mask]
         scores = probabilities[:, :, channel_index][mask]
-        ap, defined, positives, negatives, dropped = _safe_binary_average_precision(references, scores)
-        total_dropped += dropped
+        ap, _, _, _, _ = _safe_binary_average_precision(references, scores)
         metrics[f"pr_auc_{class_name}"] = ap
-        metrics[f"pr_auc_{class_name}_defined"] = defined
-        metrics[f"pr_auc_{class_name}_positives"] = float(positives)
-        metrics[f"pr_auc_{class_name}_negatives"] = float(negatives)
-        metrics[f"pr_auc_{class_name}_dropped_nonfinite"] = float(dropped)
-        if defined:
-            defined_values.append(ap)
-    metrics["pr_auc_defined_channels"] = float(len(defined_values))
-    metrics["pr_auc_mean"] = float(np.mean(defined_values)) if defined_values else 0.0
-    metrics["pr_auc_dropped_nonfinite_total"] = float(total_dropped)
+        metrics[f"roc_auc_{class_name}"] = _safe_binary_roc_auc(
+            references,
+            scores,
+        )
     return metrics
 
 
@@ -252,9 +249,17 @@ def metric_for_task(task: str) -> Callable[[Any], Dict[str, float]]:
 
 def metric_names_for_task(task: str) -> tuple[str, ...]:
     if task == "finding_edge":
-        return tuple(f"pr_auc_{name}" for name in EDGE_CLASS_NAMES)
+        return tuple(
+            metric
+            for name in EDGE_CLASS_NAMES
+            for metric in (f"pr_auc_{name}", f"roc_auc_{name}")
+        )
     if task == "finding_region":
-        return tuple(f"pr_auc_{name}" for name in REGION_CLASS_NAMES)
+        return tuple(
+            metric
+            for name in REGION_CLASS_NAMES
+            for metric in (f"pr_auc_{name}", f"roc_auc_{name}")
+        )
     if task == "segmentation":
         return ("interval_f1_exon", "interval_f1_CDS")
     if task == "transcript_type":

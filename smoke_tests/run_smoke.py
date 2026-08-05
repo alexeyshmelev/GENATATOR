@@ -133,6 +133,7 @@ def smoke_training(
         "bf16": False,
         "fp16": False,
         "resume_from_checkpoint": None,
+        "automatic_restart": True,
         "sequential_train": True,
     }
 

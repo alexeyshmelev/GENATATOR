@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from argparse import ArgumentParser
+import csv
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import json
@@ -242,12 +243,18 @@ def predict_tracks(
     return _finalize_store(pred_tracks), _finalize_store(truth_tracks)
 
 
+def _finite_binary_inputs(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    truth = np.asarray(y_true, dtype=float)
+    scores = np.asarray(y_score, dtype=float)
+    finite = np.isfinite(truth) & np.isfinite(scores)
+    return (truth[finite] > 0).astype(np.uint8), scores[finite]
+
+
 def average_precision(y_true: np.ndarray, y_score: np.ndarray) -> Optional[float]:
-    y_true = (np.asarray(y_true) > 0).astype(np.uint8)
-    y_score = np.asarray(y_score, dtype=float)
-    finite = np.isfinite(y_score)
-    y_true = y_true[finite]
-    y_score = y_score[finite]
+    y_true, y_score = _finite_binary_inputs(y_true, y_score)
     if y_true.size == 0 or int(y_true.sum()) == 0 or int((1 - y_true).sum()) == 0:
         return None
     try:
@@ -260,6 +267,17 @@ def average_precision(y_true: np.ndarray, y_score: np.ndarray) -> Optional[float
         ranks = np.arange(1, len(ordered) + 1)
         precision = true_positives / ranks
         return float((precision * ordered).sum() / max(1, int(ordered.sum())))
+
+
+def roc_auc(y_true: np.ndarray, y_score: np.ndarray) -> Optional[float]:
+    y_true, y_score = _finite_binary_inputs(y_true, y_score)
+    if y_true.size == 0 or int(y_true.sum()) == 0 or int((1 - y_true).sum()) == 0:
+        return None
+    try:
+        from sklearn.metrics import roc_auc_score
+        return float(roc_auc_score(y_true, y_score))
+    except Exception:
+        return None
 
 
 def compute_whole_chromosome_pr_auc(
@@ -307,6 +325,71 @@ def compute_whole_chromosome_pr_auc(
     }
 
 
+def compute_pooled_roc_auc(
+    predictions: Dict[GenomeChromosome, np.ndarray],
+    truth: Dict[GenomeChromosome, np.ndarray],
+    class_names: List[str],
+) -> Dict[str, Optional[float]]:
+    pooled_scores: List[List[np.ndarray]] = [[] for _ in class_names]
+    pooled_truth: List[List[np.ndarray]] = [[] for _ in class_names]
+    for key in sorted(predictions):
+        if key not in truth:
+            continue
+        predicted = predictions[key]
+        reference = truth[key]
+        length = min(predicted.shape[1], reference.shape[1])
+        channels = min(predicted.shape[0], reference.shape[0], len(class_names))
+        for channel in range(channels):
+            pooled_scores[channel].append(predicted[channel, :length])
+            pooled_truth[channel].append(reference[channel, :length])
+
+    scores: Dict[str, Optional[float]] = {}
+    for channel, name in enumerate(class_names):
+        if not pooled_scores[channel]:
+            scores[name] = None
+            continue
+        scores[name] = roc_auc(
+            np.concatenate(pooled_truth[channel]),
+            np.concatenate(pooled_scores[channel]),
+        )
+    return scores
+
+
+def _csv_metric(value: Optional[float]) -> object:
+    if value is None or not np.isfinite(value):
+        return ""
+    return float(value)
+
+
+def write_finding_auc_csv(
+    pr_auc: Dict[str, Dict],
+    roc_auc_by_stage: Dict[str, Dict[str, Optional[float]]],
+    output_path: str | Path,
+) -> Path:
+    target = Path(output_path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    classes_by_stage = (
+        ("edge", ("TSS+", "TSS-", "PolyA+", "PolyA-")),
+        ("region", ("intragenic+", "intragenic-")),
+    )
+    with open(target, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(("stage", "class", "pr_auc", "roc_auc"))
+        for stage, class_names in classes_by_stage:
+            pooled_pr_auc = pr_auc[stage]["pooled"]
+            pooled_roc_auc = roc_auc_by_stage[stage]
+            for class_name in class_names:
+                writer.writerow(
+                    (
+                        stage,
+                        class_name,
+                        _csv_metric(pooled_pr_auc.get(class_name)),
+                        _csv_metric(pooled_roc_auc.get(class_name)),
+                    )
+                )
+    return target
+
+
 def _run_single_stage(cfg: Dict) -> None:
     task = str(cfg.get("task", ""))
     if task not in {"finding_edge", "finding_region"}:
@@ -343,16 +426,25 @@ def _run_full_pipeline(cfg: Dict) -> None:
     region_tracks, region_truth = predict_tracks(
         cfg["region"], "finding_region", device, use_reverse_complement=use_rc
     )
-    metrics: Dict[str, object] = {
-        "pr_auc": {
-            "edge": compute_whole_chromosome_pr_auc(
-                edge_tracks, edge_truth, ["TSS+", "TSS-", "PolyA+", "PolyA-"]
-            ),
-            "region": compute_whole_chromosome_pr_auc(
-                region_tracks, region_truth, ["intragenic+", "intragenic-"]
-            ),
-        }
+    edge_class_names = ["TSS+", "TSS-", "PolyA+", "PolyA-"]
+    region_class_names = ["intragenic+", "intragenic-"]
+    pr_auc = {
+        "edge": compute_whole_chromosome_pr_auc(
+            edge_tracks, edge_truth, edge_class_names
+        ),
+        "region": compute_whole_chromosome_pr_auc(
+            region_tracks, region_truth, region_class_names
+        ),
     }
+    roc_auc_by_stage = {
+        "edge": compute_pooled_roc_auc(
+            edge_tracks, edge_truth, edge_class_names
+        ),
+        "region": compute_pooled_roc_auc(
+            region_tracks, region_truth, region_class_names
+        ),
+    }
+    metrics: Dict[str, object] = {"pr_auc": pr_auc}
 
     genomes = {key[0] for key in edge_tracks}
     if len(genomes) != 1:
@@ -449,7 +541,15 @@ def _run_full_pipeline(cfg: Dict) -> None:
         "metrics_json", str(Path(output_gff).with_suffix(".metrics.json"))
     )
     atomic_save_json(metrics, metrics_path)
+    metrics_csv = inference_cfg.get("metrics_csv")
+    metrics_csv_path = (
+        Path(metrics_csv).expanduser()
+        if metrics_csv
+        else Path(metrics_path).expanduser().with_suffix(".csv")
+    )
+    write_finding_auc_csv(pr_auc, roc_auc_by_stage, metrics_csv_path)
     logger.info("Wrote gene-finding inference/evaluation metrics to %s", metrics_path)
+    logger.info("Wrote gene-finding per-class AUC metrics to %s", metrics_csv_path)
 
 
 def main() -> None:
