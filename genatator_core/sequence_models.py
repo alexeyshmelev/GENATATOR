@@ -11,7 +11,7 @@ from transformers.modeling_outputs import SequenceClassifierOutput
 
 from .amt_models import _load_amt_base_model
 from .backbones import (
-    TranscriptTokenClassificationBackbone,
+    HiddenStateBackbone,
     get_word_embeddings,
     infer_hidden_size,
     infer_vocab_size_from_embeddings,
@@ -138,10 +138,11 @@ def _hidden_from_output(output: Any, *, context: str) -> torch.Tensor:
 class GenaModernTranscriptTypeClassifier(nn.Module):
     """Binary transcript classifier for GENA and ModernGENA.
 
-    The backbone container is the concrete ``BertForTokenClassification`` or
-    ``ModernBertForTokenClassification`` class.  The sequence wrapper consumes
-    exactly the tokenizer's CLS state and applies that container's one-logit
-    classification projection once per transcript.
+    ``BertForTokenClassification`` and ``ModernBertForTokenClassification`` are
+    useful checkpoint-compatible containers, but their task heads are token-level
+    and therefore are not the transcript classifier.  The established hidden-state
+    adapter discards/bypasses that unused head.  This sequence-level head consumes
+    exactly the tokenizer's CLS state and emits one logit per transcript.
     """
 
     def __init__(
@@ -159,12 +160,12 @@ class GenaModernTranscriptTypeClassifier(nn.Module):
                 "GenaModernTranscriptTypeClassifier supports only GENA/ModernGENA, "
                 f"got backbone_kind={backbone_kind!r}"
             )
-        self.hidden_backbone = TranscriptTokenClassificationBackbone(
+        self.hidden_backbone = HiddenStateBackbone(
             backbone_path,
             backbone_kind,
             trust_remote_code=trust_remote_code,
+            modernbert_num_labels=1,
             allow_unsafe_torch_load=allow_unsafe_torch_load,
-            num_labels=1,
         )
         self.hidden_size = int(self.hidden_backbone.hidden_size)
         self.register_buffer(
@@ -172,6 +173,7 @@ class GenaModernTranscriptTypeClassifier(nn.Module):
             torch.tensor(_required_token_id(tokenizer, "cls_token_id"), dtype=torch.long),
             persistent=False,
         )
+        self.classifier = nn.Linear(self.hidden_size, 1)
 
     def forward(
         self,
@@ -197,7 +199,7 @@ class GenaModernTranscriptTypeClassifier(nn.Module):
             attention_mask=attention_mask,
             token_name="CLS",
         )
-        logits = self.hidden_backbone.classify(pooled)
+        logits = self.classifier(pooled)
         target = _sequence_labels(transcript_type, labels)
         return SequenceClassifierOutput(
             loss=_binary_sequence_loss(logits, target),
@@ -375,11 +377,7 @@ class RMTTranscriptTypeClassifier(nn.Module):
                 f"got=({resized_vocab}, {resized_hidden}) "
                 f"expected=({vocab_size + self.num_mem_tokens}, {self.hidden_size})"
             )
-        self._uses_backbone_classifier = callable(getattr(self.model, "classify", None))
-        if not self._uses_backbone_classifier:
-            # Kept for direct construction with test/custom backbones. Production
-            # transcript RMT models use the token-classification owner's projection.
-            self.classifier = nn.Linear(self.hidden_size, 1)
+        self.classifier = nn.Linear(self.hidden_size, 1)
 
     def _content_sequences(
         self,
@@ -525,11 +523,7 @@ class RMTTranscriptTypeClassifier(nn.Module):
         assert torch.equal(final_active_indices, expected_indices), (
             "Every sample must participate in the final right-aligned RMT segment"
         )
-        logits = (
-            self.model.classify(final_pooled)
-            if self._uses_backbone_classifier
-            else self.classifier(final_pooled)
-        )
+        logits = self.classifier(final_pooled)
         target = _sequence_labels(transcript_type, labels)
         return SequenceClassifierOutput(
             loss=_binary_sequence_loss(logits, target),
@@ -554,7 +548,6 @@ class AMTTranscriptTypeClassifier(nn.Module):
         *,
         segment_size: int,
         segment_alignment: str = "left",
-        sequence_classifier=None,
     ):
         super().__init__()
         if segment_alignment != "left":
@@ -578,11 +571,7 @@ class AMTTranscriptTypeClassifier(nn.Module):
             torch.tensor([_required_token_id(tokenizer, "sep_token_id")], dtype=torch.long),
             persistent=False,
         )
-        self._sequence_classifier = sequence_classifier
-        if self._sequence_classifier is None:
-            # Kept for direct construction with test/custom AMT backbones. The
-            # production path uses the token-classification owner's projection.
-            self.classifier = nn.Linear(self.hidden_size, 1)
+        self.classifier = nn.Linear(self.hidden_size, 1)
 
     @classmethod
     def from_pretrained(
@@ -605,7 +594,6 @@ class AMTTranscriptTypeClassifier(nn.Module):
             backbone_kind,
             trust_remote_code,
             allow_unsafe_torch_load,
-            transcript_type=True,
         )
         if base_model.get_input_embeddings() is None:
             raise RuntimeError(
@@ -683,7 +671,6 @@ class AMTTranscriptTypeClassifier(nn.Module):
             tokenizer,
             segment_size=segment_size,
             segment_alignment=segment_alignment,
-            sequence_classifier=base_model.classify,
         )
 
     def _prepare_sample(
@@ -797,11 +784,7 @@ class AMTTranscriptTypeClassifier(nn.Module):
                 )
             )
         pooled = torch.cat(pooled_rows, dim=0)
-        logits = (
-            self._sequence_classifier(pooled)
-            if self._sequence_classifier is not None
-            else self.classifier(pooled)
-        )
+        logits = self.classifier(pooled)
         target = _sequence_labels(transcript_type, labels)
         return SequenceClassifierOutput(
             loss=_binary_sequence_loss(logits, target),

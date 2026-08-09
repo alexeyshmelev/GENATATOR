@@ -25,7 +25,11 @@ class PlainTokenClassifier(nn.Module):
         logger.info("[PlainTokenClassifier] backbone=%s hidden=%d labels=%d", backbone_kind, self.hidden_size, self.num_labels)
 
     def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, labels=None, labels_mask=None, **kwargs):
-        hidden = self.hidden_backbone(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids).logits
+        hidden = self.hidden_backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+        ).logits
         logits = self.classifier(hidden)
         loss = None
         if labels is not None:
@@ -67,7 +71,11 @@ class TokenClassifierWithUNet(nn.Module):
     def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, labels=None, labels_mask=None, embedding_repeater=None, letter_level_tokens=None, letter_level_labels=None, letter_level_labels_mask=None, letter_level_attention_mask=None, pos_weight=None, **kwargs):
         if labels_mask is None:
             raise RuntimeError("UNET model requires labels_mask to identify retained BPE content tokens")
-        hidden = self.hidden_backbone(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids).logits
+        hidden = self.hidden_backbone.forward_chunked(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+        ).logits
         loss, logits = run_samplewise_chunked_unet(
             token_hidden=hidden,
             token_content_mask=labels_mask,

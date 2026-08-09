@@ -3,8 +3,6 @@ from __future__ import annotations
 import types
 import unittest
 
-import numpy as np
-
 try:
     import torch
     import torch.nn as nn
@@ -18,8 +16,12 @@ try:
         _framing_special_token_ids,
         expand_bpe_states_to_nucleotides,
     )
-    from genatator_core.gpt_head import T5GemmaDecoder, T5GemmaSegmentationHead
-    from genatator_core.segmentation_decoding import segmentation_competition_predictions
+    from genatator_core.gpt_head import (
+        EXON_LABEL_INDEX,
+        INTRON_LABEL_INDEX,
+        T5GemmaDecoder,
+        T5GemmaSegmentationHead,
+    )
 except ImportError:
     torch = None
     nn = None
@@ -28,7 +30,7 @@ except ImportError:
 
 if nn is not None:
     class RecordingGPTHead(nn.Module):
-        def __init__(self, num_labels: int = 2):
+        def __init__(self, num_labels: int = 5):
             super().__init__()
             self.num_labels = int(num_labels)
             self.calls = []
@@ -68,9 +70,16 @@ if nn is not None:
             super().__init__()
             self.hidden = hidden
             self.calls = []
+            self.forward_calls = []
+            self.chunked_calls = []
 
         def forward(self, **kwargs):
+            self.forward_calls.append(kwargs)
+            return types.SimpleNamespace(logits=self.hidden)
+
+        def forward_chunked(self, **kwargs):
             self.calls.append(kwargs)
+            self.chunked_calls.append(kwargs)
             return types.SimpleNamespace(logits=self.hidden)
 
 
@@ -122,12 +131,11 @@ def _set_scalar_embedding(embedding) -> None:
         embedding.weight[:, 1] = ids + 0.25
 
 
-def _five_track_labels(class_ids):
-    labels = torch.zeros((*class_ids.shape, 5), dtype=torch.float32)
-    labels[..., 1] = class_ids.eq(0).float()
-    labels[..., 2] = class_ids.eq(1).float()
-    labels[..., 0] = labels[..., 1]
-    labels[..., 4] = labels[..., 1]
+def _five_track_labels(classes):
+    classes = torch.as_tensor(classes, dtype=torch.long)
+    labels = torch.zeros((*classes.shape, 5), dtype=torch.float32)
+    labels[..., INTRON_LABEL_INDEX] = classes.eq(0).float()
+    labels[..., EXON_LABEL_INDEX] = classes.eq(1).float()
     return labels
 
 
@@ -259,13 +267,10 @@ class GPTModelAdapterTests(unittest.TestCase):
         )
 
         self.assertEqual(tuple(output.logits.shape), (1, 4, 5))
-        self.assertTrue(torch.isfinite(output.logits).all())
-        self.assertTrue(bool((output.logits[..., 0] == -80.0).all()))
-        self.assertTrue(bool((output.logits[..., 3] == -80.0).all()))
-        self.assertTrue(bool((output.logits[..., 4] == -80.0).all()))
-        self.assertTrue(bool((output.logits[..., 1:3] == 0.0).all()))
         self.assertIsNotNone(output.loss)
         self.assertEqual(len(model.hidden_backbone.calls), 1)
+        self.assertEqual(len(model.hidden_backbone.chunked_calls), 1)
+        self.assertEqual(len(model.hidden_backbone.forward_calls), 0)
         self.assertTrue(
             torch.equal(model.hidden_backbone.calls[0]["token_type_ids"], token_types)
         )
@@ -310,6 +315,30 @@ class GPTModelAdapterTests(unittest.TestCase):
         self.assertFalse(bool((encoder_embeddings == 99.0).any()))
         self.assertFalse(bool((encoder_embeddings == 98.0).any()))
 
+    def test_eval_adapter_keeps_labels_for_teacher_forced_validation(self):
+        hidden = torch.tensor(
+            [[[99.0, 99.0], [1.0, 10.0], [2.0, 20.0], [98.0, 98.0], [0.0, 0.0]]]
+        )
+        model = _new_direct_model(hidden)
+        model.eval()
+        labels = _five_track_labels([[0, 1, 0, 0]])
+
+        model(
+            input_ids=torch.tensor([[10, 4, 5, 11, 0]]),
+            attention_mask=torch.tensor([[1, 1, 1, 1, 0]]),
+            labels_mask=torch.tensor([[False, True, True, False, False]]),
+            embedding_repeater=torch.tensor([[0, 0, 1, -100]]),
+            letter_level_tokens=torch.tensor([[6, 7, 8, 0]]),
+            letter_level_attention_mask=torch.tensor([[1, 1, 1, 0]]),
+            letter_level_labels=labels,
+            letter_level_labels_mask=torch.tensor([[True, True, True, False]]),
+        )
+
+        call = model.gpt_head.calls[0]
+        self.assertFalse(call["training"])
+        self.assertIsNone(call["autoregressive"])
+        self.assertTrue(torch.equal(call["labels"], labels))
+
     def test_public_generate_forces_eval_autoregression_and_restores_training(self):
         hidden = torch.tensor(
             [[[99.0, 99.0], [1.0, 10.0], [2.0, 20.0], [98.0, 98.0], [0.0, 0.0]]]
@@ -337,30 +366,6 @@ class GPTModelAdapterTests(unittest.TestCase):
         self.assertIsNone(call["labels"])
         self.assertTrue(call["autoregressive"])
         self.assertFalse(call["training"])
-
-    def test_two_target_logits_are_mapped_to_legacy_exon_intron_slots(self):
-        model = _new_direct_model(torch.zeros((1, 1, 2)))
-        target_logits = torch.tensor([[[3.0, -2.0], [-4.0, 7.0]]])
-        full = model._restore_five_track_logits(target_logits)
-        self.assertEqual(tuple(full.shape), (1, 2, 5))
-        self.assertTrue(torch.equal(full[..., 1], target_logits[..., 0]))
-        self.assertTrue(torch.equal(full[..., 2], target_logits[..., 1]))
-        for unavailable_index in (0, 3, 4):
-            self.assertTrue(torch.isfinite(full[..., unavailable_index]).all())
-            self.assertTrue(bool((full[..., unavailable_index] == -80.0).all()))
-
-        extreme = torch.tensor([[[-120.0, -100.0]]])
-        extreme_full = model._restore_five_track_logits(extreme)
-        self.assertEqual(
-            int(extreme_full[..., 1:3].argmax(dim=-1).item()),
-            int(extreme.argmax(dim=-1).item()),
-        )
-        self.assertGreater(float(extreme_full[..., 1:3].min()), -80.0)
-        cds = segmentation_competition_predictions(
-            1.0 / (1.0 + np.exp(-extreme_full.detach().float().numpy())),
-            "CDS",
-        )
-        self.assertEqual(cds.tolist(), [[0]])
 
     def test_rmt_encoder_only_adapter_uses_recurrent_content_mask(self):
         model = RMTGPTSegmentationModel.__new__(RMTGPTSegmentationModel)
@@ -476,7 +481,7 @@ class GPTModelAdapterTests(unittest.TestCase):
         model = _new_direct_model(hidden)
         model.gpt_head = T5GemmaSegmentationHead(
             encoder_dim=4,
-            num_labels=2,
+            num_labels=5,
             decoder_hidden_size=16,
             decoder_intermediate_size=32,
             num_decoder_layers=2,
@@ -492,9 +497,7 @@ class GPTModelAdapterTests(unittest.TestCase):
             "embedding_repeater": torch.tensor([[0, 0, 1, -100]]),
             "letter_level_tokens": torch.tensor([[6, 7, 8, 0]]),
             "letter_level_attention_mask": torch.tensor([[1, 1, 1, 0]]),
-            "letter_level_labels": _five_track_labels(
-                torch.tensor([[0, 1, 0, 1]])
-            ),
+            "letter_level_labels": _five_track_labels([[0, 1, 0, 0]]),
             "letter_level_labels_mask": torch.tensor([[True, True, True, False]]),
         }
 
@@ -503,10 +506,13 @@ class GPTModelAdapterTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(trained.loss))
         self.assertEqual(tuple(trained.logits.shape), (1, 4, 5))
         model.eval()
-        generated = model(**inputs)
-        self.assertTrue(torch.isfinite(generated.loss))
-        self.assertTrue(torch.isfinite(generated.logits).all())
-        self.assertEqual(tuple(generated.logits.shape), (1, 4, 5))
+        evaluated = model(**inputs)
+        self.assertTrue(torch.isfinite(evaluated.loss))
+        self.assertTrue(torch.isfinite(evaluated.logits).all())
+        self.assertEqual(tuple(evaluated.logits.shape), (1, 4, 5))
+        generated = model.generate(**inputs)
+        self.assertTrue(torch.isfinite(generated).all())
+        self.assertEqual(tuple(generated.shape), (1, 4, 5))
 
 
 if __name__ == "__main__":

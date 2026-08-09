@@ -171,6 +171,78 @@ class GenatatorTrainer(Trainer):
         else:
             base_log(filtered)
 
+    def compute_loss(
+        self,
+        model,
+        inputs,
+        return_outputs: bool = False,
+        num_items_in_batch=None,
+    ):
+        """Fail at the first non-finite loss instead of hiding it in logging.
+
+        Transformers' default ``logging_nan_inf_filter`` can turn a NaN interval
+        into an apparent zero in TensorBoard.  A non-finite loss must never be
+        backpropagated or allowed to corrupt a checkpoint, so check the scalar
+        before Trainer starts backward.
+        """
+
+        base_compute_loss = super().compute_loss
+        kwargs = {"return_outputs": return_outputs}
+        if "num_items_in_batch" in inspect.signature(base_compute_loss).parameters:
+            kwargs["num_items_in_batch"] = num_items_in_batch
+        result = base_compute_loss(model, inputs, **kwargs)
+        loss = result[0] if return_outputs else result
+        if isinstance(loss, torch.Tensor) and not bool(torch.isfinite(loss.detach()).all()):
+            raise FloatingPointError(
+                "Non-finite loss detected before backward: "
+                f"task={self.genatator_task} global_step="
+                f"{int(getattr(self.state, 'global_step', 0))}. "
+                "The optimizer step was not executed."
+            )
+        return result
+
+    @staticmethod
+    def _raise_on_nonfinite_gradients(model: torch.nn.Module) -> None:
+        """Validate the post-backward gradient norm without modifying gradients."""
+
+        parameters = [
+            parameter
+            for parameter in model.parameters()
+            if parameter.grad is not None
+        ]
+        if not parameters:
+            return
+        try:
+            # max_norm=inf makes the finite clipping coefficient exactly one.
+            # error_if_nonfinite therefore turns the existing norm reduction
+            # into a guard without changing any gradient tensor.
+            torch.nn.utils.clip_grad_norm_(
+                parameters,
+                max_norm=float("inf"),
+                error_if_nonfinite=True,
+            )
+        except RuntimeError as exc:
+            raise FloatingPointError(
+                "Non-finite gradient norm detected after backward and before "
+                "the optimizer step. The optimizer step was not executed."
+            ) from exc
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        """Run backward, then fail before clipping/step on non-finite gradients."""
+
+        base_training_step = super().training_step
+        kwargs = {}
+        if "num_items_in_batch" in inspect.signature(base_training_step).parameters:
+            kwargs["num_items_in_batch"] = num_items_in_batch
+        loss = base_training_step(model, inputs, **kwargs)
+        # FP16 GradScaler deliberately handles overflow by lowering its scale;
+        # inspecting still-scaled gradients here would turn that recovery into
+        # a false hard failure. AMT segmentation is shipped with BF16, whose
+        # gradients are unscaled and can be checked immediately.
+        if not bool(getattr(self.args, "fp16", False)):
+            self._raise_on_nonfinite_gradients(model)
+        return loss
+
     @staticmethod
     def _output_value(outputs, name: str):
         if isinstance(outputs, dict):
@@ -405,9 +477,12 @@ class GenatatorTrainer(Trainer):
 
 def dataset_family_from_model(model_cfg: Dict[str, Any], task: str | None = None) -> str:
     family = model_cfg["family"]
-    head_kind = str(model_cfg.get("head_kind", "default"))
-    if head_kind == "gpt":
-        return "nucleotide" if family == "caduceus" else "bpe_gpt"
+    if family == "gpt":
+        return (
+            "nucleotide"
+            if model_cfg.get("backbone_kind") == "caduceus"
+            else "bpe_gpt"
+        )
     # RMT and AMT are sequence wrappers for transcript-type prediction.  They
     # do not expand BPE states to letter-level inputs unless a segmentation
     # head explicitly requests that representation.
@@ -438,7 +513,7 @@ def label_names_for(task: str, dataset_family: str):
 
 def needs_nucleotide_tokenizer(model_cfg: Dict[str, Any], task: str | None = None) -> bool:
     family = model_cfg["family"]
-    if str(model_cfg.get("head_kind", "default")) == "gpt":
+    if family == "gpt":
         return True
     if task == "transcript_type":
         return False
@@ -556,10 +631,12 @@ def validate_rules(cfg: Dict[str, Any], task: str) -> None:
     if backbone_kind == "gena" and family in {"plain", "unet"}:
         for dataset_name in ("train_dataset", "eval_dataset"):
             max_bpe_tokens = int(cfg[dataset_name].get("max_bpe_tokens", 0))
-            if max_bpe_tokens > 512:
+            chunked_segmentation_unet = task == "segmentation" and family == "unet"
+            if max_bpe_tokens > 512 and not chunked_segmentation_unet:
                 raise RuntimeError(
                     f"Direct/plain GENA requires {dataset_name}.max_bpe_tokens <= 512; "
-                    f"got {max_bpe_tokens}. Use RMT/AMT for longer BPE inputs."
+                    f"got {max_bpe_tokens}. Use the segmentation U-Net's "
+                    "non-overlapping chunked encoder path or RMT/AMT for longer BPE inputs."
                 )
     if task == "transcript_type" and family not in {"plain", "caduceus", "rmt", "amt"}:
         raise RuntimeError(
@@ -570,11 +647,19 @@ def validate_rules(cfg: Dict[str, Any], task: str) -> None:
     if family == "rmt" and backbone_kind == "caduceus":
         raise RuntimeError("RMT must not be adapted to Caduceus")
     if task == "segmentation" and backbone_kind in {"gena", "moderngena"}:
-        uses_gpt = str(model_cfg.get("head_kind", "default")) == "gpt"
-        if not uses_gpt and family not in {"unet", "rmt"} and not (family == "amt" and bool(model_cfg.get("use_unet", False))):
-            raise RuntimeError("Segmentation with GENA/ModernGENA requires nucleotide resolution through UNET or head_kind='gpt'")
-    if str(model_cfg.get("head_kind", "default")) == "gpt" and task != "segmentation":
-        raise RuntimeError("head_kind='gpt' is implemented only for the segmentation task")
+        if family not in {"gpt", "unet", "rmt"} and not (
+            family == "amt" and bool(model_cfg.get("use_unet", False))
+        ):
+            raise RuntimeError(
+                "Segmentation with GENA/ModernGENA requires nucleotide resolution "
+                "through family='gpt', U-Net, RMT+U-Net, or AMT+U-Net"
+            )
+    if family == "gpt" and task != "segmentation":
+        raise RuntimeError("family='gpt' is implemented only for the segmentation task")
+    if "head_kind" in model_cfg:
+        raise RuntimeError(
+            "model.head_kind is not supported; use model.family='gpt' for GPT segmentation"
+        )
     if needs_nucleotide_tokenizer(model_cfg, task=task):
         logger.info("[rules] BPE-to-nucleotide ids will be read from model.tokenizer_path")
     if "freeze" in str(model_cfg).lower():
@@ -720,6 +805,9 @@ def train_from_config(config_path: str, task: str | None = None) -> None:
         lr_scheduler_type=tr.get("lr_scheduler_type", "constant_with_warmup"),
         logging_strategy=logging_strategy,
         logging_steps=logging_interval,
+        # Never replace NaN/Inf logging intervals with a misleading zero.  The
+        # trainer's compute_loss guard above raises before backward instead.
+        logging_nan_inf_filter=False,
         eval_steps=eval_steps,
         save_strategy=save_strategy,
         save_steps=save_steps,

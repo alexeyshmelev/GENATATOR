@@ -6,20 +6,271 @@ import types
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn import BCEWithLogitsLoss
 from transformers import AutoModel, AutoModelForCausalLM, ModernBertModel
 from transformers.modeling_outputs import TokenClassifierOutput
 
-from .backbones import (
-    TranscriptTokenClassificationBackbone,
-    get_word_embeddings,
-    infer_hidden_size,
-)
+from .backbones import infer_hidden_size, get_word_embeddings
 from .config import local_or_remote
 from .unet import DEFAULT_UNET_CHUNK_SIZE, UNET1DSegmentationHead, run_samplewise_chunked_unet
 from .torch_compat import allow_transformers_torch_load_on_legacy_torch
 
 logger = logging.getLogger(__name__)
+
+
+def _fp32_linear(layer: nn.Linear, inputs: torch.Tensor) -> torch.Tensor:
+    """Apply an AMT projection in fp32 without changing its trainable weights."""
+
+    bias = None if layer.bias is None else layer.bias.float()
+    return F.linear(inputs.float(), layer.weight.float(), bias)
+
+
+def _stable_associate(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    """Retrieve associative memory in fp32, then restore the encoder dtype.
+
+    ARMT's DPFP features, recurrent state and normalization denominator are a
+    poor fit for autocast: a rare, almost-orthogonal query can make the
+    denominator and its gradient especially sensitive to bf16 rounding.  The
+    surrounding ModernBERT encoder remains under bf16 autocast; only this small
+    linear-memory calculation is promoted to fp32.
+    """
+
+    output_dtype = hidden_states.dtype
+    device_type = hidden_states.device.type
+    with torch.autocast(device_type=device_type, enabled=False):
+        queries = self._to_heads(_fp32_linear(self.W_mq, hidden_states))
+        queries = F.normalize(self.phi(queries), dim=-1, p=2.0)
+        memory = self.W_mem.to(device=hidden_states.device, dtype=torch.float32)
+        numerator = torch.einsum("bhsk,bhkd->bhsd", queries, memory)
+        if self.use_denom:
+            denominator_state = self.z.to(
+                device=hidden_states.device,
+                dtype=torch.float32,
+            )
+            # DPFP and z are non-negative by construction.  clamp_min only
+            # guards against numerical noise and retains the upstream 1e-5
+            # denominator floor/equation.
+            denominator = torch.einsum(
+                "bhk,bhsk->bhs", denominator_state, queries
+            ).clamp_min(0.0)[..., None]
+            numerator = numerator / (denominator + 1e-5)
+        retrieved = self._from_heads(numerator)
+    return retrieved.to(dtype=output_dtype)
+
+
+def _stable_update_mem(self, mem_tokens: torch.Tensor) -> None:
+    """Update differentiable associative state in fp32 under bf16 training."""
+
+    device_type = mem_tokens.device.type
+    with torch.autocast(device_type=device_type, enabled=False):
+        tokens = mem_tokens.float()
+        keys = self._to_heads(_fp32_linear(self.W_mk, tokens))
+        keys = F.normalize(self.phi(keys), dim=-1, p=2.0)
+        new_values = self._to_heads(_fp32_linear(self.W_mv, tokens))
+
+        memory = self.W_mem.to(device=mem_tokens.device, dtype=torch.float32)
+        if not self.first_seg:
+            numerator = torch.einsum("bhsk,bhkd->bhsd", keys, memory)
+            if self.use_denom:
+                denominator_state = self.z.to(
+                    device=mem_tokens.device,
+                    dtype=torch.float32,
+                )
+                denominator = torch.einsum(
+                    "bhk,bhsk->bhs", denominator_state, keys
+                ).clamp_min(0.0)[..., None]
+                denominator = denominator + 1e-5
+                previous_values = numerator / denominator
+                if self.correction:
+                    key_norm_sq = torch.linalg.vector_norm(
+                        keys, dim=-1
+                    ).square()[..., None]
+                    new_information = (
+                        1.0 - denominator / key_norm_sq.clamp_min(1e-12)
+                    ).clamp(0.0, 1.0).detach()
+                else:
+                    new_information = 1.0
+            else:
+                previous_values = numerator
+                new_information = 1.0
+        else:
+            previous_values = torch.zeros_like(new_values)
+            new_information = 1.0
+
+        value_delta = new_values - previous_values
+        gates = self._to_heads(torch.sigmoid(_fp32_linear(self.W_mb, tokens)))
+        if self.gating:
+            associations = torch.einsum(
+                "bhsk,bhsd,bhsd->bhkd", keys, value_delta, gates
+            )
+        else:
+            associations = torch.einsum(
+                "bhsk,bhsd,bhsx->bhkd", keys, value_delta, gates
+            )
+        self.W_mem = memory + associations
+
+        if self.use_denom:
+            denominator_update = (new_information * keys).sum(dim=-2)
+            denominator_state = self.z.to(
+                device=mem_tokens.device,
+                dtype=torch.float32,
+            )
+            self.z = denominator_state + denominator_update
+        self.seg_num += 1
+        self.first_seg = False
+
+
+def _stable_zero_mem(self) -> None:
+    """Reset non-persistent ARMT state in fp32 on the projection device."""
+
+    device = self.W_mq.weight.device
+    self.first_seg = True
+    self.W_mem = torch.zeros(
+        1,
+        self.n_heads,
+        self.d_key // self.n_heads,
+        self.d_model // self.n_heads,
+        dtype=torch.float32,
+        device=device,
+    )
+    self.W_mem.requires_grad_(False)
+    if self.use_denom:
+        self.z = torch.zeros(
+            1,
+            self.n_heads,
+            self.d_key // self.n_heads,
+            dtype=torch.float32,
+            device=device,
+        )
+        self.z.requires_grad_(False)
+    self.seg_num = 0
+
+
+def _install_stable_associative_memory(memory_cell: nn.Module) -> None:
+    """Patch the loaded ARMT layer primitive with equivalent fp32 math.
+
+    The Hugging Face repository supplies model wrapping/segmentation while the
+    numerical primitive is kept local and version-checked here.  Patching the
+    primitive's defining class (rather than individual adaptive subclasses)
+    preserves optional ACT dispatch through ``super().associate``.
+    """
+
+    layers = list(memory_cell.get_layers())
+    if not layers:
+        raise RuntimeError("AMT memory cell did not expose any associative layers")
+    patched_classes = set()
+    required = {
+        "W_mq",
+        "W_mk",
+        "W_mv",
+        "W_mb",
+        "phi",
+        "n_heads",
+        "d_key",
+        "d_model",
+        "use_denom",
+        "gating",
+        "correction",
+    }
+    for layer in layers:
+        missing = sorted(name for name in required if not hasattr(layer, name))
+        if missing:
+            raise RuntimeError(
+                "The loaded AMT implementation is incompatible with GENATATOR's "
+                f"stable-memory patch; layer={type(layer).__name__} missing={missing}"
+            )
+        primitive_class = next(
+            (
+                cls
+                for cls in type(layer).__mro__
+                if all(
+                    name in cls.__dict__
+                    for name in ("associate", "update_mem", "zero_mem")
+                )
+            ),
+            None,
+        )
+        if primitive_class is None:
+            raise RuntimeError(
+                "The loaded AMT implementation has no patchable associative "
+                f"primitive for layer={type(layer).__name__}"
+            )
+        if primitive_class in patched_classes:
+            continue
+        primitive_class.associate = _stable_associate
+        primitive_class.update_mem = _stable_update_mem
+        primitive_class.zero_mem = _stable_zero_mem
+        primitive_class._genatator_fp32_associative_memory = True
+        patched_classes.add(primitive_class)
+    memory_cell.zero_mem()
+
+
+def _run_amt_without_padding(
+    amt: nn.Module,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    hidden_size: int,
+) -> torch.Tensor:
+    """Run AMT per sample on attended tokens and scatter back to batch shape.
+
+    Segmentation batches are padded to the configured maximum BPE length.  If
+    those tails are sent to recurrent AMT, every short transcript creates many
+    all-PAD segments which still append learned memory tokens and update every
+    layer's associative state.  Compacting first matches the unpadded ARMT
+    execution used by gencoder and makes recurrence depend on biological
+    content length rather than configured padding length.
+    """
+
+    if input_ids is None or input_ids.ndim != 2:
+        raise RuntimeError("AMT requires rank-2 input_ids")
+    if attention_mask is None:
+        out = amt(input_ids=input_ids, attention_mask=None)
+        hidden = out.logits
+        if hidden.shape != (*input_ids.shape, int(hidden_size)):
+            raise RuntimeError(
+                "AMT hidden shape mismatch without an attention mask: "
+                f"expected={(*input_ids.shape, int(hidden_size))} got={tuple(hidden.shape)}"
+            )
+        return hidden
+    if attention_mask.shape != input_ids.shape:
+        raise RuntimeError(
+            "AMT input_ids/attention_mask shape mismatch: "
+            f"input_ids={tuple(input_ids.shape)} attention_mask={tuple(attention_mask.shape)}"
+        )
+
+    batch_size, padded_length = input_ids.shape
+    sample_outputs = []
+    for sample_index in range(batch_size):
+        attended_positions = attention_mask[sample_index].bool().nonzero(
+            as_tuple=False
+        ).flatten()
+        if attended_positions.numel() == 0:
+            raise RuntimeError(
+                f"AMT sample {sample_index} has no attended tokens; refusing to run PAD-only recurrence"
+            )
+        compact_ids = input_ids[sample_index : sample_index + 1].index_select(
+            1, attended_positions
+        )
+        compact_mask = attention_mask[
+            sample_index : sample_index + 1
+        ].new_ones((1, attended_positions.numel()))
+        compact_hidden = amt(
+            input_ids=compact_ids,
+            attention_mask=compact_mask,
+        ).logits
+        expected_shape = (1, attended_positions.numel(), int(hidden_size))
+        if compact_hidden.shape != expected_shape:
+            raise RuntimeError(
+                "AMT compact hidden shape mismatch: "
+                f"expected={expected_shape} got={tuple(compact_hidden.shape)}"
+            )
+        sample_hidden = compact_hidden.new_zeros((padded_length, int(hidden_size)))
+        sample_hidden = sample_hidden.index_copy(
+            0, attended_positions, compact_hidden.squeeze(0)
+        )
+        sample_outputs.append(sample_hidden)
+    return torch.stack(sample_outputs, dim=0)
 
 
 def validate_gena_amt_transfer(missing, unexpected) -> None:
@@ -89,18 +340,9 @@ def _patch_forward_return_hidden_as_logits(model: nn.Module) -> None:
     model.forward = types.MethodType(_forward, model)
 
 
-def _load_amt_base_model(
-    backbone_path: str,
-    backbone_kind: str,
-    trust_remote_code: bool,
-    allow_unsafe_torch_load: bool,
-    *,
-    transcript_type: bool = False,
-) -> tuple[nn.Module, object, int, str]:
+def _load_amt_base_model(backbone_path: str, backbone_kind: str, trust_remote_code: bool, allow_unsafe_torch_load: bool) -> tuple[nn.Module, object, int, str]:
     """Load the base model in the same style as the provided AMT code.
 
-    Transcript type: exact BertForTokenClassification/ModernBertForTokenClassification
-    container with hidden-state output and a reusable one-logit projection.
     ModernGENA: ModernBertModel -> forward patched to expose hidden states as logits.
     GENA: AutoModel checkpoint -> remote BertForTokenClassification with Identity
     classifier, so AMT receives a model with get_input_embeddings() and logits equal
@@ -108,29 +350,6 @@ def _load_amt_base_model(
     """
     path = local_or_remote(backbone_path)
     allow_transformers_torch_load_on_legacy_torch(allow_unsafe_torch_load, context=f"AMT.base:{backbone_kind}:{path}")
-
-    if transcript_type:
-        base_model = TranscriptTokenClassificationBackbone(
-            path,
-            backbone_kind,
-            trust_remote_code=trust_remote_code,
-            allow_unsafe_torch_load=allow_unsafe_torch_load,
-            num_labels=1,
-            attn_implementation="sdpa" if backbone_kind == "moderngena" else None,
-        )
-        logger.info(
-            "[AMT.sequence.base] kind=%s owner=%s layers_attr=%s hidden_size=%d",
-            backbone_kind,
-            type(base_model.owner).__name__,
-            base_model.layers_attr,
-            base_model.hidden_size,
-        )
-        return (
-            base_model,
-            base_model.config,
-            int(base_model.hidden_size),
-            base_model.layers_attr,
-        )
 
     if backbone_kind == "moderngena":
         logger.info("[AMT.base] loading ModernBertModel path=%s attn_implementation=sdpa", path)
@@ -252,6 +471,7 @@ class AMTTokenClassifier(nn.Module):
             attend_to_previous_input=attend_prev_value,
             use_sink=bool(amt_kwargs.pop("use_sink", False)),
         )
+        _install_stable_associative_memory(memory_cell)
         self.amt = AssociativeRecurrentWrapper(
             memory_cell,
             segment_size=segment_size_value,
@@ -287,8 +507,12 @@ class AMTTokenClassifier(nn.Module):
             logger.info("[AMTTokenClassifier] plain hidden=%d labels=%d", self.hidden_size, self.num_labels)
 
     def encode_hidden(self, input_ids=None, attention_mask=None) -> torch.Tensor:
-        out = self.amt(input_ids=input_ids, attention_mask=attention_mask)
-        hidden = out.logits
+        hidden = _run_amt_without_padding(
+            self.amt,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            hidden_size=self.hidden_size,
+        )
         if hidden.shape[-1] != self.hidden_size:
             raise RuntimeError(f"AMT hidden size mismatch: expected {self.hidden_size}, got {hidden.shape[-1]}")
         return hidden

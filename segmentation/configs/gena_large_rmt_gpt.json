@@ -1,7 +1,7 @@
 {
   "seed": 42,
   "model": {
-    "family": "rmt",
+    "family": "gpt",
     "backbone_kind": "gena",
     "backbone_path": "AIRI-Institute/gena-lm-bert-large-t2t",
     "tokenizer_path": "AIRI-Institute/gena-lm-bert-large-t2t",
@@ -15,7 +15,6 @@
       "bptt_depth": -1,
       "segment_size": 512
     },
-    "head_kind": "gpt",
     "gpt": {
       "context_size": 8192,
       "encoder_lookahead": 8192,
@@ -25,12 +24,13 @@
       "num_attention_heads": 4,
       "num_key_value_heads": 4,
       "dropout_rate": 0.0,
-      "attention_dropout": 0.0
+      "attention_dropout": 0.0,
+      "multi_token_prediction": 3
     }
   },
   "train_dataset": {
     "path": "AIRI-Institute/genatator-gene-segmentation-dataset",
-    "config_name": "train-human",
+    "config_name": "train-multi-specie",
     "split": "train",
     "genomes": [],
     "chromosomes": [],
@@ -40,7 +40,7 @@
     ],
     "loader": "direct_parquet",
     "parquet_batch_size": 64,
-    "max_bpe_tokens": 4096,
+    "max_bpe_tokens": 30000,
     "average_bpe_token_length": 9.0,
     "random_crop": false
   },
@@ -56,7 +56,7 @@
     ],
     "loader": "direct_parquet",
     "parquet_batch_size": 64,
-    "max_bpe_tokens": 4096,
+    "max_bpe_tokens": 30000,
     "average_bpe_token_length": 9.0,
     "random_crop": false
   },

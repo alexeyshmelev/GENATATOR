@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Autoregressive T5Gemma head for nucleotide-level segmentation.
+"""Categorical T5Gemma head for nucleotide-level segmentation.
 
 The head deliberately owns only the decoder half of T5Gemma.  Its encoder
 input is a sequence of already-computed, per-nucleotide representations from a
@@ -8,12 +8,17 @@ GENATATOR backbone.  The caller is responsible for removing backbone special
 tokens while expanding BPE states to nucleotides; ``nucleotide_mask`` then
 removes padded/uncovered nucleotide positions before every decoder call.
 
-The decoder vocabulary is deliberately categorical and contains exactly two
-targets: exon and intron. Teacher forcing embeds the previous ground-truth
-class id, generation feeds back the previous argmax class id, and loss is
-cross-entropy over those two classes. The surrounding model adapter restores
-the repository's legacy five-channel output shape for metrics/postprocessing;
-UTR and CDS are never decoder targets.
+The decoder deliberately models only two mutually exclusive internal tokens:
+``intron`` and ``exon``.  Teacher forcing embeds the previous ground-truth
+class id, while inference feeds back the offset-1 head's argmax.  The public
+output is adapted back to GENATATOR's established five-track order so the
+shared validation and post-processing code can remain unchanged; 5' UTR,
+3' UTR, and CDS are unavailable from this decoder, and CDS is supplied by the
+existing inference heuristic.
+
+Optionally, one decoder state can predict several future tokens.  Each offset
+has an independent linear output head, but all heads share the same freshly
+initialized shallow T5Gemma decoder.  Only offset 1 participates in inference.
 """
 
 from contextlib import contextmanager
@@ -24,6 +29,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
+    from transformers.cache_utils import (
+        DynamicCache,
+        EncoderDecoderCache,
+        SlidingWindowCache,
+    )
     # T5GemmaDecoder is intentionally an internal Transformers class: using it
     # directly avoids constructing (and then discarding) the text encoder.
     from transformers.models.t5gemma.configuration_t5gemma import (
@@ -34,6 +44,9 @@ try:
 
     _T5GEMMA_IMPORT_ERROR: Exception | None = None
 except (ImportError, ModuleNotFoundError) as exc:  # pragma: no cover - version dependent
+    DynamicCache = None  # type: ignore[assignment,misc]
+    EncoderDecoderCache = None  # type: ignore[assignment,misc]
+    SlidingWindowCache = None  # type: ignore[assignment,misc]
     T5GemmaConfig = None  # type: ignore[assignment,misc]
     T5GemmaModuleConfig = None  # type: ignore[assignment,misc]
     T5GemmaDecoder = None  # type: ignore[assignment,misc]
@@ -42,10 +55,19 @@ except (ImportError, ModuleNotFoundError) as exc:  # pragma: no cover - version 
 
 DEFAULT_GPT_CONTEXT_SIZE = 8192
 DEFAULT_GPT_ENCODER_LOOKAHEAD = 8192
-GPT_TARGET_CLASS_NAMES = ("exon", "intron")
-GPT_TARGET_CLASS_COUNT = len(GPT_TARGET_CLASS_NAMES)
-FULL_SEGMENTATION_EXON_INDEX = 1
-FULL_SEGMENTATION_INTRON_INDEX = 2
+SEGMENTATION_NUM_LABELS = 5
+INTRON_CLASS_ID = 0
+EXON_CLASS_ID = 1
+UTR5_LABEL_INDEX = 0
+EXON_LABEL_INDEX = 1
+INTRON_LABEL_INDEX = 2
+UTR3_LABEL_INDEX = 3
+CDS_LABEL_INDEX = 4
+UNAVAILABLE_TRACK_LOGIT = -1.0e4
+
+
+class _RollingCacheIncompatible(RuntimeError):
+    """Signals a cache-layout mismatch that permits a bounded safe fallback."""
 
 
 @contextmanager
@@ -75,7 +97,7 @@ class T5GemmaSegmentationHead(nn.Module):
     def __init__(
         self,
         encoder_dim: int,
-        num_labels: int = GPT_TARGET_CLASS_COUNT,
+        num_labels: int = 5,
         *,
         decoder_hidden_size: int = 256,
         decoder_intermediate_size: int | None = None,
@@ -86,6 +108,8 @@ class T5GemmaSegmentationHead(nn.Module):
         encoder_lookahead: int = DEFAULT_GPT_ENCODER_LOOKAHEAD,
         dropout_rate: float = 0.0,
         attention_dropout: float = 0.0,
+        generation_threshold: float | None = None,
+        multi_token_prediction: int = 1,
         decoder: nn.Module | None = None,
     ) -> None:
         super().__init__()
@@ -96,13 +120,14 @@ class T5GemmaSegmentationHead(nn.Module):
         num_attention_heads = int(num_attention_heads)
         context_size = int(context_size)
         encoder_lookahead = int(encoder_lookahead)
+        multi_token_prediction = int(multi_token_prediction)
 
         if encoder_dim <= 0 or decoder_hidden_size <= 0:
             raise RuntimeError("encoder_dim and decoder_hidden_size must be positive")
-        if num_labels != GPT_TARGET_CLASS_COUNT:
+        if num_labels != SEGMENTATION_NUM_LABELS:
             raise RuntimeError(
-                "The segmentation GPT decoder has exactly two target classes "
-                f"(exon/intron), got num_labels={num_labels}"
+                "The GPT compatibility interface requires exactly five segmentation "
+                f"labels, got {num_labels}"
             )
         if not 2 <= num_decoder_layers <= 4:
             raise RuntimeError(
@@ -114,6 +139,13 @@ class T5GemmaSegmentationHead(nn.Module):
         if encoder_lookahead < 0:
             raise RuntimeError(
                 f"encoder_lookahead must be non-negative, got {encoder_lookahead}"
+            )
+        if generation_threshold is not None and not 0.0 < float(generation_threshold) < 1.0:
+            raise RuntimeError("generation_threshold must be strictly between 0 and 1")
+        if multi_token_prediction <= 0:
+            raise RuntimeError(
+                "multi_token_prediction must be a positive integer, got "
+                f"{multi_token_prediction}"
             )
         if decoder_hidden_size % num_attention_heads:
             raise RuntimeError(
@@ -128,6 +160,7 @@ class T5GemmaSegmentationHead(nn.Module):
         self.context_size = context_size
         self.encoder_lookahead = encoder_lookahead
         self.cross_attention_span = context_size + encoder_lookahead
+        self.multi_token_prediction = multi_token_prediction
 
         if decoder is None:
             decoder = self._build_t5gemma_decoder(
@@ -158,6 +191,14 @@ class T5GemmaSegmentationHead(nn.Module):
             if not hasattr(decoder, "embed_tokens"):
                 raise RuntimeError("The T5Gemma decoder must expose embed_tokens for BOS")
         self.decoder = decoder
+        # Chunked teacher forcing still spans very long samples.  Checkpointing
+        # decoder layers prevents all per-chunk layer activations from being
+        # retained until the single outer backward pass.  It is active only in
+        # training mode and does not alter validation or inference.
+        if hasattr(self.decoder, "gradient_checkpointing_enable"):
+            self.decoder.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
 
         self.encoder_projection: nn.Module
         if encoder_dim == decoder_hidden_size:
@@ -165,11 +206,20 @@ class T5GemmaSegmentationHead(nn.Module):
         else:
             self.encoder_projection = nn.Linear(encoder_dim, decoder_hidden_size)
 
-        # BOS comes from T5Gemma's freshly initialized embedding table. Normal
-        # targets use a separate categorical table: id 0 = exon, id 1 = intron.
-        self.target_embedding = nn.Embedding(num_labels, decoder_hidden_size)
-        self.classifier = nn.Linear(decoder_hidden_size, num_labels)
+        # BOS comes from T5Gemma's own embedding table.  The two categorical
+        # transcript-structure tokens use a separate learned embedding table.
+        self.label_embedding = nn.Embedding(2, decoder_hidden_size)
+        self.classifiers = nn.ModuleList(
+            nn.Linear(decoder_hidden_size, 2)
+            for _ in range(multi_token_prediction)
+        )
         self.bos_token_id = int(getattr(self.decoder.config, "bos_token_id", 2))
+
+    @property
+    def classifier(self) -> nn.Linear:
+        """Offset-1 classifier retained as a read-only compatibility alias."""
+
+        return self.classifiers[0]
 
     @staticmethod
     def _build_t5gemma_decoder(
@@ -197,8 +247,8 @@ class T5GemmaSegmentationHead(nn.Module):
 
         head_dim = hidden_size // num_attention_heads
         module_kwargs = dict(
-            # Only PAD/EOS/BOS ids exist because exon/intron targets use the
-            # separate target_embedding and arrive through inputs_embeds.
+            # Only PAD/EOS/BOS ids exist because decoder_input_ids are never
+            # used for labels.  Label vectors arrive through inputs_embeds.
             vocab_size=3,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -230,11 +280,13 @@ class T5GemmaSegmentationHead(nn.Module):
             attention_dropout=attention_dropout,
             tie_word_embeddings=False,
         )
-        # A direct additive cross-attention mask is used during generation.
-        # Eager attention has a stable, explicit 4-D additive-mask contract
-        # across the supported T5Gemma releases.
-        config._attn_implementation = "eager"
-        config.decoder._attn_implementation = "eager"
+        # SDPA is essential here: eager attention materializes a [heads, C, C+A]
+        # score tensor per layer (about 1 GiB at C=A=8192 with four BF16 heads).
+        # Teacher-forcing inputs are unpadded and receive mask mappings with
+        # None values, allowing fused causal self-attention and unmasked cross-
+        # attention without any dense 4-D masks.
+        config._attn_implementation = "sdpa"
+        config.decoder._attn_implementation = "sdpa"
         return T5GemmaDecoder(config.decoder)
 
     def _bos_embedding(self, *, device: torch.device) -> torch.Tensor:
@@ -242,74 +294,230 @@ class T5GemmaSegmentationHead(nn.Module):
         return self.decoder.embed_tokens(token_id)
 
     @staticmethod
-    def _full_cross_attention_mask(
-        query_length: int,
-        key_length: int,
+    def _teacher_self_attention_mask() -> dict[str, None]:
+        # Each independent decoder chunk is unpadded and no longer than C.
+        # With SDPA, None selects fused causal attention through the module's
+        # ``is_causal`` flag without allocating a [C, C] mask.
+        return {"sliding_attention": None}
+
+    @staticmethod
+    def _unmasked_cross_attention() -> dict[str, None]:
+        # Encoder windows are physically sliced and unpadded.  Cross attention
+        # is non-causal, so no mask at all is the exact desired operation.
+        return {"full_attention": None}
+
+    @staticmethod
+    def _bounded_generation_self_attention_mask(
         *,
+        filled_length: int,
+        cache_length: int,
         device: torch.device,
         dtype: torch.dtype,
     ) -> dict[str, torch.Tensor]:
-        return {
-            "full_attention": torch.zeros(
-                (1, 1, int(query_length), int(key_length)),
-                device=device,
-                dtype=dtype,
-            )
-        }
+        """Mask only unused slots in the fixed-size sliding cache.
 
-    def _sliding_cross_attention_mask(
+        This is at most ``[1, 1, 1, context_size]`` rather than a dense
+        sequence-by-sequence mask.  Once the cache is full, every physical slot
+        holds one of the most recent ``context_size`` decoder tokens.
+        """
+
+        cache_length = int(cache_length)
+        filled_length = min(int(filled_length), cache_length)
+        mask = torch.full(
+            (1, 1, 1, cache_length),
+            torch.finfo(dtype).min,
+            device=device,
+            dtype=dtype,
+        )
+        mask[..., :filled_length] = 0
+        return {"sliding_attention": mask}
+
+    def _encoder_window_bounds(
         self,
-        *,
         target_position: int,
         encoder_length: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> dict[str, torch.Tensor]:
+    ) -> tuple[int, int]:
         # The first query remains aligned to encoder position zero until BOS
         # would leave the decoder window.  Thereafter both windows move one
         # nucleotide at a time.
         start = max(0, int(target_position) - self.context_size + 1)
         end = min(int(encoder_length), start + self.cross_attention_span)
-        min_value = torch.finfo(dtype).min
-        mask = torch.full(
-            (1, 1, 1, int(encoder_length)),
-            min_value,
+        return start, end
+
+    def _new_generation_cache(
+        self,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ):
+        if (
+            SlidingWindowCache is None
+            or DynamicCache is None
+            or EncoderDecoderCache is None
+        ):
+            raise RuntimeError(
+                "Bounded GPT generation requires the cache classes provided by "
+                "transformers>=4.53.0"
+            )
+        self_cache = SlidingWindowCache(
+            config=self.decoder.config,
+            max_batch_size=1,
+            max_cache_len=self.context_size,
             device=device,
             dtype=dtype,
         )
-        mask[..., start:end] = 0
-        return {"full_attention": mask}
+        return EncoderDecoderCache(
+            self_attention_cache=self_cache,
+            cross_attention_cache=DynamicCache(),
+        )
+
+    @staticmethod
+    def _refresh_cross_attention_cache(past_key_values):
+        """Keep bounded self history while invalidating a moved encoder slice."""
+
+        if DynamicCache is None or EncoderDecoderCache is None:
+            raise RuntimeError(
+                "Bounded GPT generation requires transformers cache classes"
+            )
+        return EncoderDecoderCache(
+            self_attention_cache=past_key_values.self_attention_cache,
+            cross_attention_cache=DynamicCache(),
+        )
+
+    def _roll_cross_attention_cache(
+        self,
+        past_key_values,
+        projected_encoder: torch.Tensor,
+        previous_bounds: tuple[int, int],
+        current_bounds: tuple[int, int],
+    ):
+        """Move cached cross K/V without re-projecting the overlapping window.
+
+        Generation moves monotonically to the right.  Therefore the new
+        physical encoder slice is the old overlap, optionally followed by a
+        newly visible right-edge suffix.  Existing per-layer K/V are sliced to
+        that overlap, and only the suffix is passed through each layer's
+        cross-attention projections.  At the sequence's right edge there is no
+        suffix and this operation only drops stale left-edge entries.
+
+        ``DynamicCache.key_cache``/``value_cache`` are stable in the supported
+        Transformers 4.53 implementation but remain semi-internal.  If a future
+        release changes that representation, fall back to rebuilding the new
+        *bounded* physical slice rather than risking incorrect K/V alignment.
+        """
+
+        old_start, old_end = previous_bounds
+        new_start, new_end = current_bounds
+        if new_start < old_start or new_end < old_end:
+            return self._refresh_cross_attention_cache(past_key_values)
+
+        cross_cache = past_key_values.cross_attention_cache
+        overlap_start = max(old_start, new_start)
+        overlap_end = min(old_end, new_end)
+        overlap_length = max(0, overlap_end - overlap_start)
+        expected_old_length = old_end - old_start
+        append_start = overlap_end
+        append_end = new_end
+
+        try:
+            key_cache = cross_cache.key_cache
+            value_cache = cross_cache.value_cache
+            if len(key_cache) < self.num_decoder_layers:
+                raise _RollingCacheIncompatible(
+                    "Cross-attention cache has missing layers"
+                )
+
+            new_keys: list[torch.Tensor] = []
+            new_values: list[torch.Tensor] = []
+            for layer_index in range(self.num_decoder_layers):
+                cached_key = key_cache[layer_index]
+                cached_value = value_cache[layer_index]
+                if int(cached_key.shape[-2]) != expected_old_length:
+                    raise _RollingCacheIncompatible(
+                        "Cross-attention cache length does not match its encoder slice"
+                    )
+                local_start = overlap_start - old_start
+                local_end = local_start + overlap_length
+                retained_key = cached_key[..., local_start:local_end, :]
+                retained_value = cached_value[..., local_start:local_end, :]
+
+                if append_end > append_start:
+                    new_encoder_states = projected_encoder[
+                        :, append_start:append_end, :
+                    ]
+                    cross_attention = self.decoder.layers[layer_index].cross_attn
+                    hidden_shape = (
+                        *new_encoder_states.shape[:-1],
+                        -1,
+                        int(cross_attention.head_dim),
+                    )
+                    appended_key = cross_attention.k_proj(new_encoder_states)
+                    appended_key = appended_key.view(hidden_shape).transpose(1, 2)
+                    appended_value = cross_attention.v_proj(new_encoder_states)
+                    appended_value = appended_value.view(hidden_shape).transpose(1, 2)
+                    retained_key = torch.cat((retained_key, appended_key), dim=-2)
+                    retained_value = torch.cat(
+                        (retained_value, appended_value), dim=-2
+                    )
+
+                expected_new_length = new_end - new_start
+                if int(retained_key.shape[-2]) != expected_new_length:
+                    raise _RollingCacheIncompatible(
+                        "Rolling cross-attention cache produced a misaligned window"
+                    )
+                new_keys.append(retained_key.contiguous())
+                new_values.append(retained_value.contiguous())
+
+            # Commit only after every layer has passed validation, so an
+            # incompatibility cannot leave a partially updated cache behind.
+            for layer_index, (new_key, new_value) in enumerate(
+                zip(new_keys, new_values)
+            ):
+                key_cache[layer_index] = new_key
+                value_cache[layer_index] = new_value
+            if hasattr(cross_cache, "_seen_tokens"):
+                cross_cache._seen_tokens = new_end - new_start
+            return past_key_values
+        except (
+            AttributeError,
+            IndexError,
+            TypeError,
+            ValueError,
+            _RollingCacheIncompatible,
+        ):
+            return self._refresh_cross_attention_cache(past_key_values)
 
     def _teacher_forced_single(
         self,
         projected_encoder: torch.Tensor,
-        target_ids: torch.Tensor,
-    ) -> torch.Tensor:
+        target_classes: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
         if projected_encoder.ndim != 3 or projected_encoder.shape[0] != 1:
             raise RuntimeError(
                 "Teacher forcing requires one unpadded sample shaped [1, N, H]"
             )
-        if target_ids.ndim != 2 or target_ids.shape != projected_encoder.shape[:2]:
+        if target_classes.ndim != 2 or target_classes.shape != projected_encoder.shape[:2]:
             raise RuntimeError(
-                "Teacher-forcing target ids must have shape [1, N]"
+                "Teacher-forcing classes must have shape [1, N] aligned with the encoder"
             )
-        if target_ids.dtype != torch.long:
-            raise RuntimeError("Teacher-forcing target ids must use torch.long")
 
         length = int(projected_encoder.shape[1])
         if length == 0:
             raise RuntimeError("The GPT head received an empty nucleotide sequence")
-        logits_chunks: list[torch.Tensor] = []
+        logits_chunks: list[list[torch.Tensor]] = [
+            [] for _ in range(self.multi_token_prediction)
+        ]
         for start in range(0, length, self.context_size):
             end = min(length, start + self.context_size)
-            target = target_ids[:, start:end]
+            target = target_classes[:, start:end]
             bos = self._bos_embedding(device=projected_encoder.device).to(
                 dtype=projected_encoder.dtype
             )
             if target.shape[1] == 1:
                 decoder_inputs = bos
             else:
-                previous_targets = self.target_embedding(target[:, :-1]).to(bos.dtype)
+                previous_targets = self.label_embedding(target[:, :-1])
+                previous_targets = previous_targets.to(dtype=bos.dtype)
                 decoder_inputs = torch.cat((bos, previous_targets), dim=1)
 
             encoder_end = min(length, start + self.cross_attention_span)
@@ -317,33 +525,25 @@ class T5GemmaSegmentationHead(nn.Module):
             query_length = int(decoder_inputs.shape[1])
             decoder_output = self.decoder(
                 inputs_embeds=decoder_inputs,
-                attention_mask=torch.ones(
-                    (1, query_length),
-                    dtype=torch.bool,
-                    device=decoder_inputs.device,
-                ),
+                attention_mask=self._teacher_self_attention_mask(),
                 position_ids=torch.arange(
                     query_length,
                     dtype=torch.long,
                     device=decoder_inputs.device,
                 ).unsqueeze(0),
                 encoder_hidden_states=encoder_window,
-                encoder_attention_mask=self._full_cross_attention_mask(
-                    query_length,
-                    int(encoder_window.shape[1]),
-                    device=decoder_inputs.device,
-                    dtype=decoder_inputs.dtype,
-                ),
+                encoder_attention_mask=self._unmasked_cross_attention(),
                 use_cache=False,
             )
-            chunk_logits = self.classifier(decoder_output.last_hidden_state)
-            if chunk_logits.shape[:2] != target.shape[:2]:
-                raise RuntimeError(
-                    "T5Gemma decoder did not preserve teacher-forcing length: "
-                    f"decoder={tuple(chunk_logits.shape)} target={tuple(target.shape)}"
-                )
-            logits_chunks.append(chunk_logits)
-        return torch.cat(logits_chunks, dim=1)
+            for offset_index, classifier in enumerate(self.classifiers):
+                chunk_logits = classifier(decoder_output.last_hidden_state)
+                if chunk_logits.shape[:2] != target.shape:
+                    raise RuntimeError(
+                        "T5Gemma decoder did not preserve teacher-forcing length: "
+                        f"decoder={tuple(chunk_logits.shape)} target={tuple(target.shape)}"
+                    )
+                logits_chunks[offset_index].append(chunk_logits)
+        return tuple(torch.cat(chunks, dim=1) for chunks in logits_chunks)
 
     def _generate_single(self, projected_encoder: torch.Tensor) -> torch.Tensor:
         if projected_encoder.ndim != 3 or projected_encoder.shape[0] != 1:
@@ -353,32 +553,115 @@ class T5GemmaSegmentationHead(nn.Module):
             raise RuntimeError("The GPT head received an empty nucleotide sequence")
 
         previous_prediction: torch.Tensor | None = None
-        past_key_values = None
+        past_key_values = self._new_generation_cache(
+            device=projected_encoder.device,
+            dtype=projected_encoder.dtype,
+        )
+        previous_encoder_bounds: tuple[int, int] | None = None
         logits: list[torch.Tensor] = []
         for position in range(length):
             if previous_prediction is None:
                 decoder_input = self._bos_embedding(device=projected_encoder.device)
             else:
-                decoder_input = self.target_embedding(previous_prediction)
+                decoder_input = self.label_embedding(previous_prediction)
             decoder_input = decoder_input.to(dtype=projected_encoder.dtype)
+            encoder_bounds = self._encoder_window_bounds(position, length)
+            if (
+                previous_encoder_bounds is not None
+                and encoder_bounds != previous_encoder_bounds
+            ):
+                past_key_values = self._roll_cross_attention_cache(
+                    past_key_values,
+                    projected_encoder,
+                    previous_encoder_bounds,
+                    encoder_bounds,
+                )
+            encoder_start, encoder_end = encoder_bounds
+            encoder_window = projected_encoder[:, encoder_start:encoder_end, :]
+            cache_position = torch.tensor(
+                [position],
+                dtype=torch.long,
+                device=decoder_input.device,
+            )
             decoder_output = self.decoder(
                 inputs_embeds=decoder_input,
-                encoder_hidden_states=projected_encoder,
-                encoder_attention_mask=self._sliding_cross_attention_mask(
-                    target_position=position,
-                    encoder_length=length,
+                attention_mask=self._bounded_generation_self_attention_mask(
+                    filled_length=position + 1,
+                    cache_length=self.context_size,
                     device=decoder_input.device,
                     dtype=decoder_input.dtype,
                 ),
+                position_ids=cache_position.unsqueeze(0),
+                cache_position=cache_position,
+                encoder_hidden_states=encoder_window,
+                encoder_attention_mask=self._unmasked_cross_attention(),
                 past_key_values=past_key_values,
                 use_cache=True,
             )
             step_hidden = decoder_output.last_hidden_state[:, -1:, :]
+            # Auxiliary future-token heads are a training objective only.
             step_logits = self.classifier(step_hidden)
             logits.append(step_logits)
             previous_prediction = step_logits.argmax(dim=-1)
             past_key_values = decoder_output.past_key_values
+            previous_encoder_bounds = encoder_bounds
         return torch.cat(logits, dim=1)
+
+    @staticmethod
+    def _categorical_targets(
+        labels: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Convert five segmentation tracks to categorical ``[intron, exon]`` ids."""
+
+        if labels.ndim != 3 or labels.shape[-1] != SEGMENTATION_NUM_LABELS:
+            raise RuntimeError(
+                "Categorical GPT targets require labels shaped [1, N, 5], got "
+                f"{tuple(labels.shape)}"
+            )
+        if valid_mask.shape != labels.shape[:2]:
+            raise RuntimeError(
+                "Categorical GPT target mask must align with labels, got "
+                f"{tuple(valid_mask.shape)} and {tuple(labels.shape)}"
+            )
+        class_scores = torch.stack(
+            (labels[..., INTRON_LABEL_INDEX], labels[..., EXON_LABEL_INDEX]),
+            dim=-1,
+        )
+        active = class_scores.ge(0.5).sum(dim=-1)
+        malformed = valid_mask.bool() & active.ne(1)
+        if bool(malformed.any()):
+            count = int(malformed.sum().item())
+            raise RuntimeError(
+                "GPT exon/intron targets must contain exactly one active class at every "
+                f"valid nucleotide; found {count} malformed positions"
+            )
+        return class_scores.argmax(dim=-1).long()
+
+    @staticmethod
+    def _five_track_compatibility_logits(
+        categorical_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Map ``[intron, exon]`` logits to the shared five-track interface.
+
+        UTR and CDS channels receive a large finite negative value, making them
+        explicitly unavailable while remaining stable when forward and reverse-
+        complement logits are averaged.  The exon/intron competition remains
+        exactly the categorical head's competition.
+        """
+
+        if categorical_logits.ndim != 3 or categorical_logits.shape[-1] != 2:
+            raise RuntimeError(
+                "GPT compatibility mapping expects [batch, length, 2] logits, got "
+                f"{tuple(categorical_logits.shape)}"
+            )
+        output = categorical_logits.new_full(
+            (*categorical_logits.shape[:2], SEGMENTATION_NUM_LABELS),
+            UNAVAILABLE_TRACK_LOGIT,
+        )
+        output[..., EXON_LABEL_INDEX] = categorical_logits[..., EXON_CLASS_ID]
+        output[..., INTRON_LABEL_INDEX] = categorical_logits[..., INTRON_CLASS_ID]
+        return output
 
     def _validate_inputs(
         self,
@@ -402,48 +685,14 @@ class T5GemmaSegmentationHead(nn.Module):
                 "remove PAD, special, and uncovered positions"
             )
         if labels is not None:
-            if labels.ndim != 3 or labels.shape[:2] != encoder_embeddings.shape[:2]:
-                raise RuntimeError(
-                    "Segmentation labels must have shape [batch, nucleotides, classes], "
-                    f"got {tuple(labels.shape)}"
-                )
-            if labels.shape[-1] not in {GPT_TARGET_CLASS_COUNT, 5}:
-                raise RuntimeError(
-                    "GPT labels must contain either exon/intron only (2 channels) "
-                    f"or the legacy five segmentation channels, got {labels.shape[-1]}"
-                )
+            expected = (*encoder_embeddings.shape[:2], self.num_labels)
+            if tuple(labels.shape) != expected:
+                raise RuntimeError(f"Expected labels shape {expected}, got {tuple(labels.shape)}")
         if labels_mask is not None and labels_mask.shape != encoder_embeddings.shape[:2]:
             raise RuntimeError(
                 "labels_mask must have shape [batch, nucleotides], got "
                 f"{tuple(labels_mask.shape)}"
             )
-
-    @staticmethod
-    def _target_ids(labels: torch.Tensor) -> torch.Tensor:
-        """Convert two-channel or legacy five-channel labels to exon/intron ids."""
-
-        if labels.shape[-1] == 5:
-            categorical = labels[
-                ..., [FULL_SEGMENTATION_EXON_INDEX, FULL_SEGMENTATION_INTRON_INDEX]
-            ]
-        elif labels.shape[-1] == GPT_TARGET_CLASS_COUNT:
-            categorical = labels
-        else:  # guarded by _validate_inputs; keep this helper safe in isolation.
-            raise RuntimeError(f"Unsupported GPT label width: {labels.shape[-1]}")
-        rounded = categorical.round()
-        if not bool(
-            torch.allclose(
-                categorical.float(), rounded.float(), atol=1e-6, rtol=0.0
-            )
-        ):
-            raise RuntimeError("GPT exon/intron targets must be binary")
-        if not bool(((rounded == 0) | (rounded == 1)).all()):
-            raise RuntimeError("GPT exon/intron targets must contain only 0 or 1")
-        if not bool((rounded.sum(dim=-1) == 1).all()):
-            raise RuntimeError(
-                "Every retained nucleotide must have exactly one exon/intron target"
-            )
-        return rounded.argmax(dim=-1).long()
 
     def forward(
         self,
@@ -455,23 +704,24 @@ class T5GemmaSegmentationHead(nn.Module):
         pos_weight: torch.Tensor | None = None,
         autoregressive: bool | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
-        """Return loss and two categorical exon/intron logits per nucleotide.
+        """Return ``(loss, logits)`` with the repository's segmentation shape.
 
-        Training with labels uses chunked teacher forcing.  Evaluation defaults
-        to autoregressive generation even when validation labels are present;
-        in that case validation loss is computed from generated logits.  A
-        label-free call is always autoregressive inference.
+        Every call carrying labels uses chunked teacher forcing, irrespective of
+        ``module.training``.  Thus validation is the same single forward-pass
+        objective as training rather than a nucleotide-by-nucleotide decode.
+        Autoregressive decoding is reserved for label-free inference.
         """
 
         self._validate_inputs(encoder_embeddings, nucleotide_mask, labels, labels_mask)
-        # Categorical cross-entropy has no BCE-style positive-class weights.
-        # Keep this argument only so existing dataset/collator batches remain
-        # compatible with the GPT wrapper.
-        del pos_weight
         if autoregressive is None:
-            autoregressive = not self.training or labels is None
+            autoregressive = labels is None
         if not autoregressive and labels is None:
             raise RuntimeError("Teacher forcing requires segmentation labels")
+        if autoregressive and labels is not None:
+            raise RuntimeError(
+                "Autoregressive GPT decoding is inference-only and cannot consume labels; "
+                "call generate() after removing ground-truth tensors"
+            )
 
         batch_size, output_length, _ = encoder_embeddings.shape
         full_logits = encoder_embeddings.new_zeros(
@@ -488,41 +738,70 @@ class T5GemmaSegmentationHead(nn.Module):
             projected = self.encoder_projection(sample_encoder)
 
             sample_labels: torch.Tensor | None = None
-            sample_target_ids: torch.Tensor | None = None
+            sample_loss_mask: torch.Tensor | None = None
             if labels is not None:
                 sample_labels = labels[sample_index, sample_mask, :].unsqueeze(0)
-                sample_target_ids = self._target_ids(sample_labels)
+                if labels_mask is None:
+                    sample_loss_mask = torch.ones(
+                        sample_labels.shape[:2],
+                        dtype=torch.bool,
+                        device=sample_labels.device,
+                    )
+                else:
+                    sample_loss_mask = labels_mask[
+                        sample_index, sample_mask
+                    ].bool().unsqueeze(0)
+                if not bool(sample_loss_mask.any()):
+                    raise RuntimeError(f"Sample {sample_index} has an empty label mask")
 
             if autoregressive:
-                # Validation and inference must not consume ground-truth history.
-                with torch.no_grad():
-                    sample_logits = self._generate_single(projected)
+                categorical_logits = self._generate_single(projected)
+                offset_logits = (categorical_logits,)
             else:
-                assert sample_target_ids is not None
-                sample_logits = self._teacher_forced_single(projected, sample_target_ids)
+                assert sample_labels is not None and sample_loss_mask is not None
+                target_classes = self._categorical_targets(
+                    sample_labels,
+                    sample_loss_mask,
+                )
+                offset_logits = self._teacher_forced_single(projected, target_classes)
+                categorical_logits = offset_logits[0]
 
-            full_logits[sample_index, sample_mask, :] = sample_logits[0].to(
+            compatibility_logits = self._five_track_compatibility_logits(
+                categorical_logits
+            )
+            full_logits[sample_index, sample_mask, :] = compatibility_logits[0].to(
                 dtype=full_logits.dtype
             )
 
-            if sample_target_ids is not None:
-                if labels_mask is None:
-                    sample_loss_mask = torch.ones(
-                        sample_target_ids.shape,
-                        dtype=torch.bool,
-                        device=sample_target_ids.device,
+            if sample_labels is not None:
+                assert sample_loss_mask is not None
+                target_classes = self._categorical_targets(sample_labels, sample_loss_mask)
+                sample_length = int(target_classes.shape[1])
+                for offset_index, prediction_logits in enumerate(offset_logits):
+                    shift = offset_index
+                    valid_length = sample_length - shift
+                    if valid_length <= 0:
+                        # DDP still needs every configured auxiliary head to
+                        # participate in the graph when K exceeds this sample's
+                        # length.  This contributes an exact zero and produces
+                        # zero-valued (rather than missing) gradients.
+                        zero_loss = prediction_logits.sum() * 0.0
+                        loss_sum = zero_loss if loss_sum is None else loss_sum + zero_loss
+                        continue
+                    shifted_mask = sample_loss_mask[:, shift:]
+                    if not bool(shifted_mask.any()):
+                        zero_loss = prediction_logits.sum() * 0.0
+                        loss_sum = zero_loss if loss_sum is None else loss_sum + zero_loss
+                        continue
+                    shifted_targets = target_classes[:, shift:]
+                    aligned_logits = prediction_logits[:, :valid_length, :]
+                    sample_loss = F.cross_entropy(
+                        aligned_logits[shifted_mask].float(),
+                        shifted_targets[shifted_mask],
+                        reduction="sum",
                     )
-                else:
-                    sample_loss_mask = labels_mask[sample_index, sample_mask].bool().unsqueeze(0)
-                if not bool(sample_loss_mask.any()):
-                    raise RuntimeError(f"Sample {sample_index} has an empty label mask")
-                sample_loss = F.cross_entropy(
-                    sample_logits[sample_loss_mask].float(),
-                    sample_target_ids[sample_loss_mask],
-                    reduction="sum",
-                )
-                loss_sum = sample_loss if loss_sum is None else loss_sum + sample_loss
-                loss_element_count += int(sample_loss_mask.sum().item())
+                    loss_sum = sample_loss if loss_sum is None else loss_sum + sample_loss
+                    loss_element_count += int(shifted_mask.sum().item())
 
         loss = None
         if labels is not None:
@@ -538,7 +817,7 @@ class T5GemmaSegmentationHead(nn.Module):
         *,
         nucleotide_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Autoregressively generate two exon/intron logits per real nucleotide."""
+        """Autoregressively generate via offset 1 and return five-track logits."""
 
         self._validate_inputs(encoder_embeddings, nucleotide_mask, None, None)
         with _temporary_eval(self):
@@ -553,7 +832,10 @@ class T5GemmaSegmentationHead(nn.Module):
 __all__ = [
     "DEFAULT_GPT_CONTEXT_SIZE",
     "DEFAULT_GPT_ENCODER_LOOKAHEAD",
-    "GPT_TARGET_CLASS_COUNT",
-    "GPT_TARGET_CLASS_NAMES",
+    "EXON_CLASS_ID",
+    "EXON_LABEL_INDEX",
+    "INTRON_CLASS_ID",
+    "INTRON_LABEL_INDEX",
+    "UNAVAILABLE_TRACK_LOGIT",
     "T5GemmaSegmentationHead",
 ]

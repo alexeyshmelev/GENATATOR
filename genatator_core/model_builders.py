@@ -9,7 +9,7 @@ from safetensors.torch import load_file as safe_load_file
 from transformers import AutoConfig, AutoModel
 
 from .amt_models import AMTTokenClassifier
-from .backbones import HiddenStateBackbone, TranscriptTokenClassificationBackbone
+from .backbones import HiddenStateBackbone
 from .config import local_or_remote
 from .gpt_head import DEFAULT_GPT_CONTEXT_SIZE, DEFAULT_GPT_ENCODER_LOOKAHEAD
 from .gpt_models import (
@@ -66,30 +66,60 @@ def default_amt_segment_size(backbone_kind: str, num_mem_tokens: int | None = No
     return segment_size
 
 
+def gpt_encoder_family(model_cfg: Dict[str, Any]) -> str:
+    """Resolve the encoder variant for ``family='gpt'`` without a selector field.
+
+    Direct GENA/ModernGENA GPT models have neither wrapper block.  Presence of
+    the existing ``rmt`` or ``amt`` block selects that recurrent encoder, while
+    ``backbone_kind='caduceus'`` selects the direct Caduceus path.
+    """
+
+    if model_cfg.get("family") != "gpt":
+        return str(model_cfg.get("family"))
+    wrappers = [name for name in ("rmt", "amt") if name in model_cfg]
+    if len(wrappers) > 1:
+        raise RuntimeError(
+            "A GPT model may define at most one encoder-wrapper block: "
+            f"found {wrappers}"
+        )
+    backbone_kind = str(model_cfg.get("backbone_kind", ""))
+    if backbone_kind == "caduceus":
+        if wrappers:
+            raise RuntimeError("Caduceus GPT models cannot define RMT/AMT wrappers")
+        return "caduceus"
+    if backbone_kind not in {"gena", "moderngena"}:
+        raise RuntimeError(
+            "family='gpt' requires backbone_kind='gena', 'moderngena', or "
+            f"'caduceus'; got {backbone_kind!r}"
+        )
+    return wrappers[0] if wrappers else "plain"
+
+
 def normalize_memory_wrapper_config(model_cfg: Dict[str, Any]) -> None:
     """Materialize and validate memory-wrapper rules for train and inference."""
 
     family = model_cfg.get("family")
-    if family not in {"rmt", "amt"}:
+    wrapper_family = gpt_encoder_family(model_cfg) if family == "gpt" else family
+    if wrapper_family not in {"rmt", "amt"}:
         return
     backbone_kind = model_cfg.get("backbone_kind")
     if backbone_kind not in {"gena", "moderngena"}:
         raise RuntimeError(
-            f"{str(family).upper()} is only valid for GENA/ModernGENA. "
+            f"{str(wrapper_family).upper()} is only valid for GENA/ModernGENA. "
             f"Got backbone_kind={backbone_kind}"
         )
-    wrapper_cfg = model_cfg.setdefault(str(family), {})
+    wrapper_cfg = model_cfg.setdefault(str(wrapper_family), {})
     expected_memory_tokens = default_memory_token_count(str(backbone_kind))
     configured_memory_tokens = int(
         wrapper_cfg.get("num_mem_tokens", expected_memory_tokens)
     )
     if configured_memory_tokens != expected_memory_tokens:
         raise RuntimeError(
-            f"{str(family).upper()} with backbone_kind={backbone_kind!r} requires "
+            f"{str(wrapper_family).upper()} with backbone_kind={backbone_kind!r} requires "
             f"num_mem_tokens={expected_memory_tokens}, got {configured_memory_tokens}"
         )
     wrapper_cfg["num_mem_tokens"] = configured_memory_tokens
-    if family == "amt":
+    if wrapper_family == "amt":
         segment_size = int(
             wrapper_cfg.get(
                 "segment_size",
@@ -107,7 +137,7 @@ def normalize_memory_wrapper_config(model_cfg: Dict[str, Any]) -> None:
 def model_uses_unet(
     model_cfg: Dict[str, Any], task: str | None = None
 ) -> bool:
-    if task == "transcript_type" or str(model_cfg.get("head_kind", "default")) == "gpt":
+    if task == "transcript_type" or model_cfg.get("family") == "gpt":
         return False
     family = model_cfg.get("family")
     return family in {"unet", "rmt"} or (family == "amt" and bool(model_cfg.get("use_unet", False)))
@@ -148,23 +178,21 @@ def _gpt_config(model_cfg: Dict[str, Any]) -> Dict[str, Any]:
     config = dict(model_cfg.get("gpt", {}))
     config.setdefault("context_size", DEFAULT_GPT_CONTEXT_SIZE)
     config.setdefault("encoder_lookahead", DEFAULT_GPT_ENCODER_LOOKAHEAD)
-    if int(config["context_size"]) != DEFAULT_GPT_CONTEXT_SIZE:
-        raise RuntimeError(
-            "The segmentation GPT decoder context is fixed to 8192 nucleotides"
-        )
-    if int(config["encoder_lookahead"]) != DEFAULT_GPT_ENCODER_LOOKAHEAD:
-        raise RuntimeError(
-            "The segmentation GPT cross-attention lookahead is fixed to 8192 nucleotides"
-        )
     return config
 
 
 def build_model(cfg: Dict[str, Any], task: str):
     model_cfg = cfg["model"]
     family = model_cfg["family"]
-    head_kind = str(model_cfg.get("head_kind", "default"))
-    if head_kind == "gpt" and task != "segmentation":
-        raise RuntimeError("head_kind='gpt' is implemented only for segmentation")
+    is_gpt = family == "gpt"
+    if "head_kind" in model_cfg:
+        raise RuntimeError(
+            "model.head_kind is no longer supported; GPT is a model family and "
+            "must use model.family='gpt'"
+        )
+    if is_gpt and task != "segmentation":
+        raise RuntimeError("family='gpt' is implemented only for segmentation")
+    encoder_family = gpt_encoder_family(model_cfg) if is_gpt else family
     normalize_memory_wrapper_config(model_cfg)
     if task == "transcript_type" and family not in {"plain", "caduceus", "rmt", "amt"}:
         raise RuntimeError(
@@ -178,9 +206,13 @@ def build_model(cfg: Dict[str, Any], task: str):
     allow_unsafe_torch_load = bool(model_cfg.get("allow_unsafe_torch_load_with_torch_lt_2_6", True))
     allow_transformers_torch_load_on_legacy_torch(allow_unsafe_torch_load, context=f"build_model:{family}:{backbone_path}")
     num_labels = _num_labels_for_task(task)
-    logger.info("[build_model] task=%s family=%s backbone_kind=%s backbone_path=%s num_labels=%d", task, family, backbone_kind, backbone_path, num_labels)
+    logger.info(
+        "[build_model] task=%s family=%s encoder_family=%s backbone_kind=%s "
+        "backbone_path=%s num_labels=%d",
+        task, family, encoder_family, backbone_kind, backbone_path, num_labels,
+    )
 
-    if family == "caduceus":
+    if encoder_family == "caduceus":
         if backbone_kind != "caduceus":
             raise RuntimeError("family='caduceus' requires backbone_kind='caduceus'")
         config = AutoConfig.from_pretrained(backbone_path, trust_remote_code=trust_remote_code)
@@ -194,7 +226,7 @@ def build_model(cfg: Dict[str, Any], task: str):
         if "hidden_size" in model_cfg:
             logger.info("[caduceus.shape] using explicit model.hidden_size=%d from config", hidden_size)
         backbone = AutoModel.from_pretrained(backbone_path, config=config, trust_remote_code=trust_remote_code)
-        if head_kind == "gpt":
+        if is_gpt:
             if "_tokenizer" not in cfg:
                 raise RuntimeError(
                     "Caduceus GPT build requires cfg['_tokenizer'] set by the entrypoint"
@@ -224,10 +256,10 @@ def build_model(cfg: Dict[str, Any], task: str):
                 hidden_size=hidden_size,
             )
 
-    elif family == "plain":
+    elif encoder_family == "plain":
         if backbone_kind not in {"gena", "moderngena"}:
             raise RuntimeError(f"plain family is for GENA/ModernGENA only, got backbone_kind={backbone_kind}")
-        if head_kind == "gpt":
+        if is_gpt:
             if "_tokenizer" not in cfg:
                 raise RuntimeError(
                     "GENA/ModernGENA GPT build requires cfg['_tokenizer'] set by the entrypoint"
@@ -257,11 +289,7 @@ def build_model(cfg: Dict[str, Any], task: str):
         else:
             model = PlainTokenClassifier(backbone_path, backbone_kind, num_labels=num_labels, trust_remote_code=trust_remote_code, allow_unsafe_torch_load=allow_unsafe_torch_load)
 
-    elif family == "unet":
-        if head_kind == "gpt":
-            raise RuntimeError(
-                "Direct GPT segmentation uses family='plain', not family='unet'"
-            )
+    elif encoder_family == "unet":
         if backbone_kind not in {"gena", "moderngena"}:
             raise RuntimeError(f"UNET family is for GENA/ModernGENA only, got backbone_kind={backbone_kind}")
         model = TokenClassifierWithUNet(
@@ -276,27 +304,12 @@ def build_model(cfg: Dict[str, Any], task: str):
             allow_unsafe_torch_load=allow_unsafe_torch_load,
         )
 
-    elif family == "rmt":
+    elif encoder_family == "rmt":
         if backbone_kind not in {"gena", "moderngena"}:
             raise RuntimeError(f"RMT is allowed only for GENA/ModernGENA, got backbone_kind={backbone_kind}")
         if "_tokenizer" not in cfg:
             raise RuntimeError("RMT build requires cfg['_tokenizer'] set by train/infer entrypoint")
-        if task == "transcript_type":
-            base_model = TranscriptTokenClassificationBackbone(
-                backbone_path,
-                backbone_kind,
-                trust_remote_code=trust_remote_code,
-                allow_unsafe_torch_load=allow_unsafe_torch_load,
-                num_labels=1,
-            )
-        else:
-            base_model = HiddenStateBackbone(
-                backbone_path,
-                backbone_kind,
-                trust_remote_code=trust_remote_code,
-                modernbert_num_labels=num_labels,
-                allow_unsafe_torch_load=allow_unsafe_torch_load,
-            )
+        base_model = HiddenStateBackbone(backbone_path, backbone_kind, trust_remote_code=trust_remote_code, modernbert_num_labels=num_labels, allow_unsafe_torch_load=allow_unsafe_torch_load)
         rmt_kwargs = dict(model_cfg.get("rmt", {}))
         legacy_input_size = rmt_kwargs.pop("input_size", None)
         configured_segment_size = rmt_kwargs.get("segment_size")
@@ -312,7 +325,7 @@ def build_model(cfg: Dict[str, Any], task: str):
         )
         rmt_kwargs.setdefault("num_mem_tokens", default_memory_token_count(backbone_kind))
         rmt_kwargs.setdefault("max_n_segments", 10000)
-        if head_kind == "gpt":
+        if is_gpt:
             model = RMTGPTSegmentationModel(
                 base_model,
                 cfg["_tokenizer"],
@@ -340,7 +353,7 @@ def build_model(cfg: Dict[str, Any], task: str):
                 base_model, **rmt_kwargs
             )
 
-    elif family == "amt":
+    elif encoder_family == "amt":
         if backbone_kind not in {"gena", "moderngena"}:
             raise RuntimeError(f"AMT is allowed only for GENA/ModernGENA, got backbone_kind={backbone_kind}")
         use_unet = bool(model_cfg.get("use_unet", False))
@@ -350,7 +363,7 @@ def build_model(cfg: Dict[str, Any], task: str):
             "segment_size",
             default_amt_segment_size(backbone_kind, amt_kwargs["num_mem_tokens"]),
         )
-        if head_kind == "gpt":
+        if is_gpt:
             if "_tokenizer" not in cfg:
                 raise RuntimeError(
                     "AMT GPT build requires cfg['_tokenizer'] set by the entrypoint"
@@ -396,7 +409,9 @@ def build_model(cfg: Dict[str, Any], task: str):
                 **amt_kwargs,
             )
     else:
-        raise RuntimeError(f"Unsupported model family: {family}")
+        raise RuntimeError(
+            f"Unsupported model family: {family} (resolved encoder family {encoder_family})"
+        )
 
     checkpoint = model_cfg.get("checkpoint_path")
     if checkpoint:

@@ -16,25 +16,21 @@ FINDING_SETUPS = {
         "short": True,
         "train_genomes": ["hg38"],
         "train_target_group": "primary",
-        "eval_target_group": "primary",
     },
     "long_human_mrna_lncrna": {
         "short": False,
         "train_genomes": ["hg38"],
         "train_target_group": "primary",
-        "eval_target_group": "primary",
     },
     "long_human_mrna": {
         "short": False,
         "train_genomes": ["hg38"],
         "train_target_group": "mrna",
-        "eval_target_group": "primary",
     },
     "long_multispecies_mrna_lncrna": {
         "short": False,
         "train_genomes": [],
         "train_target_group": "primary",
-        "eval_target_group": "primary",
     },
 }
 
@@ -74,7 +70,7 @@ def _training_paths(task: str):
 
 
 def _uses_unet(model: dict, task: str) -> bool:
-    if task == "transcript_type" or model.get("head_kind") == "gpt":
+    if task == "transcript_type" or model.get("family") == "gpt":
         return False
     return model.get("family") in {"unet", "rmt"} or (
         model.get("family") == "amt" and bool(model.get("use_unet", False))
@@ -90,6 +86,11 @@ def _expected_context(task: str, path: Path, model: dict) -> tuple[str, int]:
         short = TRANSCRIPT_SETUPS[path.parent.name]["short"]
     else:
         short = False
+
+    if task == "segmentation":
+        if backbone == "caduceus":
+            return "max_nucleotides", 250_000
+        return "max_bpe_tokens", 30_000
 
     if family == "caduceus":
         return "max_nucleotides", 8192 if short else 32768
@@ -130,10 +131,16 @@ def test_all_shipped_training_configs_use_requested_contracts() -> None:
 
             family = model["family"]
             backbone = model.get("backbone_kind", family)
-            is_gpt = model.get("head_kind") == "gpt"
-            if family == "caduceus":
+            is_gpt = family == "gpt"
+            wrapper_family = family
+            if is_gpt:
+                wrapper_family = (
+                    "rmt" if "rmt" in model else "amt" if "amt" in model else None
+                )
+            assert "head_kind" not in model, path
+            if backbone == "caduceus":
                 assert model["bidirectional_weight_tie"] is False, path
-            if family == "rmt":
+            if wrapper_family == "rmt":
                 assert model["rmt"]["segment_size"] == (
                     512 if backbone == "gena" else 1024
                 ), path
@@ -148,7 +155,7 @@ def test_all_shipped_training_configs_use_requested_contracts() -> None:
                         assert "vocab_size" not in model, path
                 else:
                     assert model["cycles"] == 1, path
-            if family == "amt":
+            if wrapper_family == "amt":
                 assert model["amt"]["num_mem_tokens"] == (
                     10 if backbone == "gena" else 20
                 ), path
@@ -163,7 +170,7 @@ def test_all_shipped_training_configs_use_requested_contracts() -> None:
                         assert "vocab_size" not in model, path
             if family == "unet":
                 assert model["unet_cycles"] == 1, path
-            if family == "amt" and model.get("use_unet"):
+            if wrapper_family == "amt" and model.get("use_unet"):
                 assert model["unet_cycles"] == 1, path
             if _uses_unet(model, task):
                 assert "vocab_size" in model, path
@@ -181,6 +188,7 @@ def test_all_shipped_training_configs_use_requested_contracts() -> None:
                     "num_key_value_heads": 4,
                     "dropout_rate": 0.0,
                     "attention_dropout": 0.0,
+                    "multi_token_prediction": 3,
                 }, path
 
             length_field, expected_length = _expected_context(task, path, model)
@@ -197,7 +205,7 @@ def test_all_shipped_training_configs_use_requested_contracts() -> None:
                     assert "overlap" not in dataset, path
 
             if task == "segmentation":
-                expected_random = family == "caduceus"
+                expected_random = backbone == "caduceus"
                 assert cfg["train_dataset"]["random_crop"] is expected_random, path
                 assert cfg["eval_dataset"]["random_crop"] is expected_random, path
                 assert cfg["train_dataset"]["statuses"] == [1], path
@@ -237,14 +245,8 @@ def test_config_matrices_and_setup_semantics_are_exact() -> None:
             cfg = _load(path)
             assert cfg["train_dataset"]["genomes"] == setup["train_genomes"], path
             assert cfg["eval_dataset"]["genomes"] == ["hg38"], path
-            assert (
-                cfg["train_dataset"]["target_group"]
-                == setup["train_target_group"]
-            ), path
-            assert (
-                cfg["eval_dataset"]["target_group"]
-                == setup["eval_target_group"]
-            ), path
+            assert cfg["train_dataset"]["target_group"] == setup["train_target_group"], path
+            assert cfg["eval_dataset"]["target_group"] == "primary", path
 
     expected_transcript = {
         *{
@@ -289,7 +291,7 @@ def test_target_group_is_exclusive_to_finding_configs() -> None:
         values = _keys_named(cfg, "target_group")
         assert values == [
             FINDING_SETUPS[path.parent.name]["train_target_group"],
-            FINDING_SETUPS[path.parent.name]["eval_target_group"],
+            "primary",
         ], path
 
 
@@ -352,7 +354,6 @@ def test_massive_finding_experiments_are_exact_cartesian_transfers() -> None:
                 )
                 expected_dataset.pop("statuses", None)
                 assert stage_cfg["dataset"] == expected_dataset, path
-                assert stage_cfg["dataset"]["target_group"] == "primary", path
 
             assert cfg["task"] == "finding", path
             assert cfg["postprocess"] == FINDING_POSTPROCESS, path

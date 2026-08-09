@@ -20,7 +20,10 @@ logger = logging.getLogger(__name__)
 @contextmanager
 def suppress_repeated_rmt_inference_logs(model_cfg: Dict[str, Any]):
     """Hide per-segment embedding diagnostics during RMT inference only."""
-    if model_cfg.get("family") != "rmt":
+    is_rmt = model_cfg.get("family") == "rmt" or (
+        model_cfg.get("family") == "gpt" and "rmt" in model_cfg
+    )
+    if not is_rmt:
         yield
         return
     backbone_logger = logging.getLogger("genatator_core.backbones")
@@ -33,7 +36,13 @@ def suppress_repeated_rmt_inference_logs(model_cfg: Dict[str, Any]):
 
 
 def sigmoid(x):
-    return 1.0 / (1.0 + np.exp(-x))
+    values = np.asarray(x, dtype=np.float64)
+    positive = values >= 0
+    output = np.empty_like(values, dtype=np.float64)
+    output[positive] = 1.0 / (1.0 + np.exp(-values[positive]))
+    exp_values = np.exp(values[~positive])
+    output[~positive] = exp_values / (1.0 + exp_values)
+    return output
 
 
 def prepare_tokenizers(model_cfg: Dict[str, Any], task: str | None = None):
@@ -196,6 +205,21 @@ def aggregate_full_segmentation_chunks(rows: List[Dict[str, Any]]) -> List[Dict[
         })
     return gathered
 
+
+def model_logits_for_inference(
+    model,
+    tensor_batch: Dict[str, torch.Tensor],
+    *,
+    task: str,
+    model_cfg: Dict[str, Any],
+) -> torch.Tensor:
+    """Run the inference-only model path and return its logits tensor."""
+
+    if task == "segmentation" and model_cfg.get("family") == "gpt":
+        return model.generate(**tensor_batch)
+    output = model(**tensor_batch)
+    return output["logits"] if isinstance(output, dict) else output.logits
+
 def _predict_once(cfg: Dict[str, Any], task: str, device: str, reverse_complement: bool) -> List[Dict[str, Any]]:
     model, tokenizer, nucleotide_tokenizer = prepare_model(cfg, task, device)
     data_cfg = dict(cfg["dataset"])
@@ -216,8 +240,16 @@ def _predict_once(cfg: Dict[str, Any], task: str, device: str, reverse_complemen
                 offset_mapping = batch.pop("offset_mapping")
                 batch.pop("reverse_complement")
                 tensor_batch = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
-                out = model(**tensor_batch)
-                logits = out["logits"] if isinstance(out, dict) else out.logits
+                # Inference is the only autoregressive GPT path.  The
+                # materialized inference batch still contains reference labels
+                # for benchmarking, so ordinary forward would correctly choose
+                # teacher forcing as validation does.
+                logits = model_logits_for_inference(
+                    model,
+                    tensor_batch,
+                    task=task,
+                    model_cfg=cfg["model"],
+                )
                 logits = logits.detach().cpu().numpy()
                 family = data_cfg["model_family"]
                 if task == "transcript_type":

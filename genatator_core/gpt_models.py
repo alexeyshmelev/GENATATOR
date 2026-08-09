@@ -10,7 +10,7 @@ from transformers.modeling_outputs import TokenClassifierOutput
 
 from .amt_models import AMTTokenClassifier
 from .backbones import HiddenStateBackbone
-from .gpt_head import GPT_TARGET_CLASS_COUNT, T5GemmaSegmentationHead
+from .gpt_head import T5GemmaSegmentationHead
 from .legacy_rmt import RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater
 
 
@@ -173,41 +173,6 @@ def expand_bpe_states_to_nucleotides(
 class _GPTSegmentationModelBase(nn.Module):
     gpt_head: T5GemmaSegmentationHead
 
-    # Preserve the repository-wide five-track interface without pretending the
-    # categorical decoder predicts UTR or CDS. Sigmoid(-80) is effectively zero
-    # while remaining finite in fp32, fp16, and bf16 inference/RC averaging.
-    UNAVAILABLE_SEGMENTATION_LOGIT = -80.0
-
-    @classmethod
-    def _restore_five_track_logits(cls, target_logits: torch.Tensor) -> torch.Tensor:
-        if target_logits.ndim != 3 or target_logits.shape[-1] != GPT_TARGET_CLASS_COUNT:
-            raise RuntimeError(
-                "GPT head must return [batch, nucleotides, 2] exon/intron logits, "
-                f"got {tuple(target_logits.shape)}"
-            )
-        unavailable = torch.full_like(
-            target_logits[..., 0], cls.UNAVAILABLE_SEGMENTATION_LOGIT
-        )
-        # Add one shared per-position offset when necessary. This preserves the
-        # exon-vs-intron argmax/softmax exactly while guaranteeing that neither
-        # categorical class can fall below an unavailable legacy slot.
-        minimum_target = target_logits.amin(dim=-1, keepdim=True)
-        required_minimum = cls.UNAVAILABLE_SEGMENTATION_LOGIT + 1.0
-        compatible_targets = target_logits + (
-            required_minimum - minimum_target
-        ).clamp_min(0.0)
-        # Legacy order: 5UTR, exon, intron, 3UTR, CDS.
-        return torch.stack(
-            (
-                unavailable,
-                compatible_targets[..., 0],
-                compatible_targets[..., 1],
-                unavailable,
-                unavailable,
-            ),
-            dim=-1,
-        )
-
     def _decode(
         self,
         encoder_embeddings: torch.Tensor,
@@ -218,7 +183,7 @@ class _GPTSegmentationModelBase(nn.Module):
         pos_weight: torch.Tensor | None,
         autoregressive: bool | None,
     ) -> TokenClassifierOutput:
-        loss, target_logits = self.gpt_head(
+        loss, logits = self.gpt_head(
             encoder_embeddings,
             nucleotide_mask=nucleotide_mask,
             labels=letter_level_labels,
@@ -226,12 +191,11 @@ class _GPTSegmentationModelBase(nn.Module):
             pos_weight=pos_weight,
             autoregressive=autoregressive,
         )
-        logits = self._restore_five_track_logits(target_logits)
         return TokenClassifierOutput(loss=loss, logits=logits)
 
     @torch.no_grad()
     def generate(self, **kwargs) -> torch.Tensor:
-        """Generate five-slot compatible logits from two decoder target classes."""
+        """Generate categorical exon/intron states through the five-track interface."""
 
         kwargs.pop("letter_level_labels", None)
         kwargs.pop("pos_weight", None)
@@ -274,7 +238,7 @@ class GenaModernGPTSegmentationModel(_GPTSegmentationModelBase):
         )
         self.gpt_head = T5GemmaSegmentationHead(
             encoder_dim=self.hidden_size * 2,
-            num_labels=GPT_TARGET_CLASS_COUNT,
+            num_labels=int(num_labels),
             **dict(gpt_config or {}),
         )
 
@@ -294,11 +258,20 @@ class GenaModernGPTSegmentationModel(_GPTSegmentationModelBase):
         autoregressive=None,
         **kwargs,
     ) -> TokenClassifierOutput:
-        hidden = self.hidden_backbone(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-        ).logits
+        backbone_kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "token_type_ids": token_type_ids,
+        }
+        forward_chunked = getattr(self.hidden_backbone, "forward_chunked", None)
+        if callable(forward_chunked):
+            hidden_output = forward_chunked(**backbone_kwargs)
+        else:
+            # Compatibility for injected test doubles and old checkpoints.  The
+            # production HiddenStateBackbone exposes forward_chunked so direct
+            # GENA/ModernGENA GPT models can safely encode 30k-token inputs.
+            hidden_output = self.hidden_backbone(**backbone_kwargs)
+        hidden = hidden_output.logits
         content_mask = _resolve_bpe_content_mask(
             input_ids,
             attention_mask,
@@ -354,7 +327,7 @@ class RMTGPTSegmentationModel(_GPTSegmentationModelBase):
         )
         self.gpt_head = T5GemmaSegmentationHead(
             encoder_dim=self.hidden_size * 2,
-            num_labels=GPT_TARGET_CLASS_COUNT,
+            num_labels=int(num_labels),
             **dict(gpt_config or {}),
         )
 
@@ -443,7 +416,7 @@ class AMTGPTSegmentationModel(_GPTSegmentationModelBase):
         )
         self.gpt_head = T5GemmaSegmentationHead(
             encoder_dim=self.hidden_size * 2,
-            num_labels=GPT_TARGET_CLASS_COUNT,
+            num_labels=int(num_labels),
             **dict(gpt_config or {}),
         )
 
@@ -516,7 +489,7 @@ class CaduceusGPTSegmentationModel(_GPTSegmentationModelBase):
         )
         self.gpt_head = T5GemmaSegmentationHead(
             encoder_dim=self.hidden_size * 2,
-            num_labels=GPT_TARGET_CLASS_COUNT,
+            num_labels=int(num_labels),
             **dict(gpt_config or {}),
         )
 

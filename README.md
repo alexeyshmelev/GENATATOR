@@ -81,54 +81,114 @@ Input is the same kind of reconstructed chromosome window. Output is two nucleot
 
 ### Gene segmentation
 
-Input is one transcript sequence or one non-overlapping chunk of a complete transcript. The common segmentation interface contains five nucleotide tracks ordered `5UTR`, `exon`, `intron`, `3UTR`, `CDS`. Existing linear and U-Net heads predict all five tracks. The GPT head described below deliberately predicts only the mutually exclusive exon/intron choice; its CDS annotation is reconstructed by the CDS heuristic during post-processing, and it does not predict UTR classes. Inference gathers every chunk back into one transcript prediction, optionally averages its reverse complement, writes GFF3, and evaluates against `true_gff` when supplied.
+Input is one transcript sequence or one non-overlapping chunk of a complete transcript. Output is five nucleotide tracks ordered `5UTR`, `exon`, `intron`, `3UTR`, `CDS`. Training uses exact interval F1 for exon and CDS checkpoint selection. Inference gathers every chunk back into one transcript prediction, optionally averages its reverse complement, writes GFF3, and evaluates against `true_gff` when supplied.
 
 #### GPT generative segmentation head
 
-The segmentation-only GPT head uses the decoder half of the official T5Gemma implementation as a shallow autoregressive nucleotide classifier. It does not run or instantiate the T5Gemma text encoder. The existing GENA, ModernGENA, RMT, AMT, or Caduceus path remains the sequence encoder and supplies contextual nucleotide representations to T5Gemma cross-attention.
+The segmentation-only GPT family uses the decoder half of T5Gemma as a shallow
+categorical nucleotide decoder. T5Gemma is initialized from scratch; no
+pretrained Gemma weights or text encoder are loaded. The selected GENA,
+ModernGENA, RMT, AMT, or Caduceus encoder supplies contextual nucleotide
+representations through cross-attention.
 
-For a BPE backbone, preparation follows the same nucleotide-resolution alignment as the U-Net path:
+For BPE encoders, special tokens and padding are removed, every retained BPE
+state is expanded to its covered nucleotides with embedding_repeater, and a
+learned A/C/G/T nucleotide embedding is concatenated to that state. Caduceus
+already supplies nucleotide-resolution states. Each sample is then processed
+without padding. Direct GENA and ModernGENA GPT models encode long BPE inputs
+in non-overlapping chunks no larger than the backbone's native context and
+scatter the hidden states back before nucleotide expansion.
 
-1. The token content mask removes `CLS`, `SEP`, memory, and padding positions from the backbone output.
-2. `embedding_repeater` expands each retained BPE state over the nucleotides covered by that token. Positions with a negative repeater value are uncovered and are excluded.
-3. A learned embedding of the actual `A`, `C`, `G`, `T`, or supported ambiguous nucleotide is concatenated with the expanded backbone state.
-4. The resulting tensor has shape `[B, L, D_encoder]`. A learned linear projection maps it to `D_decoder` only when the dimensions differ.
+The decoder models exactly two mutually exclusive internal tokens:
 
-Caduceus already produces nucleotide-resolution states, but the same outer interface supplies only real nucleotide positions. In every case, the nucleotide mask is applied before the GPT head runs. The head then loops over samples and calls T5Gemma with tensors shaped `[1, N, D]`, where `N` is the exact number of retained nucleotides for that sample. Transformer padding and special-token embeddings never enter a decoder call.
+| Class ID | Internal token | Public segmentation slot |
+|---:|---|---:|
+| 0 | intron | 2 |
+| 1 | exon | 1 |
 
-Training uses non-overlapping chunks of at most `C=8192` nucleotides. The final short chunk is not padded. The GPT vocabulary has exactly two target IDs:
+Training labels must contain exactly one active exon/intron class at every
+valid nucleotide. The GPT head does not predict 5' UTR, 3' UTR, or CDS. Its
+public output still has shape [B, N, 5] in the repository order 5UTR, exon,
+intron, 3UTR, CDS so the shared validation, reverse-complement, exon selection,
+GFF, and CDS-heuristic pipeline remains usable. Unavailable tracks receive a
+large finite negative logit; padding positions remain zero.
 
-```text
-0 = exon
-1 = intron
-```
+Both training and validation use teacher forcing. For an exact, unpadded chunk
+with targets y0 ... y(n-1), the decoder inputs are BOS, y0 ... y(n-2), so one
+forward pass returns probabilities for every nucleotide. Validation therefore
+does not generate an internal transcript one token at a time. Only label-free
+inference uses autoregressive argmax feedback.
 
-The data pipeline may still supply the repository's five-track segmentation labels, but the GPT head selects only channels 1 and 2 (`exon`, `intron`) and asserts that every retained nucleotide has exactly one of them. For a chunk with categorical targets `y_0 ... y_(n-1)`, the decoder input is:
+The decoder context C and encoder lookahead A are independent configurable
+values. Teacher-forced samples are split into exact chunks of at most C
+nucleotides; the final short chunk is never padded. Each decoder chunk
+cross-attends to its current C encoder states plus up to A following states.
+During inference, cached self-attention retains at most C preceding decoder
+inputs while the visible encoder interval moves one nucleotide at a time:
 
-```text
-[BOS, embed(y_0), embed(y_1), ..., embed(y_(n-2))]
-```
-
-The hidden states at those positions predict `y_0 ... y_(n-1)`, respectively. `BOS` comes from the freshly initialized T5Gemma decoder embedding table and is attached to the decoder input, not to the encoder key/value sequence. Normal targets use a learned `nn.Embedding(2, D_decoder)`. The output projection returns two categorical logits per nucleotide, and training minimizes masked cross-entropy over the valid positions. BCE positive-class weights are not used by this head.
-
-The model adapter maps the internal `[B, L, 2]` logits back to the repository's common `[B, L, 5]` interface so reverse-complement handling, exon metrics, GFF decoding, and the existing post-processing code remain shared. Only the exon and intron slots receive decoder logits; `5UTR`, `3UTR`, and `CDS` receive finite strongly negative compatibility logits. This mapping does not turn those unavailable tracks into GPT predictions.
-
-Each training chunk cross-attends to its current encoder chunk plus as many as 8,192 following nucleotide states. With the defaults, its visible encoder span is therefore at most `2C=16384` states. All decoder layers use causal sliding self-attention with an 8,192-position context; alternating global T5Gemma decoder layers are deliberately disabled so no layer silently exceeds `C`.
-
-Validation and inference use the custom autoregressive `generate` path, never teacher-forced label history. Generation begins with BOS and produces exactly two logits per real nucleotide. `argmax` selects exon or intron, and that target ID is embedded as the next decoder input. Validation has reference labels, but uses them only after generation to calculate cross-entropy and the exon interval metric. Standalone inference has no reference labels. The outer adapter then exposes the generated result through the five-slot compatibility interface described above.
-
-Generation keeps the full projected, unpadded encoder sequence and lets T5Gemma cache its cross-attention keys and values once. At nucleotide position `p`, an additive mask exposes only:
-
-```text
 start = max(0, p - C + 1)
-encoder window = [start : min(N, start + 2C)]
-```
+visible encoder = [start, min(N, start + C + A))
 
-All cached encoder positions outside that interval receive `-inf` attention scores. This is mathematically equivalent to slicing and shifting the visible encoder window one nucleotide to the right, while avoiding repeated key/value projections. Decoder self-attention also reuses its autoregressive cache and is restricted to the latest `C` positions.
+The implementation physically slices this encoder interval; it does not attend
+to the complete N-state encoder behind a mask. When the interval moves, cached
+cross-attention keys/values for the overlap are retained, exited states are
+dropped, and only the newly visible right-edge state is projected. A fixed-size
+T5Gemma sliding cache retains the latest C decoder inputs. In addition to the
+backbone's N encoder outputs, the decoder's cross-attention working set is
+bounded by C+A states and its autoregressive self cache by C states.
 
-The decoder is initialized entirely from scratch from a small T5Gemma configuration: two layers and width 256 by default, with two through four layers permitted. No pretrained T5Gemma/Gemma checkpoint is loaded or copied. This includes fresh decoder, BOS-token, exon/intron target-embedding, adapter, and output-classifier weights. The implementation uses the internal `T5GemmaDecoder` class so it can avoid allocating an unused text encoder; consequently, `transformers>=4.53.0` is required and future Transformers changes to that internal API must be compatibility-tested.
+The following example uses N=10, C=3, and A=3. y values are previously known
+argmax decisions; e values are encoder nucleotide states.
 
-Autoregressive segmentation is substantially more expensive than a linear or U-Net head. Although key/value caching avoids recomputing the full decoder prefix and encoder projections, generation is still sequential over `N` nucleotides, each step attends to as many as 16,384 encoder states, and cache memory grows with sequence length and decoder depth. The 2–4-layer limit, batch-sample loop, and no-padding execution reduce memory use but do not remove this latency tradeoff.
+| Next position p | Decoder history visible before prediction | Encoder states visible | Output |
+|---:|---|---|---|
+| 0 | BOS | e0 ... e5 | y0 |
+| 1 | BOS, y0 | e0 ... e5 | y1 |
+| 2 | BOS, y0, y1 | e0 ... e5 | y2 |
+| 3 | y0, y1, y2 | e1 ... e6 | y3 |
+| 7 | y4, y5, y6 | e5 ... e9 | y7 |
+| 9 | y6, y7, y8 | e7 ... e9 | y9 |
+
+This table also shows the two right-edge cases: the encoder lookahead shortens
+instead of reading beyond N, and generation stops immediately after y(N-1).
+If N<C, the sequence is handled as one short context. If A=0, cross-attention
+sees only the moving C-state encoder interval.
+
+##### Multi-token prediction
+
+The GPT-only field multi_token_prediction=K creates K independent linear
+classifiers over the same final decoder state. Head 1 predicts the next
+structure token, head 2 predicts the second future token, and so on through
+head K. For a sequence of length N, the heads contribute N, N-1, ...,
+max(N-K+1, 0) valid targets. Targets that would fall past the right edge are
+excluded before cross-entropy, and the summed loss is divided by the total
+number of valid token-offset pairs. A head with no valid target contributes
+neither loss nor denominator. This prevents short sequences and final chunks
+from being biased by fabricated targets or padding.
+
+The auxiliary future-token heads are a training and validation objective only.
+Autoregressive inference uses head 1 exclusively, feeds back its argmax class,
+and advances by one nucleotide.
+
+The decoder remains intentionally shallow: two layers and width 256 by default,
+with two through four layers permitted. Context size, lookahead, width,
+intermediate size, attention heads, dropout, and multi-token prediction depth
+are all configurable inside the model.gpt object. The implementation uses the
+internal T5GemmaDecoder API and therefore requires transformers>=4.53.0.
+Teacher-forced decoder layers use memory-efficient SDPA and activation
+checkpointing during training so they do not retain dense C-by-(C+A) attention
+weights for every chunk. Activation checkpointing recomputes decoder layers
+during backward, exchanging additional compute for lower peak training memory.
+
+Autoregressive inference remains substantially slower than linear or U-Net
+inference despite key/value caching, because its N decisions are sequential.
+Each decision still attends to as many as C+A encoder keys, and the already
+materialized backbone output plus returned N-by-5 logits scale with N. The
+rolling K/V update uses semi-internal T5Gemma/DynamicCache attributes; if their
+layout changes, a guarded compatibility path rebuilds only the current bounded
+encoder slice instead of risking stale or misaligned keys.
+Training and validation are parallel teacher-forced passes and do not pay this
+one-token-at-a-time cost.
 
 ### Transcript type
 
@@ -147,14 +207,11 @@ substitutes the last non-padding position. Caduceus keeps its middle-loss design
 the final and middle hidden layers each classify the same `SEP` position, their
 binary losses are averaged during training, and the final-layer logit is returned.
 
-GENA and ModernGENA instantiate the requested concrete
-`BertForTokenClassification` and `ModernBertForTokenClassification` containers,
-respectively. GENATATOR obtains the contextual token states from that container,
-selects the asserted `CLS` state, and applies the container's one-logit
-classification projection once to the pooled state. This remains sequence
-classification: the wrapper returns one `[batch, 1]` output, not one output per
-input token. The same class contract and final-`CLS` projection are used by the
-RMT and AMT transcript classifiers.
+The GENA/ModernGENA checkpoint loaders may use
+`BertForTokenClassification`/`ModernBertForTokenClassification` as
+checkpoint-compatible containers for contextual token states. Their token-level
+task heads are not used for transcript prediction. GENATATOR pools `CLS` and
+applies its own one-logit sequence-classification head.
 
 Long-context transcript classification is available through RMT and AMT:
 
@@ -181,13 +238,14 @@ Long-context transcript classification is available through RMT and AMT:
 Important architecture rules:
 
 - Caduceus always uses `bidirectional_weight_tie=false`; the loader forces it regardless of the downloaded checkpoint config.
-- Plain/direct GENA accepts at most 512 BPE positions. It never elongates the backbone by independently chunking and concatenating hidden states. Use RMT or AMT for longer GENA inputs.
+- Ordinary plain/direct GENA accepts at most 512 BPE positions. Segmentation U-Net and GPT adapters support the shipped long inputs by running the direct backbone on non-overlapping native-context chunks, concatenating/scattering those hidden states, and only then applying the nucleotide head. RMT or AMT remains required when cross-chunk memory is part of the intended encoder architecture.
 - RMT uses 10 memory tokens for GENA and 20 for ModernGENA. Its full segment defaults remain 512 and 1,024 BPE positions because RMT reserves memory positions internally.
-- AMT uses the same 10/20 memory-token rule, but its data-token segment must reserve those positions explicitly. The shipped GENA and ModernGENA defaults are therefore 502 and 1,004. ModernGENA contexts may still be extended beyond the 1,024-position default.
+- AMT uses the same 10/20 memory-token rule, but its data-token segment must reserve those positions explicitly. The shipped GENA and ModernGENA defaults are therefore 502 and 1,004. Before recurrence, each sample is compacted to attended tokens so a 30k-padded batch cannot create PAD-only memory updates. The small associative-memory projection, DPFP normalization, denominator, and recurrent state updates run in FP32 under bf16 training; the ModernGENA encoder and returned states retain their configured mixed precision.
 - Transcript-type RMT and AMT are sequence classifiers and do not use a U-Net,
   nucleotide repeater, nucleotide vocabulary, or `unet_chunk_size`.
-- `head_kind="gpt"` is valid only for segmentation. It replaces the existing
-  task head while retaining the selected direct, RMT, AMT, or Caduceus encoder.
+- `family="gpt"` is valid only for segmentation. `backbone_kind` selects the
+  direct GENA, ModernGENA, or Caduceus encoder; the presence of the existing
+  `rmt` or `amt` block selects that memory wrapper without another selector.
 - Every U-Net uses one cycle by default. The shipped configs use `unet_cycles=1` or `cycles=1` and an 8,192-nucleotide `unet_chunk_size`.
 - For BPE + U-Net models, each retained BPE hidden state is repeated over the nucleotide offsets covered by that token. A learned embedding of the actual nucleotide is concatenated with the repeated hidden state before U-Net processing.
 
@@ -226,15 +284,14 @@ Common fields:
 
 | Field | Meaning |
 |---|---|
-| `family` | `caduceus`, `plain`, `unet`, `rmt`, or `amt` |
+| `family` | `caduceus`, `plain`, `unet`, `rmt`, `amt`, or segmentation-only `gpt` |
 | `backbone_kind` | `caduceus`, `gena`, or `moderngena` |
 | `backbone_path` | local path or Hugging Face model ID |
 | `tokenizer_path` | local path or Hugging Face tokenizer ID |
 | `trust_remote_code` | passed to Hugging Face loaders |
 | `checkpoint_path` | optional model weights loaded before training; normally `null` |
 | `vocab_size` | full main-tokenizer vocabulary size, inferred when `null` for U-Net/GPT nucleotide embeddings |
-| `head_kind` | `gpt` for the generative segmentation head; omitted for existing heads |
-| `gpt` | shallow decoder dimensions plus the fixed decoder context and encoder lookahead; exon/intron generation always uses categorical `argmax` |
+| `gpt` | shallow decoder dimensions, configurable context/lookahead, and `multi_token_prediction` |
 | `unet_chunk_size` | independent nucleotide chunk processed by the U-Net |
 | `unet_cycles` / `cycles` | U-Net cycle count; shipped default is one |
 | `rmt` | RMT memory-token, segment-size and maximum-segment settings |
@@ -273,6 +330,13 @@ precedence; set `automatic_restart=false` to start fresh when no explicit
 checkpoint is supplied.
 
 Reverse-complement processing is intentionally absent from training configs. Training and training-time validation always use one orientation only.
+
+Training disables Transformers' `logging_nan_inf_filter`: a non-finite loss is
+never replaced by the current logging accumulator and displayed as a misleading
+zero. `GenatatorTrainer` checks the scalar loss before backward and the BF16
+gradient norm immediately after backward, raising at the first NaN or infinity
+before clipping or the optimizer step. FP16 keeps GradScaler's standard overflow
+recovery instead of treating a temporary scaled-gradient overflow as fatal.
 
 ## Dataset configuration and filtering
 
@@ -336,10 +400,9 @@ This field is finding-specific and is absent from every segmentation and
 transcript-type training/evaluation config.
 
 Finding training configurations are grouped as follows. Every setup contains
-the same complete matrix of 22 edge and 22 region models (44 JSON files).
-Validation is explicitly restricted to `hg38` and uses combined mRNA + lncRNA
-targets (`target_group="primary"`) in all four setups, including the setup whose
-training targets are mRNA-only.
+the same complete matrix of 22 edge and 22 region models (44 JSON files), and
+validation is explicitly restricted to `hg38` with combined mRNA+lncRNA
+targets in all four setups.
 
 | Config subfolder | Training genomes | Training targets | Context class |
 |---|---|---|---|
@@ -447,6 +510,20 @@ Each transcript row contains:
 
 Shipped training configs use `statuses=[1]`. Automatically generated inference configs remove this filter and evaluate **all transcripts/isoforms** on `val-human`, restricted to `GCF_009914755.1 / NC_060944.1`.
 
+All 28 shipped segmentation training configs use `train-multi-specie`; their
+validation dataset is always `val-human`. The configured limits are exact and
+apply to both the training and validation dataset blocks:
+
+| Backbone input | Configured limit |
+|---|---:|
+| Caduceus nucleotide input | 250,000 nucleotides |
+| GENA / ModernGENA BPE input | 30,000 BPE tokens |
+
+The BPE configs retain `average_bpe_token_length=9.0` for nucleotide crop
+estimation. Token padding is distinct from model execution: AMT compacts each
+sample before recurrence, and direct U-Net/GPT encoders process only native-size
+backbone chunks.
+
 During complete segmentation inference, every transcript is processed from beginning to end in non-overlapping model-sized chunks. The reverse-complement pass uses the same chunking, its channels and coordinates are restored, and the forward/RC logits are averaged.
 
 ### Transcript-type dataset
@@ -465,10 +542,8 @@ For GENA, the plain backbone's hard 512-position limit overrides the general
 1,024/4,096-BPE setup cap. Long GENA configurations therefore use RMT or AMT to
 consume more than 512 BPE positions. ModernGENA can use the setup cap directly.
 Caduceus uses the nucleotide caps. The human setups select only the human
-training dataset; `long_multispecies` uses the multi-species training dataset.
-Validation is human and contains both mRNA and lncRNA transcripts in every
-setup. The representative-transcript `statuses` filter does not remove either
-transcript type.
+training dataset; `long_multispecies` uses the multi-species training dataset,
+while validation remains human in every setup.
 
 ## Training
 
@@ -558,11 +633,9 @@ for the paired edge and region models.
 `experiments/massive_gene_finding_evaluation/` contains one subfolder for each
 finding training setup. Each has every Cartesian pair of the 22 edge and 22
 region models: 484 configs per setup and 1,936 in total. A pair config copies
-the complete model/wrapper block and the setup-specific context, overlap, and
-evaluation-dataset settings from both source configs. Therefore every pair,
-including those trained in `long_human_mrna`, is tested against combined mRNA +
-lncRNA targets. Optimizer and scheduler fields are intentionally absent because
-inference never consumes them.
+the complete model/wrapper block and the setup-specific context, overlap and
+target group from both source training configs. Optimizer and scheduler fields
+are intentionally absent because inference never consumes them.
 
 Before running a pair, replace both stage checkpoint placeholders and the
 reference-GFF placeholder. Result GFF, JSON and CSV paths are unique to that
@@ -573,23 +646,10 @@ python finding/infer.py \
   --config experiments/massive_gene_finding_evaluation/long_human_mrna_lncrna/edge_moderngena_base_plain__region_moderngena_base_plain.json
 ```
 
-All 1,936 combinations are intentionally benchmarked on the T2T test split
-after each component model has undergone its normal training/checkpoint
-validation. Test outputs do not feed back into weights, gradients, checkpoint
-selection, or training. Every setup uses the combined mRNA + lncRNA reference
-GFF for annotation metrics; only the training targets of `long_human_mrna` are
-mRNA-only.
-
-The pair configurations and their results are not duplicates. In each setup,
-the 22 edge checkpoints crossed with the 22 region checkpoints form 484 unique
-two-stage systems. The current implementation simply has repeated *stage-level
-computation*: a fixed edge checkpoint is executed again for each of its 22
-region partners, and a fixed region checkpoint is likewise executed for each of
-its 22 edge partners. This produces 968 stage inference calls per setup and
-3,872 across all four setups, although there are only 44 unique stage
-checkpoint predictions per setup (176 overall). A future disk cache could reuse
-those stage predictions before running each pair's post-processing and metrics;
-no such cache is implemented now.
+These configs preserve the requested T2T test benchmark for post-training
+edge-region pair comparison. Even in the `long_human_mrna` setup, validation
+and pair evaluation use the combined mRNA+lncRNA targets and reference; only
+that setup's training targets are mRNA-only.
 
 ### Complete gene-finding pipeline
 
@@ -631,9 +691,8 @@ Important inference switches:
 
 `use_cds_heuristic` defaults to on. It replaces the model's directly decoded
 mRNA CDS with the benchmark-compatible longest complete ORF inferred from
-predicted exons. Existing five-track heads can keep their direct CDS track by
-setting it to `false`. GPT heads never predict CDS, so keep this option enabled
-for GPT inference; disabling it leaves GPT output without a CDS annotation.
+predicted exons. Set it to `false` to keep the model's direct CDS track. GPT
+models do not emit a CDS class, so their CDS annotations require this heuristic.
 
 The script writes a GFF3 file and runs the official segmentation metric when `true_gff` is non-null.
 
@@ -653,7 +712,7 @@ The script writes a TSV containing probabilities and classes and always writes a
 |---|---|
 | `finding_edge` | Per-class PR-AUC and ROC-AUC for TSS+/TSS-/PolyA+/PolyA- |
 | `finding_region` | Per-class PR-AUC and ROC-AUC for intragenic+/intragenic- |
-| `segmentation` | exact interval-level F1 for exon and CDS with existing five-track heads; exon F1 for the two-class GPT head |
+| `segmentation` | exact interval-level F1 for exon and CDS |
 | `transcript_type` | accuracy |
 
 Training validation and direct segmentation GFF inference use the same
@@ -663,10 +722,6 @@ raw-score competition sets, not independent 0.5 thresholds:
 exon prediction: argmax among [exon, intron]; positive only when exon wins
 CDS prediction:  argmax among [CDS, intron, 5UTR, 3UTR]; positive only when CDS wins
 ```
-
-For GPT models, only the exon-versus-intron competition is available from the
-decoder and `interval_f1_exon` is the checkpoint metric. Final mRNA CDS intervals
-are supplied by the post-processing heuristic rather than the GPT decoder.
 
 The target class wins ties. Contiguous positive bases become half-open
 intervals. A predicted interval is a true positive only when it exactly equals a
