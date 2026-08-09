@@ -34,6 +34,12 @@ FINDING_SETUPS = {
     },
 }
 
+FINDING_PATIENCE_10_SETUPS = {
+    "long_human_mrna",
+    "long_human_mrna_lncrna",
+    "short_human_mrna_lncrna",
+}
+
 TRANSCRIPT_SETUPS = {
     "short_human": {"short": True, "train_config_name": "train-human"},
     "long_human": {"short": False, "train_config_name": "train-human"},
@@ -122,7 +128,12 @@ def test_all_shipped_training_configs_use_requested_contracts() -> None:
             assert training["max_steps"] == 500_000, path
             assert training["eval_steps"] == 5000, path
             assert training["save_steps"] == 5000, path
-            assert training["patience"] == 50, path
+            expected_patience = (
+                10
+                if task == "finding" and path.parent.name in FINDING_PATIENCE_10_SETUPS
+                else 25
+            )
+            assert training["patience"] == expected_patience, path
             assert training["automatic_restart"] is True, path
             assert "eval_interval" not in training, path
             assert "save_interval" not in training, path

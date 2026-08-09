@@ -371,7 +371,7 @@ class T5GemmaSegmentationHeadTests(unittest.TestCase):
         # Encoder states are physically sliced; neither cross-attention keys nor
         # any mask ever scale with the complete seven-base sequence.
         projected = head.encoder_projection(encoder).detach()
-        expected_bounds = [(0, 6), (0, 6), (0, 6), (1, 7), (2, 7), (3, 7), (4, 7)]
+        expected_bounds = [(0, 6), (0, 6), (0, 6), (1, 7), (1, 7), (1, 7), (1, 7)]
         self.assertEqual(
             [call["encoder_shape"][1] for call in decoder.calls],
             [end - start for start, end in expected_bounds],
@@ -402,14 +402,14 @@ class T5GemmaSegmentationHeadTests(unittest.TestCase):
         )
 
         # Cross K/V remain in one bounded cache.  When [0:6] moves to [1:7],
-        # each decoder layer projects only the one newly visible state; later
-        # right-edge steps only drop stale entries and project nothing.
+        # each decoder layer projects only the one newly visible state.  The
+        # full window then remains anchored at the right edge.
         cross_ids = [call["cross_cache_id"] for call in decoder.calls]
         self.assertTrue(all(value == cross_ids[0] for value in cross_ids))
         self.assertEqual(cross_projection_lengths, [1, 1])
         self.assertEqual(
             [call["cross_cache_length_after"] for call in decoder.calls],
-            [6, 6, 6, 6, 5, 4, 3],
+            [6, 6, 6, 6, 6, 6, 6],
         )
         expected_second_input = head.label_embedding(
             torch.tensor([[EXON_CLASS_ID]])
@@ -418,6 +418,48 @@ class T5GemmaSegmentationHeadTests(unittest.TestCase):
             torch.allclose(decoder.calls[1]["inputs_embeds"], expected_second_input)
         )
         self.assertTrue(bool((logits[..., EXON_LABEL_INDEX] > logits[..., INTRON_LABEL_INDEX]).all()))
+
+    def test_encoder_window_remains_anchored_after_reaching_right_edge(self):
+        head, _ = self._head(context=3, lookahead=3)
+
+        self.assertEqual(
+            [head._encoder_window_bounds(position, 10) for position in range(10)],
+            [
+                (0, 6),
+                (0, 6),
+                (0, 6),
+                (1, 7),
+                (2, 8),
+                (3, 9),
+                (4, 10),
+                (4, 10),
+                (4, 10),
+                (4, 10),
+            ],
+        )
+        self.assertEqual(
+            [head._encoder_window_bounds(position, 4) for position in range(4)],
+            [(0, 4), (0, 4), (0, 4), (0, 4)],
+        )
+        head_without_lookahead, _ = self._head(context=3, lookahead=0)
+        self.assertEqual(
+            [
+                head_without_lookahead._encoder_window_bounds(position, 10)
+                for position in range(10)
+            ],
+            [
+                (0, 3),
+                (0, 3),
+                (0, 3),
+                (1, 4),
+                (2, 5),
+                (3, 6),
+                (4, 7),
+                (5, 8),
+                (6, 9),
+                (7, 10),
+            ],
+        )
 
     def test_multi_token_heads_beyond_sequence_length_receive_zero_gradients(self):
         head, _ = self._head(

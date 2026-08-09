@@ -124,18 +124,26 @@ values. Teacher-forced samples are split into exact chunks of at most C
 nucleotides; the final short chunk is never padded. Each decoder chunk
 cross-attends to its current C encoder states plus up to A following states.
 During inference, cached self-attention retains at most C preceding decoder
-inputs while the visible encoder interval moves one nucleotide at a time:
+inputs while the visible encoder interval advances one nucleotide at a time
+until it reaches its final right-edge position:
 
-start = max(0, p - C + 1)
+```text
+moving_start = max(0, p - C + 1)
+last_full_start = max(0, N - (C + A))
+start = min(moving_start, last_full_start)
 visible encoder = [start, min(N, start + C + A))
+```
 
 The implementation physically slices this encoder interval; it does not attend
 to the complete N-state encoder behind a mask. When the interval moves, cached
 cross-attention keys/values for the overlap are retained, exited states are
-dropped, and only the newly visible right-edge state is projected. A fixed-size
-T5Gemma sliding cache retains the latest C decoder inputs. In addition to the
-backbone's N encoder outputs, the decoder's cross-attention working set is
-bounded by C+A states and its autoregressive self cache by C states.
+dropped, and only the newly visible right-edge state is projected. Once the
+right boundary reaches N, the left boundary stops advancing: the final full
+encoder window remains anchored at the sequence end for every remaining
+prediction. A fixed-size T5Gemma sliding cache retains the latest C decoder
+inputs. In addition to the backbone's N encoder outputs, the decoder's
+cross-attention working set is bounded by C+A states and its autoregressive self
+cache by C states.
 
 The following example uses N=10, C=3, and A=3. y values are previously known
 argmax decisions; e values are encoder nucleotide states.
@@ -146,13 +154,14 @@ argmax decisions; e values are encoder nucleotide states.
 | 1 | BOS, y0 | e0 ... e5 | y1 |
 | 2 | BOS, y0, y1 | e0 ... e5 | y2 |
 | 3 | y0, y1, y2 | e1 ... e6 | y3 |
-| 7 | y4, y5, y6 | e5 ... e9 | y7 |
-| 9 | y6, y7, y8 | e7 ... e9 | y9 |
+| 7 | y4, y5, y6 | e4 ... e9 | y7 |
+| 9 | y6, y7, y8 | e4 ... e9 | y9 |
 
-This table also shows the two right-edge cases: the encoder lookahead shortens
-instead of reading beyond N, and generation stops immediately after y(N-1).
-If N<C, the sequence is handled as one short context. If A=0, cross-attention
-sees only the moving C-state encoder interval.
+This table also shows the right-edge behavior: once the full encoder window is
+right-aligned at N, it no longer moves or shrinks from the left, and generation
+stops immediately after y(N-1). If `N <= C+A`, the complete sequence remains visible
+throughout generation. If A=0, cross-attention sees only the moving C-state
+encoder interval.
 
 ##### Multi-token prediction
 
@@ -311,7 +320,14 @@ All shipped configurations and the runtime validator enforce:
 
 This invariant applies to every task and every model. `gradient_accumulation_steps` may still be used to change the optimizer-step batch. Finding additionally uses `dataloader_num_workers=0`, because worker subprocesses would otherwise create independent chromosome-sized RAM caches.
 
-Every shipped config uses `max_steps=500000`, `eval_steps=5000`, `save_steps=5000`, and `patience=50`. Patience counts consecutive evaluations without improvement in the selected best-model metric before early stopping. Other important fields include `num_train_epochs`, `learning_rate`, `weight_decay`, `warmup_steps`, mixed precision, checkpoint retention, and `resume_from_checkpoint`.
+Every shipped training config uses `max_steps=500000`, `eval_steps=5000`, and
+`save_steps=5000`. Patience is 25 for every model and task except the finding
+setups `long_human_mrna`, `long_human_mrna_lncrna`, and
+`short_human_mrna_lncrna`, where it is 10. Patience counts consecutive
+evaluations without improvement in the selected best-model metric before early
+stopping. Other important fields include `num_train_epochs`, `learning_rate`,
+`weight_decay`, `warmup_steps`, mixed precision, checkpoint retention, and
+`resume_from_checkpoint`.
 
 Every shipped training config also sets:
 

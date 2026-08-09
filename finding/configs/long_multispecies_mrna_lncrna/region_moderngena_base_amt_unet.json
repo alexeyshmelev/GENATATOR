@@ -69,7 +69,7 @@
     "save_safetensors": false,
     "logging_interval": 100,
     "eval_accumulation_steps": 1,
-    "patience": 50
+    "patience": 25
   },
   "task": "finding_region"
 }

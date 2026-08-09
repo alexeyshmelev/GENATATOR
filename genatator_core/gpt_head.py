@@ -85,9 +85,11 @@ class T5GemmaSegmentationHead(nn.Module):
 
     Parameters are intentionally small by default (two 256-wide layers).  All
     decoder layers use T5Gemma sliding self-attention, while cross-attention is
-    restricted to the current decoder window plus ``encoder_lookahead`` future
-    nucleotide states.  With both defaults this is an 8192-token decoder
-    context and a 16384-token cross-attention span.
+    restricted to a moving encoder window of at most ``context_size`` plus
+    ``encoder_lookahead`` nucleotide states.  The final full encoder window is
+    anchored at the sequence end instead of shrinking from the left.  With both
+    defaults this is an 8192-token decoder context and a 16384-token
+    cross-attention span.
 
     ``decoder`` exists for dependency-injected unit tests.  Production callers
     should leave it as ``None`` so the official Transformers implementation is
@@ -338,9 +340,12 @@ class T5GemmaSegmentationHead(nn.Module):
         encoder_length: int,
     ) -> tuple[int, int]:
         # The first query remains aligned to encoder position zero until BOS
-        # would leave the decoder window.  Thereafter both windows move one
-        # nucleotide at a time.
-        start = max(0, int(target_position) - self.context_size + 1)
+        # would leave the decoder window.  Thereafter the encoder window moves
+        # right only until its right edge reaches the sequence end.  The final
+        # full window remains anchored there instead of shrinking from the left.
+        moving_start = max(0, int(target_position) - self.context_size + 1)
+        last_full_start = max(0, int(encoder_length) - self.cross_attention_span)
+        start = min(moving_start, last_full_start)
         end = min(int(encoder_length), start + self.cross_attention_span)
         return start, end
 
@@ -393,12 +398,12 @@ class T5GemmaSegmentationHead(nn.Module):
     ):
         """Move cached cross K/V without re-projecting the overlapping window.
 
-        Generation moves monotonically to the right.  Therefore the new
-        physical encoder slice is the old overlap, optionally followed by a
-        newly visible right-edge suffix.  Existing per-layer K/V are sliced to
-        that overlap, and only the suffix is passed through each layer's
-        cross-attention projections.  At the sequence's right edge there is no
-        suffix and this operation only drops stale left-edge entries.
+        Generation moves monotonically to the right until the full encoder
+        window is anchored at the sequence end.  Therefore a moved physical
+        slice is the old overlap followed by a newly visible right-edge suffix.
+        Existing per-layer K/V are sliced to that overlap, and only the suffix
+        is passed through each layer's cross-attention projections.  Once the
+        final window is anchored, its bounds and cached K/V remain unchanged.
 
         ``DynamicCache.key_cache``/``value_cache`` are stable in the supported
         Transformers 4.53 implementation but remain semi-internal.  If a future
