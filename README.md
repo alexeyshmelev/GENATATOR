@@ -355,11 +355,6 @@ previous configuration starts fresh. An explicit `resume_from_checkpoint` takes
 precedence; set `automatic_restart=false` to start fresh when no explicit
 checkpoint is supplied.
 
-Finding and transcript-type configs use globally unique `custom_prefix` values
-derived from their task, setup folder, and config name. This keeps timestamped
-run names unambiguous during massive parallel launches. The prefix is naming
-metadata and is excluded from automatic-restart compatibility matching.
-
 Reverse-complement processing is intentionally absent from training configs. Training and training-time validation always use one orientation only.
 
 Training disables Transformers' `logging_nan_inf_filter`: a non-finite loss is
