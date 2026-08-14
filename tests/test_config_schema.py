@@ -295,6 +295,21 @@ def test_config_matrices_and_setup_semantics_are_exact() -> None:
     assert segmentation_expected <= segmentation_actual
 
 
+def test_parallel_training_prefixes_are_task_scoped_and_unique() -> None:
+    prefixes: dict[str, Path] = {}
+    expected_count = 0
+    for task in ("finding", "transcript_type"):
+        for path, cfg in _training_paths(task):
+            expected_count += 1
+            expected = f"{task}_{path.parent.name}_{path.stem}"
+            prefix = cfg["training"]["custom_prefix"]
+            assert prefix == expected, path
+            assert prefix not in prefixes, (path, prefixes.get(prefix))
+            prefixes[prefix] = path
+    assert expected_count == 218
+    assert len(prefixes) == expected_count
+
+
 def test_target_group_is_exclusive_to_finding_configs() -> None:
     for task in ("segmentation", "transcript_type"):
         for path in sorted((REPO / task / "configs").rglob("*.json")):
@@ -401,6 +416,9 @@ class ShippedConfigSchemaTests(unittest.TestCase):
 
     def test_complete_matrix(self) -> None:
         test_config_matrices_and_setup_semantics_are_exact()
+
+    def test_parallel_prefixes(self) -> None:
+        test_parallel_training_prefixes_are_task_scoped_and_unique()
 
     def test_target_group_scope(self) -> None:
         test_target_group_is_exclusive_to_finding_configs()

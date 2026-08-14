@@ -124,6 +124,7 @@ class RunManagementTests(unittest.TestCase):
             )
             saved["training"]["overwrite_output_dir"] = False
             saved["training"]["automatic_restart"] = True
+            saved["training"]["custom_prefix"] = "renamed-experiment"
 
             self.assertEqual(
                 canonical_training_config(current),

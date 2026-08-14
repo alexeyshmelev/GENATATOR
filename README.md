@@ -43,6 +43,7 @@ torchrun \
 GENATATOR-main/
 ├── genatator_core/          shared models, data loading, metrics, inference and run management
 ├── experiments/
+│   ├── first_gpt_model_experiments/  12 human-data GPT training configs
 │   ├── small_finding_evaluation_v1/
 │   │   └── evaluation_config.json
 │   └── massive_gene_finding_evaluation/
@@ -199,6 +200,15 @@ encoder slice instead of risking stale or misaligned keys.
 Training and validation are parallel teacher-forced passes and do not pay this
 one-token-at-a-time cost.
 
+##### First GPT model experiments
+
+`experiments/first_gpt_model_experiments/` contains the requested Caduceus PS
+and ModernGENA Base GPT sweep. Every config uses human training data, a
+four-layer decoder, and one of `multi_token_prediction=1,2,5,10,50,100`.
+Caduceus uses 32,768 nucleotides; ModernGENA uses 8,192 BPE tokens. Each config
+has its own output directory so all 12 experiments can run concurrently without
+sharing an automatic-restart manifest.
+
 ### Transcript type
 
 Input is one transcript sequence. Every model returns exactly one binary logit
@@ -249,7 +259,7 @@ Important architecture rules:
 - Caduceus always uses `bidirectional_weight_tie=false`; the loader forces it regardless of the downloaded checkpoint config.
 - Ordinary plain/direct GENA accepts at most 512 BPE positions. Segmentation U-Net and GPT adapters support the shipped long inputs by running the direct backbone on non-overlapping native-context chunks, concatenating/scattering those hidden states, and only then applying the nucleotide head. RMT or AMT remains required when cross-chunk memory is part of the intended encoder architecture.
 - RMT uses 10 memory tokens for GENA and 20 for ModernGENA. Its full segment defaults remain 512 and 1,024 BPE positions because RMT reserves memory positions internally.
-- AMT uses the same 10/20 memory-token rule, but its data-token segment must reserve those positions explicitly. The shipped GENA and ModernGENA defaults are therefore 502 and 1,004. Before recurrence, each sample is compacted to attended tokens so a 30k-padded batch cannot create PAD-only memory updates. The small associative-memory projection, DPFP normalization, denominator, and recurrent state updates run in FP32 under bf16 training; the ModernGENA encoder and returned states retain their configured mixed precision.
+- AMT uses the same 10/20 memory-token rule, but its data-token segment must reserve those positions explicitly. The shipped GENA and ModernGENA defaults are therefore 502 and 1,004. Before recurrence, each sample is compacted to attended tokens so a 30k-padded batch cannot create PAD-only memory updates. The small associative-memory projection, DPFP normalization, denominator, and recurrent state updates always run in FP32. Every shipped ModernGENA+AMT training config—including AMT+GPT—also disables both bf16 and fp16, so the complete model trains in FP32.
 - Transcript-type RMT and AMT are sequence classifiers and do not use a U-Net,
   nucleotide repeater, nucleotide vocabulary, or `unet_chunk_size`.
 - `family="gpt"` is valid only for segmentation. `backbone_kind` selects the
@@ -345,11 +355,16 @@ previous configuration starts fresh. An explicit `resume_from_checkpoint` takes
 precedence; set `automatic_restart=false` to start fresh when no explicit
 checkpoint is supplied.
 
+Finding and transcript-type configs use globally unique `custom_prefix` values
+derived from their task, setup folder, and config name. This keeps timestamped
+run names unambiguous during massive parallel launches. The prefix is naming
+metadata and is excluded from automatic-restart compatibility matching.
+
 Reverse-complement processing is intentionally absent from training configs. Training and training-time validation always use one orientation only.
 
 Training disables Transformers' `logging_nan_inf_filter`: a non-finite loss is
 never replaced by the current logging accumulator and displayed as a misleading
-zero. `GenatatorTrainer` checks the scalar loss before backward and the BF16
+zero. `GenatatorTrainer` checks the scalar loss before backward and the BF16/FP32
 gradient norm immediately after backward, raising at the first NaN or infinity
 before clipping or the optimizer step. FP16 keeps GradScaler's standard overflow
 recovery instead of treating a temporary scaled-gradient overflow as fatal.

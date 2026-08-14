@@ -142,7 +142,9 @@ def canonical_training_config(
     ``training.output_dir`` and the original directory as
     ``training.output_base_dir``. Those runtime fields must compare equal to the
     source configuration that launched it. ``overwrite_output_dir`` is also
-    generated/forced by the runner and has no training effect.
+    generated/forced by the runner and has no training effect. Likewise,
+    ``custom_prefix`` only decorates the newly allocated run-directory name and
+    must not prevent an otherwise identical configuration from resuming.
     """
 
     normalized = copy.deepcopy(cfg)
@@ -157,6 +159,7 @@ def canonical_training_config(
     training["output_dir"] = str(Path(output_base_dir).expanduser().resolve())
     training.pop("output_base_dir", None)
     training.pop("overwrite_output_dir", None)
+    training.pop("custom_prefix", None)
     training.setdefault("automatic_restart", True)
     return normalized
 
