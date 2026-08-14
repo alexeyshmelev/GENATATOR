@@ -199,6 +199,7 @@ def test_all_shipped_training_configs_use_requested_contracts() -> None:
                     "num_key_value_heads": 4,
                     "dropout_rate": 0.0,
                     "attention_dropout": 0.0,
+                    "add_encoder_to_decoder_input": True,
                     "multi_token_prediction": 3,
                 }, path
 

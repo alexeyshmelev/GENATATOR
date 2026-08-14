@@ -94,6 +94,10 @@ class T5GemmaSegmentationHead(nn.Module):
     ``decoder`` exists for dependency-injected unit tests.  Production callers
     should leave it as ``None`` so the official Transformers implementation is
     constructed from a fresh config without downloading weights.
+
+    When ``add_encoder_to_decoder_input`` is enabled, every non-BOS decoder
+    input is the sum of its categorical target/prediction embedding and the
+    aligned projected encoder state.  Cross-attention is unchanged.
     """
 
     def __init__(
@@ -112,6 +116,7 @@ class T5GemmaSegmentationHead(nn.Module):
         attention_dropout: float = 0.0,
         generation_threshold: float | None = None,
         multi_token_prediction: int = 1,
+        add_encoder_to_decoder_input: bool = False,
         decoder: nn.Module | None = None,
     ) -> None:
         super().__init__()
@@ -149,6 +154,8 @@ class T5GemmaSegmentationHead(nn.Module):
                 "multi_token_prediction must be a positive integer, got "
                 f"{multi_token_prediction}"
             )
+        if not isinstance(add_encoder_to_decoder_input, bool):
+            raise RuntimeError("add_encoder_to_decoder_input must be a bool")
         if decoder_hidden_size % num_attention_heads:
             raise RuntimeError(
                 "decoder_hidden_size must be divisible by num_attention_heads: "
@@ -163,6 +170,7 @@ class T5GemmaSegmentationHead(nn.Module):
         self.encoder_lookahead = encoder_lookahead
         self.cross_attention_span = context_size + encoder_lookahead
         self.multi_token_prediction = multi_token_prediction
+        self.add_encoder_to_decoder_input = add_encoder_to_decoder_input
 
         if decoder is None:
             decoder = self._build_t5gemma_decoder(
@@ -523,6 +531,11 @@ class T5GemmaSegmentationHead(nn.Module):
             else:
                 previous_targets = self.label_embedding(target[:, :-1])
                 previous_targets = previous_targets.to(dtype=bos.dtype)
+                if self.add_encoder_to_decoder_input:
+                    previous_targets = (
+                        previous_targets
+                        + projected_encoder[:, start : end - 1, :]
+                    )
                 decoder_inputs = torch.cat((bos, previous_targets), dim=1)
 
             encoder_end = min(length, start + self.cross_attention_span)
@@ -570,6 +583,14 @@ class T5GemmaSegmentationHead(nn.Module):
             else:
                 decoder_input = self.label_embedding(previous_prediction)
             decoder_input = decoder_input.to(dtype=projected_encoder.dtype)
+            if (
+                self.add_encoder_to_decoder_input
+                and previous_prediction is not None
+            ):
+                decoder_input = (
+                    decoder_input
+                    + projected_encoder[:, position - 1 : position, :]
+                )
             encoder_bounds = self._encoder_window_bounds(position, length)
             if (
                 previous_encoder_bounds is not None

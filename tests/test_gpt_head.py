@@ -171,6 +171,7 @@ class T5GemmaSegmentationHeadTests(unittest.TestCase):
         context=3,
         lookahead=3,
         multi_token_prediction=1,
+        add_encoder_to_decoder_input=False,
     ):
         decoder = RecordingDecoder(hidden_size, context)
         head = T5GemmaSegmentationHead(
@@ -183,6 +184,7 @@ class T5GemmaSegmentationHeadTests(unittest.TestCase):
             context_size=context,
             encoder_lookahead=lookahead,
             multi_token_prediction=multi_token_prediction,
+            add_encoder_to_decoder_input=add_encoder_to_decoder_input,
             decoder=decoder,
         )
         return head, decoder
@@ -246,6 +248,34 @@ class T5GemmaSegmentationHeadTests(unittest.TestCase):
         seen = decoder.calls[0]["inputs_embeds"][:, 1:, :]
         expected = head.label_embedding(classes[:, :-1]).detach()
         self.assertTrue(torch.allclose(seen, expected))
+
+    def test_teacher_forcing_can_add_aligned_encoder_states_to_decoder_inputs(self):
+        head, decoder = self._head(
+            encoder_dim=4,
+            hidden_size=4,
+            context=3,
+            lookahead=2,
+            add_encoder_to_decoder_input=True,
+        )
+        encoder = torch.arange(20, dtype=torch.float32).view(1, 5, 4)
+        classes = torch.tensor([[0, 1, 0, 1, 1]])
+        labels = _five_track_labels(classes)
+        mask = torch.ones((1, 5), dtype=torch.bool)
+
+        head(encoder, nucleotide_mask=mask, labels=labels, labels_mask=mask)
+
+        projected = head.encoder_projection(encoder).detach()
+        bos = head._bos_embedding(device=encoder.device).detach()
+        self.assertEqual(len(decoder.calls), 2)
+        for call, (start, end) in zip(decoder.calls, ((0, 3), (3, 5))):
+            previous_targets = head.label_embedding(
+                classes[:, start : end - 1]
+            ).detach()
+            expected = torch.cat(
+                (bos, previous_targets + projected[:, start : end - 1, :]),
+                dim=1,
+            )
+            self.assertTrue(torch.allclose(call["inputs_embeds"], expected))
 
     def test_eval_forward_with_labels_is_one_teacher_forced_pass(self):
         head, decoder = self._head(context=8, lookahead=3)
@@ -419,6 +449,35 @@ class T5GemmaSegmentationHeadTests(unittest.TestCase):
         )
         self.assertTrue(bool((logits[..., EXON_LABEL_INDEX] > logits[..., INTRON_LABEL_INDEX]).all()))
 
+    def test_generation_can_add_aligned_encoder_state_to_prediction_feedback(self):
+        head, decoder = self._head(
+            encoder_dim=4,
+            hidden_size=4,
+            context=4,
+            lookahead=2,
+            add_encoder_to_decoder_input=True,
+        )
+        with torch.no_grad():
+            head.classifier.weight.zero_()
+            head.classifier.bias.copy_(torch.tensor([-10.0, 10.0]))
+        encoder = torch.arange(16, dtype=torch.float32).view(1, 4, 4)
+        mask = torch.ones((1, 4), dtype=torch.bool)
+
+        head.generate(encoder, nucleotide_mask=mask)
+
+        projected = head.encoder_projection(encoder).detach()
+        bos = head._bos_embedding(device=encoder.device).detach()
+        self.assertTrue(torch.allclose(decoder.calls[0]["inputs_embeds"], bos))
+        predicted_embedding = head.label_embedding(
+            torch.tensor([[EXON_CLASS_ID]])
+        ).detach()
+        for position, call in enumerate(decoder.calls[1:], start=1):
+            expected = (
+                predicted_embedding
+                + projected[:, position - 1 : position, :]
+            )
+            self.assertTrue(torch.allclose(call["inputs_embeds"], expected))
+
     def test_encoder_window_remains_anchored_after_reaching_right_edge(self):
         head, _ = self._head(context=3, lookahead=3)
 
@@ -538,6 +597,17 @@ class T5GemmaSegmentationHeadTests(unittest.TestCase):
                 context_size=3,
                 encoder_lookahead=3,
                 multi_token_prediction=0,
+                decoder=decoder,
+            )
+        with self.assertRaisesRegex(RuntimeError, "must be a bool"):
+            T5GemmaSegmentationHead(
+                encoder_dim=2,
+                decoder_hidden_size=4,
+                num_decoder_layers=2,
+                num_attention_heads=2,
+                context_size=3,
+                encoder_lookahead=3,
+                add_encoder_to_decoder_input=1,
                 decoder=decoder,
             )
 
