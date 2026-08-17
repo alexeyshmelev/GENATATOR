@@ -120,6 +120,214 @@ forward pass returns probabilities for every nucleotide. Validation therefore
 does not generate an internal transcript one token at a time. Only label-free
 inference uses autoregressive argmax feedback.
 
+##### Teacher-forcing input alignment and target visibility
+
+Teacher-forced validation is deliberate: label-free autoregressive generation
+requires one sequential decoder call per nucleotide and is prohibitively slow
+for large validation sets containing very long transcripts. The parallel path
+is safe only if its target shift and causal mask are understood precisely.
+
+Use the following notation:
+
+- `x_i` is the DNA nucleotide at position `i`;
+- `E_i` is the projected, DNA-derived encoder representation aligned to `x_i`;
+- `y_i` is the true categorical structure target at position `i`, either
+  `intron` or `exon`;
+- `L(y_i)` is the learned embedding of that categorical target;
+- `D_i` is the input at decoder tensor position `i`;
+- `H_i` is the decoder output state classified at position `i`.
+
+The two encoder families construct `E_i` as follows. Target classes are not
+used in either encoder stream.
+
+For GENA/ModernGENA and their RMT/AMT variants:
+
+```text
+DNA BPE token t
+      │
+      ▼
+backbone hidden state Z_t
+      │
+      ▼
+repeat Z_t over the nucleotide offsets covered by token t
+      │
+      ├────────────── repeated state Z_token(i)
+      │
+DNA nucleotide x_i
+      │
+      ▼
+learned nucleotide embedding N(x_i)
+      │
+      ▼
+concatenate [N(x_i); Z_token(i)]
+      │
+      ▼
+encoder projection
+      │
+      ▼
+projected encoder state E_i
+```
+
+For Caduceus:
+
+```text
+DNA nucleotide x_i
+      │
+      ├──────────────► learned nucleotide embedding N(x_i)
+      │
+      └──────────────► Caduceus hidden state C_i
+                              │
+                              ▼
+                    concatenate [N(x_i); C_i]
+                              │
+                              ▼
+                       encoder projection
+                              │
+                              ▼
+                     projected encoder state E_i
+```
+
+`letter_level_labels` enter only after these encoder representations have been
+constructed. Label and attention masks select valid, non-padding nucleotide
+positions; they do not encode whether a position is exon or intron.
+
+With `add_encoder_to_decoder_input=true`, teacher forcing constructs the
+decoder inputs as
+
+```text
+D_0 = BOS
+D_i = L(y_(i-1)) + E_(i-1),  for i >= 1
+```
+
+and the primary classifier uses `H_i` to predict `y_i`. BOS is therefore the
+conceptual index `-1`; no encoder representation is added to it. The exact
+alignment is:
+
+```text
+Decoder tensor position:       0                 1                  2                  3
+Conceptual source index:      -1                 0                  1                  2
+
+Decoder input D_i:            BOS         L(y0) + E0         L(y1) + E1         L(y2) + E2
+Primary output:                y0                y1                 y2                 y3
+```
+
+Equivalently:
+
+```text
+BOS               ───────────────► H0 ── primary head ──► y0
+L(y0) + E0        ───────────────► H1 ── primary head ──► y1
+L(y1) + E1        ───────────────► H2 ── primary head ──► y2
+L(y2) + E2        ───────────────► H3 ── primary head ──► y3
+...
+```
+
+The key point is that `L(y_i) + E_i` does **not** produce the prediction for
+`y_i`; it occupies the following decoder slot and is used to predict
+`y_(i+1)`. When `add_encoder_to_decoder_input=false`, the same shift is kept,
+but `E_(i-1)` is omitted from `D_i`; encoder information still reaches every
+decoder layer through cross-attention.
+
+The complete shifted target sequence is physically present in the parallel
+input tensor. For example, while `H2` predicts `y2`, the embedding of `y2`
+exists at decoder input position `3`. The decoder's causal self-attention is
+what makes this safe:
+
+```text
+                              decoder input positions
+                         D0          D1          D2          D3
+                        BOS       y0 + E0     y1 + E1     y2 + E2
+
+H0 predicts y0           ✓           ×           ×           ×
+H1 predicts y1           ✓           ✓           ×           ×
+H2 predicts y2           ✓           ✓           ✓           ×
+H3 predicts y3           ✓           ✓           ✓           ✓
+```
+
+Thus, when predicting `y_i`, `H_i` can read decoder inputs `D_0 ... D_i`, which
+contain only `y_0 ... y_(i-1)`. It cannot read `D_(i+1)`, where the current
+target `y_i` is embedded, or any later target. The implementation passes
+
+```text
+{"sliding_attention": None}
+```
+
+to T5Gemma self-attention. In this path, `None` does not mean bidirectional
+attention: SDPA uses the decoder module's `is_causal` flag and applies causal
+attention without materializing a dense triangular mask.
+
+Cross-attention is intentionally different. The implementation passes
+
+```text
+{"full_attention": None}
+```
+
+for the physically sliced encoder window. This means that `H_i` may attend to
+the current and future DNA-derived encoder states inside that window, including
+the configured encoder lookahead. Those states contain sequence information,
+not current or future target embeddings.
+
+The information available to the primary prediction at position `i` is
+therefore:
+
+| Information | Available to `H_i`? | Path |
+|---|---:|---|
+| previous true targets `y_0 ... y_(i-1)` | yes | causal teacher-forced self-attention |
+| current target `y_i` | **no** | stored at inaccessible decoder position `i+1` |
+| future targets `y_(i+1) ...` | **no** | stored at still later decoder positions |
+| previous encoder state `E_(i-1)` | yes | direct addition when enabled, and cross-attention |
+| current encoder state `E_i` | yes | cross-attention |
+| future DNA encoder states in the bounded window | yes | intentional encoder lookahead |
+| current or future targets through the encoder | **no** | encoder states are constructed from DNA, not labels |
+
+Multi-token prediction does not change these inputs. All `K` classifiers read
+the same causally constructed decoder state. With three heads:
+
+```text
+H0, constructed from BOS:
+    head 1 ──► y0
+    head 2 ──► y1
+    head 3 ──► y2
+
+H1, constructed from BOS and L(y0) + E0:
+    head 1 ──► y1
+    head 2 ──► y2
+    head 3 ──► y3
+
+H2, constructed from BOS, L(y0) + E0, and L(y1) + E1:
+    head 1 ──► y2
+    head 2 ──► y3
+    head 3 ──► y4
+```
+
+In general, one-based head `m` applied to `H_i` is trained against
+`y_(i+m-1)`. These future targets are used only on the loss side of
+cross-entropy; they are not injected into `H_i`. Public validation logits and
+autoregressive inference both use head 1.
+
+Teacher forcing is restarted independently at every decoder chunk boundary.
+For a chunk beginning at global nucleotide `s`, the alignment is:
+
+```text
+BOS                       ──► predict y_s
+L(y_s) + E_s              ──► predict y_(s+1)
+L(y_(s+1)) + E_(s+1)      ──► predict y_(s+2)
+...
+```
+
+The first prediction in a chunk does not receive `y_(s-1)`.
+
+Consequently, teacher-forced validation provides the intended ground-truth
+*previous-state* conditioning, but there is no same-position target leakage:
+the primary prediction for nucleotide `i` receives `y_(i-1)`, never `y_i`.
+Because exon and intron labels form long runs, `y_(i-1)` is often equal to
+`y_i`; that can make the teacher-forced task easier, but it is different from
+feeding the answer for the current nucleotide.
+
+A regression test for this invariant can keep all encoder states fixed, alter
+targets from position `i` onward, and compare the two primary-logit sequences.
+Logits through position `i` must remain identical; the first permitted
+difference is position `i+1`, whose decoder input contains `y_i`.
+
 The decoder context C and encoder lookahead A are independent configurable
 values. Teacher-forced samples are split into exact chunks of at most C
 nucleotides; the final short chunk is never padded. Each decoder chunk
