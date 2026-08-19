@@ -118,6 +118,48 @@ def _keys_named(value, key: str) -> list[object]:
     return found
 
 
+def _dicts(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _dicts(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _dicts(child)
+
+
+def test_use_denom_is_explicit_in_every_amt_config_only() -> None:
+    expected_by_root = {
+        "experiments": 1408,
+        "finding": 64,
+        "segmentation": 8,
+        "transcript_type": 12,
+    }
+    actual_by_root = {name: 0 for name in expected_by_root}
+
+    for root_name in expected_by_root:
+        for path in sorted((REPO / root_name).rglob("*.json")):
+            cfg = _load(path)
+            objects = list(_dicts(cfg))
+            amt_models = [
+                value
+                for value in objects
+                if isinstance(value.get("amt"), dict)
+            ]
+            amt_blocks = [value["amt"] for value in amt_models]
+            use_denom_owners = [value for value in objects if "use_denom" in value]
+
+            for model in amt_models:
+                assert model.get("family") in {"amt", "gpt"}, path
+                assert model["amt"]["use_denom"] is True, path
+            assert {id(value) for value in use_denom_owners} == {
+                id(value) for value in amt_blocks
+            }, path
+            actual_by_root[root_name] += len(amt_blocks)
+
+    assert actual_by_root == expected_by_root
+
+
 def test_all_shipped_training_configs_use_requested_contracts() -> None:
     for task in ("finding", "segmentation", "transcript_type"):
         for path, cfg in _training_paths(task):
@@ -396,6 +438,9 @@ def test_massive_finding_experiments_are_exact_cartesian_transfers() -> None:
 
 
 class ShippedConfigSchemaTests(unittest.TestCase):
+    def test_amt_use_denom_contract(self) -> None:
+        test_use_denom_is_explicit_in_every_amt_config_only()
+
     def test_requested_contracts(self) -> None:
         test_all_shipped_training_configs_use_requested_contracts()
 

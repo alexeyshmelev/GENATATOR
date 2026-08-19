@@ -315,7 +315,7 @@ class GPTModelAdapterTests(unittest.TestCase):
         self.assertFalse(bool((encoder_embeddings == 99.0).any()))
         self.assertFalse(bool((encoder_embeddings == 98.0).any()))
 
-    def test_eval_adapter_keeps_labels_for_teacher_forced_validation(self):
+    def test_eval_adapter_rejects_teacher_forced_validation(self):
         hidden = torch.tensor(
             [[[99.0, 99.0], [1.0, 10.0], [2.0, 20.0], [98.0, 98.0], [0.0, 0.0]]]
         )
@@ -323,21 +323,19 @@ class GPTModelAdapterTests(unittest.TestCase):
         model.eval()
         labels = _five_track_labels([[0, 1, 0, 0]])
 
-        model(
-            input_ids=torch.tensor([[10, 4, 5, 11, 0]]),
-            attention_mask=torch.tensor([[1, 1, 1, 1, 0]]),
-            labels_mask=torch.tensor([[False, True, True, False, False]]),
-            embedding_repeater=torch.tensor([[0, 0, 1, -100]]),
-            letter_level_tokens=torch.tensor([[6, 7, 8, 0]]),
-            letter_level_attention_mask=torch.tensor([[1, 1, 1, 0]]),
-            letter_level_labels=labels,
-            letter_level_labels_mask=torch.tensor([[True, True, True, False]]),
-        )
+        with self.assertRaisesRegex(RuntimeError, "cannot consume labels"):
+            model(
+                input_ids=torch.tensor([[10, 4, 5, 11, 0]]),
+                attention_mask=torch.tensor([[1, 1, 1, 1, 0]]),
+                labels_mask=torch.tensor([[False, True, True, False, False]]),
+                embedding_repeater=torch.tensor([[0, 0, 1, -100]]),
+                letter_level_tokens=torch.tensor([[6, 7, 8, 0]]),
+                letter_level_attention_mask=torch.tensor([[1, 1, 1, 0]]),
+                letter_level_labels=labels,
+                letter_level_labels_mask=torch.tensor([[True, True, True, False]]),
+            )
 
-        call = model.gpt_head.calls[0]
-        self.assertFalse(call["training"])
-        self.assertIsNone(call["autoregressive"])
-        self.assertTrue(torch.equal(call["labels"], labels))
+        self.assertEqual(model.gpt_head.calls, [])
 
     def test_public_generate_forces_eval_autoregression_and_restores_training(self):
         hidden = torch.tensor(
@@ -506,10 +504,8 @@ class GPTModelAdapterTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(trained.loss))
         self.assertEqual(tuple(trained.logits.shape), (1, 4, 5))
         model.eval()
-        evaluated = model(**inputs)
-        self.assertTrue(torch.isfinite(evaluated.loss))
-        self.assertTrue(torch.isfinite(evaluated.logits).all())
-        self.assertEqual(tuple(evaluated.logits.shape), (1, 4, 5))
+        with self.assertRaisesRegex(RuntimeError, "cannot consume labels"):
+            model(**inputs)
         generated = model.generate(**inputs)
         self.assertTrue(torch.isfinite(generated).all())
         self.assertEqual(tuple(generated.shape), (1, 4, 5))

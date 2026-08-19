@@ -5,11 +5,14 @@ from typing import Any, Dict
 import inspect
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
+from filelock import FileLock
 from torch.utils.data import DataLoader, Sampler, SequentialSampler
 from tqdm.auto import tqdm
 from transformers import EarlyStoppingCallback, Trainer, TrainingArguments
@@ -28,6 +31,7 @@ from .metrics_training import (
     sigmoid,
 )
 from .intervals import f1_from_counts, interval_counts
+from .gpt_head import EXON_LABEL_INDEX, INTRON_LABEL_INDEX
 from .model_builders import (
     build_model,
     normalize_memory_wrapper_config,
@@ -44,6 +48,136 @@ from .torch_compat import allow_transformers_torch_load_on_legacy_torch
 from .utils import set_seed
 
 logger = logging.getLogger(__name__)
+
+
+_GPT_AUTO_TORCHRUN_ENV = "GENATATOR_GPT_AUTO_TORCHRUN"
+_GPT_GROUND_TRUTH_INPUTS = frozenset(
+    {
+        "labels",
+        "labels_mask",
+        "letter_level_labels",
+        "letter_level_labels_mask",
+        "pos_weight",
+        "transcript_type",
+    }
+)
+
+
+def gpt_torchrun_relaunch_command(
+    *,
+    model_cfg: Dict[str, Any],
+    config_path: str | Path,
+    cuda_device_count: int,
+    distributed_world_size: int,
+    executable: str | None = None,
+) -> list[str] | None:
+    """Build the automatic one-process-per-GPU launch for GPT training.
+
+    GPT validation performs one autoregressive transcript at a time on each
+    rank.  A normal ``python segmentation/train.py`` invocation therefore has
+    to become a local torchrun job before any run directory or model is built.
+    ``torch.cuda.device_count()`` already respects ``CUDA_VISIBLE_DEVICES``.
+    """
+
+    if model_cfg.get("family") != "gpt":
+        return None
+    device_count = int(cuda_device_count)
+    world_size = int(distributed_world_size)
+    if device_count <= 1 or world_size > 1:
+        return None
+    training_script = (
+        Path(__file__).resolve().parent.parent / "segmentation" / "train.py"
+    )
+    return [
+        str(executable or sys.executable),
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        f"--nproc_per_node={device_count}",
+        str(training_script),
+        "--config",
+        str(Path(config_path).expanduser().resolve()),
+    ]
+
+
+def _maybe_relaunch_gpt_training(model_cfg: Dict[str, Any], config_path: str | Path) -> None:
+    """Replace a single-process GPT CLI with one local rank per visible GPU."""
+
+    command = gpt_torchrun_relaunch_command(
+        model_cfg=model_cfg,
+        config_path=config_path,
+        cuda_device_count=torch.cuda.device_count(),
+        distributed_world_size=int(os.environ.get("WORLD_SIZE", "1")),
+    )
+    if command is None:
+        return
+    if os.environ.get(_GPT_AUTO_TORCHRUN_ENV) == "1":
+        raise RuntimeError(
+            "Automatic GPT torchrun relaunch returned to a single-process environment"
+        )
+    environment = dict(os.environ)
+    environment[_GPT_AUTO_TORCHRUN_ENV] = "1"
+    repository_root = str(Path(__file__).resolve().parent.parent)
+    existing_pythonpath = environment.get("PYTHONPATH", "")
+    environment["PYTHONPATH"] = (
+        repository_root
+        if not existing_pythonpath
+        else repository_root + os.pathsep + existing_pythonpath
+    )
+    logger.warning(
+        "[gpt.validation.launch] detected %d visible GPUs; relaunching with one "
+        "training/validation rank per GPU",
+        torch.cuda.device_count(),
+    )
+    os.execvpe(command[0], command, environment)
+
+
+class AtomicValidationIndexQueue:
+    """A filesystem-backed dynamic queue shared by GPT validation ranks."""
+
+    def __init__(self, root: str | Path, *, total: int, timeout_seconds: float):
+        self.root = Path(root)
+        self.total = int(total)
+        self.timeout_seconds = float(timeout_seconds)
+        self.counter_path = self.root / "counter.json"
+        self.lock_path = self.root / "counter.lock"
+
+    @classmethod
+    def create(
+        cls,
+        root: str | Path,
+        *,
+        total: int,
+        timeout_seconds: float,
+    ) -> "AtomicValidationIndexQueue":
+        queue = cls(root, total=total, timeout_seconds=timeout_seconds)
+        queue.root.mkdir(parents=True, exist_ok=False)
+        atomic_save_json(
+            {"next_index": 0, "total": queue.total},
+            queue.counter_path,
+        )
+        return queue
+
+    def claim(self, rank: int) -> int | None:
+        """Atomically claim the next transcript, or return ``None`` when empty."""
+
+        with FileLock(str(self.lock_path), timeout=self.timeout_seconds):
+            with open(self.counter_path, encoding="utf-8") as fh:
+                counter = json.load(fh)
+            if int(counter.get("total", -1)) != self.total:
+                raise RuntimeError("GPT validation queue size changed while it was active")
+            index = int(counter["next_index"])
+            if index >= self.total:
+                return None
+            atomic_save_json(
+                {
+                    "last_claimed_by_rank": int(rank),
+                    "next_index": index + 1,
+                    "total": self.total,
+                },
+                self.counter_path,
+            )
+            return index
 
 
 def filter_training_logs(logs: Dict[str, Any], task: str) -> Dict[str, Any]:
@@ -134,11 +268,14 @@ class GenatatorTrainer(Trainer):
         sequential_train: bool = False,
         allow_legacy_torch_load: bool = True,
         genatator_task: str | None = None,
+        gpt_validation: bool = False,
         **kwargs,
     ):
         self.sequential_train = bool(sequential_train)
         self.allow_legacy_torch_load = bool(allow_legacy_torch_load)
         self.genatator_task = genatator_task or "unknown"
+        self.gpt_validation = bool(gpt_validation)
+        self._gpt_validation_round = 0
         super().__init__(*args, **kwargs)
 
     def _enable_trusted_checkpoint_loading(self, context: str) -> None:
@@ -407,44 +544,380 @@ class GenatatorTrainer(Trainer):
             dataset.release_finding_cache()
         return metrics
 
+    def _gpt_autoregressive_validation_outputs(
+        self,
+        model,
+        inputs: Dict[str, Any],
+    ) -> Dict[str, torch.Tensor]:
+        """Generate one transcript without exposing any reference to the model.
+
+        The returned loss is computed *after* autoregressive generation by
+        comparing generated exon/intron logits with the held-out labels.  The
+        labels never enter ``generate`` and therefore can never become decoder
+        context through teacher forcing.
+        """
+
+        if self.genatator_task != "segmentation":
+            raise RuntimeError("GPT validation is implemented only for segmentation")
+        batch_size = self._batch_size_from_inputs(inputs)
+        if batch_size != 1:
+            raise RuntimeError(
+                "GPT validation requires exactly one transcript per GPU; "
+                f"received per-device batch size {batch_size}"
+            )
+        labels, labels_mask = self._labels_and_mask_from_inputs(
+            self.genatator_task,
+            inputs,
+        )
+        generation_inputs = {
+            key: value
+            for key, value in inputs.items()
+            if key not in _GPT_GROUND_TRUTH_INPUTS
+        }
+        leaked = _GPT_GROUND_TRUTH_INPUTS.intersection(generation_inputs)
+        if leaked:
+            raise RuntimeError(
+                "GPT validation attempted to expose ground truth to generate: "
+                f"{sorted(leaked)}"
+            )
+        logits = model.generate(**generation_inputs)
+        if not isinstance(logits, torch.Tensor):
+            raise RuntimeError("GPT generate() must return a logits tensor")
+        if tuple(logits.shape) != tuple(labels.shape):
+            raise RuntimeError(
+                "GPT validation logits must align with held-out segmentation labels; "
+                f"got logits={tuple(logits.shape)} labels={tuple(labels.shape)}"
+            )
+
+        valid_mask = labels_mask.bool()
+        class_targets = torch.stack(
+            (
+                labels[..., INTRON_LABEL_INDEX],
+                labels[..., EXON_LABEL_INDEX],
+            ),
+            dim=-1,
+        )
+        active = class_targets.ge(0.5).sum(dim=-1)
+        malformed = valid_mask & active.ne(1)
+        if bool(malformed.any()):
+            raise RuntimeError(
+                "GPT validation labels must contain exactly one active exon/intron "
+                f"class at every valid nucleotide; found {int(malformed.sum().item())} "
+                "malformed positions"
+            )
+        if not bool(valid_mask.any()):
+            raise RuntimeError("GPT validation transcript has no valid labeled nucleotides")
+        categorical_targets = class_targets.argmax(dim=-1).long()
+        categorical_logits = torch.stack(
+            (
+                logits[..., INTRON_LABEL_INDEX],
+                logits[..., EXON_LABEL_INDEX],
+            ),
+            dim=-1,
+        )
+        loss = F.cross_entropy(
+            categorical_logits[valid_mask].float(),
+            categorical_targets[valid_mask],
+            reduction="mean",
+        )
+        return {"loss": loss, "logits": logits}
+
+    @staticmethod
+    def _gpt_validation_state_payload(
+        state: Dict[str, Any],
+        claimed_indices: list[int],
+    ) -> Dict[str, Any]:
+        return {
+            "claimed_indices": [int(index) for index in claimed_indices],
+            "loss_count": int(state["loss_count"]),
+            "loss_sum": float(state["loss_sum"]),
+            "counts": {
+                name: [int(value) for value in counts]
+                for name, counts in state["counts"].items()
+            },
+        }
+
+    def _merge_gpt_validation_payloads(
+        self,
+        payloads: list[Dict[str, Any]],
+        *,
+        dataset_size: int,
+        metric_key_prefix: str,
+    ) -> Dict[str, float]:
+        merged = self._new_streaming_state()
+        claimed_indices: list[int] = []
+        for payload in payloads:
+            claimed_indices.extend(int(index) for index in payload["claimed_indices"])
+            merged["loss_sum"] += float(payload["loss_sum"])
+            merged["loss_count"] += int(payload["loss_count"])
+            counts = payload["counts"]
+            if set(counts) != set(merged["counts"]):
+                raise RuntimeError("GPT validation rank returned an invalid metric state")
+            for class_name, values in counts.items():
+                if len(values) != 3:
+                    raise RuntimeError("GPT validation interval counts must be [tp, fp, fn]")
+                for offset, value in enumerate(values):
+                    merged["counts"][class_name][offset] += int(value)
+
+        expected = list(range(int(dataset_size)))
+        if sorted(claimed_indices) != expected:
+            duplicates = len(claimed_indices) - len(set(claimed_indices))
+            missing = sorted(set(expected).difference(claimed_indices))
+            raise RuntimeError(
+                "Dynamic GPT validation did not process every transcript exactly once: "
+                f"claims={len(claimed_indices)} duplicates={duplicates} "
+                f"missing={missing[:20]}"
+            )
+        return self._finalize_streaming_state(merged, metric_key_prefix)
+
+    @staticmethod
+    def _wait_for_json_files(
+        directory: Path,
+        *,
+        expected: int,
+        errors_directory: Path,
+        timeout_seconds: float,
+        context: str,
+    ) -> list[Dict[str, Any]]:
+        deadline = time.monotonic() + float(timeout_seconds)
+        while time.monotonic() < deadline:
+            error_paths = sorted(errors_directory.glob("rank_*.json"))
+            if error_paths:
+                with open(error_paths[0], encoding="utf-8") as fh:
+                    error = json.load(fh)
+                raise RuntimeError(
+                    f"{context} failed on rank {error.get('rank')}: "
+                    f"{error.get('type')}: {error.get('message')}"
+                )
+            paths = sorted(directory.glob("rank_*.json"))
+            if len(paths) == int(expected):
+                payloads = []
+                for path in paths:
+                    with open(path, encoding="utf-8") as fh:
+                        payloads.append(json.load(fh))
+                return payloads
+            time.sleep(0.1)
+        raise TimeoutError(
+            f"Timed out waiting for {expected} GPT validation ranks in {directory}"
+        )
+
+    def _distributed_gpt_evaluate(
+        self,
+        eval_dataset=None,
+        metric_key_prefix: str = "eval",
+    ) -> Dict[str, float]:
+        """Dynamically schedule one autoregressive transcript per GPU rank."""
+
+        dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        if dataset is None:
+            return {}
+        configured_batch_size = int(self.args.per_device_eval_batch_size)
+        if configured_batch_size != 1:
+            raise RuntimeError(
+                "GPT validation requires training.per_device_eval_batch_size=1; "
+                f"got {configured_batch_size}"
+            )
+        dataset_size = len(dataset)
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        rank = int(os.environ.get("RANK", "0"))
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        timeout_seconds = float(
+            getattr(self.args, "eval_rank0_timeout_seconds", 86400.0)
+        )
+        step = int(getattr(self.state, "global_step", 0))
+        round_index = int(getattr(self, "_gpt_validation_round", 0))
+        self._gpt_validation_round += 1
+        queue_root = (
+            Path(self.args.output_dir)
+            / "gpt_validation_queue"
+            / f"{metric_key_prefix}_step_{step}_round_{round_index}"
+        )
+        ready_path = queue_root / "ready.json"
+        results_dir = queue_root / "results"
+        errors_dir = queue_root / "errors"
+        work_dir = queue_root / "work"
+
+        if rank == 0:
+            queue_root.mkdir(parents=True, exist_ok=False)
+            results_dir.mkdir()
+            errors_dir.mkdir()
+            queue = AtomicValidationIndexQueue.create(
+                work_dir,
+                total=dataset_size,
+                timeout_seconds=timeout_seconds,
+            )
+            atomic_save_json(
+                {
+                    "dataset_size": dataset_size,
+                    "round": round_index,
+                    "step": step,
+                    "world_size": world_size,
+                },
+                ready_path,
+            )
+        else:
+            deadline = time.monotonic() + timeout_seconds
+            ready = None
+            while time.monotonic() < deadline:
+                try:
+                    with open(ready_path, encoding="utf-8") as fh:
+                        candidate = json.load(fh)
+                    if (
+                        int(candidate.get("dataset_size", -1)) == dataset_size
+                        and int(candidate.get("round", -1)) == round_index
+                        and int(candidate.get("step", -1)) == step
+                        and int(candidate.get("world_size", -1)) == world_size
+                    ):
+                        ready = candidate
+                        break
+                except (FileNotFoundError, json.JSONDecodeError, OSError):
+                    pass
+                time.sleep(0.1)
+            if ready is None:
+                raise TimeoutError(f"Timed out waiting for GPT validation queue {ready_path}")
+            queue = AtomicValidationIndexQueue(
+                work_dir,
+                total=dataset_size,
+                timeout_seconds=timeout_seconds,
+            )
+
+        model = (
+            self.accelerator.unwrap_model(self.model)
+            if hasattr(self, "accelerator")
+            else self.model
+        )
+        model.eval()
+        state = self._new_streaming_state()
+        claimed_indices: list[int] = []
+        progress = tqdm(
+            desc=f"{metric_key_prefix}:{self.genatator_task}:rank={rank}",
+            disable=rank != 0,
+        )
+        logger.info(
+            "[gpt_distributed_validation] rank=%d local_rank=%d world_size=%d "
+            "dataset_size=%d per_device_batch_size=1 teacher_forcing=false",
+            rank,
+            local_rank,
+            world_size,
+            dataset_size,
+        )
+        try:
+            with torch.no_grad():
+                while True:
+                    index = queue.claim(rank)
+                    if index is None:
+                        break
+                    batch = self.data_collator([dataset[index]])
+                    inputs = self._prepare_inputs(batch)
+                    if self._batch_size_from_inputs(inputs) != 1:
+                        raise RuntimeError(
+                            "GPT validation collator violated per-device batch_size=1"
+                        )
+                    outputs = self._gpt_autoregressive_validation_outputs(model, inputs)
+                    self._update_streaming_state(state, inputs, outputs)
+                    claimed_indices.append(index)
+                    del outputs, inputs, batch
+                    progress.update(1)
+            atomic_save_json(
+                self._gpt_validation_state_payload(state, claimed_indices),
+                results_dir / f"rank_{rank:06d}.json",
+            )
+        except Exception as exc:
+            atomic_save_json(
+                {
+                    "message": str(exc),
+                    "rank": rank,
+                    "type": type(exc).__name__,
+                },
+                errors_dir / f"rank_{rank:06d}.json",
+            )
+            raise
+        finally:
+            progress.close()
+
+        payloads = self._wait_for_json_files(
+            results_dir,
+            expected=world_size,
+            errors_directory=errors_dir,
+            timeout_seconds=timeout_seconds,
+            context="GPT validation",
+        )
+        metrics = self._merge_gpt_validation_payloads(
+            payloads,
+            dataset_size=dataset_size,
+            metric_key_prefix=metric_key_prefix,
+        )
+        if hasattr(dataset, "release_finding_cache"):
+            dataset.release_finding_cache()
+        logger.info(
+            "[gpt_distributed_validation] rank=%d processed=%d total=%d metrics=%s",
+            rank,
+            len(claimed_indices),
+            dataset_size,
+            metrics,
+        )
+        return metrics
+
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix: str = "eval"):
-        """Rank-0 streaming evaluation that avoids distributed all-gather of large tensors.
+        """Stream metrics without distributed all-gather of nucleotide tensors.
 
         Hugging Face's default prediction loop all-gathers logits/labels across
-        all ranks. For nucleotide-level validation this can allocate huge GPU
-        tensors or hang in NCCL when one rank is a straggler. Here rank 0 runs a
-        sequential validation pass with the unwrapped model, moves every batch's
-        predictions to CPU immediately, writes the small metric dictionary to
-        disk, and the other ranks wait for that file without using NCCL.
+        all ranks. Non-GPT models retain the original rank-0-only sequential
+        validation. GPT models instead use every GPU rank, dynamically claim one
+        transcript at a time, and merge only small CPU metric states through the
+        run directory.
         """
-        world_size = int(os.environ.get("WORLD_SIZE", "1"))
         rank = int(os.environ.get("RANK", "0"))
         step = int(getattr(self.state, "global_step", 0))
         sync_dir = Path(self.args.output_dir) / "rank0_eval_metrics"
         sync_dir.mkdir(parents=True, exist_ok=True)
         metrics_path = sync_dir / f"{metric_key_prefix}_step_{step}.json"
-        start_time = time.time()
-        if rank == 0:
-            if metrics_path.exists():
-                metrics_path.unlink()
-            metrics = self._streaming_evaluate_rank0(eval_dataset=eval_dataset, metric_key_prefix=metric_key_prefix)
-            atomic_save_json(metrics, metrics_path)
-            logger.info("[rank0_streaming_eval] wrote metrics=%s", metrics_path)
-        else:
-            timeout_s = float(getattr(self.args, "eval_rank0_timeout_seconds", 86400.0))
-            logger.info(
-                "[rank0_streaming_eval] rank=%d waiting for rank0 metrics file=%s without NCCL collectives",
-                rank,
-                metrics_path,
+        if bool(getattr(self, "gpt_validation", False)):
+            metrics = self._distributed_gpt_evaluate(
+                eval_dataset=eval_dataset,
+                metric_key_prefix=metric_key_prefix,
             )
-            while True:
-                if metrics_path.exists() and metrics_path.stat().st_mtime >= start_time - 1.0:
-                    with open(metrics_path) as fh:
-                        metrics = json.load(fh)
-                    break
-                if time.time() - start_time > timeout_s:
-                    raise TimeoutError(f"Timed out waiting for rank0 evaluation metrics at {metrics_path}")
-                time.sleep(5.0)
+            if rank == 0:
+                atomic_save_json(metrics, metrics_path)
+                logger.info(
+                    "[gpt_distributed_validation] wrote metrics=%s",
+                    metrics_path,
+                )
+        else:
+            start_time = time.time()
+            if rank == 0:
+                if metrics_path.exists():
+                    metrics_path.unlink()
+                metrics = self._streaming_evaluate_rank0(
+                    eval_dataset=eval_dataset,
+                    metric_key_prefix=metric_key_prefix,
+                )
+                atomic_save_json(metrics, metrics_path)
+                logger.info("[rank0_streaming_eval] wrote metrics=%s", metrics_path)
+            else:
+                timeout_s = float(
+                    getattr(self.args, "eval_rank0_timeout_seconds", 86400.0)
+                )
+                logger.info(
+                    "[rank0_streaming_eval] rank=%d waiting for rank0 metrics "
+                    "file=%s without NCCL collectives",
+                    rank,
+                    metrics_path,
+                )
+                while True:
+                    if (
+                        metrics_path.exists()
+                        and metrics_path.stat().st_mtime >= start_time - 1.0
+                    ):
+                        with open(metrics_path) as fh:
+                            metrics = json.load(fh)
+                        break
+                    if time.time() - start_time > timeout_s:
+                        raise TimeoutError(
+                            "Timed out waiting for rank0 evaluation metrics at "
+                            f"{metrics_path}"
+                        )
+                    time.sleep(5.0)
         if rank == 0:
             self.log(metrics)
         # Match Trainer.evaluate's callback contract on every rank. In
@@ -691,6 +1164,7 @@ def train_from_config(config_path: str, task: str | None = None) -> None:
             "Training config must set task to finding_edge, finding_region, segmentation, or transcript_type"
         )
     validate_rules(cfg, task)
+    _maybe_relaunch_gpt_training(cfg["model"], config_path)
     set_seed(int(cfg.get("seed", 42)))
     tr = cfg["training"]
     configured_output_dir = str(Path(tr["output_dir"]).expanduser().resolve())
@@ -799,6 +1273,7 @@ def train_from_config(config_path: str, task: str | None = None) -> None:
         # device changes.
         eval_accumulation_steps=int(tr.get("eval_accumulation_steps", 1)),
         gradient_accumulation_steps=int(tr.get("gradient_accumulation_steps", 1)),
+        max_grad_norm=float(tr.get("max_grad_norm", 1.0)),
         learning_rate=float(tr.get("learning_rate", 5e-5)),
         weight_decay=float(tr.get("weight_decay", 1e-4)),
         warmup_steps=int(tr.get("warmup_steps", 1000)),
@@ -838,7 +1313,17 @@ def train_from_config(config_path: str, task: str | None = None) -> None:
         raise RuntimeError("Installed transformers.TrainingArguments supports neither eval_strategy nor evaluation_strategy")
     args = TrainingArguments(**ta_kwargs)
     args.eval_rank0_timeout_seconds = float(tr.get("eval_rank0_timeout_seconds", 86400.0))
-    logger.info("[training.evaluation_memory] rank0_streaming_evaluation=true; no distributed all-gather of validation logits/labels")
+    if model_cfg.get("family") == "gpt":
+        logger.info(
+            "[training.evaluation_memory] gpt_dynamic_distributed_validation=true; "
+            "per_device_batch_size=1 teacher_forcing=false; no distributed all-gather "
+            "of validation logits/labels"
+        )
+    else:
+        logger.info(
+            "[training.evaluation_memory] rank0_streaming_evaluation=true; "
+            "no distributed all-gather of validation logits/labels"
+        )
     trainer = GenatatorTrainer(
         model=model,
         args=args,
@@ -851,6 +1336,7 @@ def train_from_config(config_path: str, task: str | None = None) -> None:
             model_cfg.get("allow_unsafe_torch_load_with_torch_lt_2_6", True)
         ),
         genatator_task=task,
+        gpt_validation=model_cfg.get("family") == "gpt",
         callbacks=[
             BestCheckpointEvaluationConfigCallback(evaluation_config_manager),
             EarlyStoppingCallback(early_stopping_patience=patience),

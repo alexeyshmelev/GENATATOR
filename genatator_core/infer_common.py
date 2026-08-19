@@ -240,10 +240,10 @@ def _predict_once(cfg: Dict[str, Any], task: str, device: str, reverse_complemen
                 offset_mapping = batch.pop("offset_mapping")
                 batch.pop("reverse_complement")
                 tensor_batch = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
-                # Inference is the only autoregressive GPT path.  The
-                # materialized inference batch still contains reference labels
-                # for benchmarking, so ordinary forward would correctly choose
-                # teacher forcing as validation does.
+                # GPT validation and inference are strictly autoregressive. The
+                # materialized benchmark batch still contains reference labels,
+                # so dispatch through generate() to keep them out of decoder
+                # context.
                 logits = model_logits_for_inference(
                     model,
                     tensor_batch,

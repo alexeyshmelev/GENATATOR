@@ -183,6 +183,11 @@ class _GPTSegmentationModelBase(nn.Module):
         pos_weight: torch.Tensor | None,
         autoregressive: bool | None,
     ) -> TokenClassifierOutput:
+        if letter_level_labels is not None and not self.training:
+            raise RuntimeError(
+                "GPT evaluation cannot consume labels or use teacher forcing; "
+                "call generate() without ground-truth tensors"
+            )
         loss, logits = self.gpt_head(
             encoder_embeddings,
             nucleotide_mask=nucleotide_mask,

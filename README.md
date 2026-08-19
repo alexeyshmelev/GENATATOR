@@ -114,18 +114,27 @@ intron, 3UTR, CDS so the shared validation, reverse-complement, exon selection,
 GFF, and CDS-heuristic pipeline remains usable. Unavailable tracks receive a
 large finite negative logit; padding positions remain zero.
 
-Both training and validation use teacher forcing. For an exact, unpadded chunk
-with targets y0 ... y(n-1), the decoder inputs are BOS, y0 ... y(n-2), so one
-forward pass returns probabilities for every nucleotide. Validation therefore
-does not generate an internal transcript one token at a time. Only label-free
-inference uses autoregressive argmax feedback.
+Training uses teacher forcing. For an exact, unpadded chunk with targets
+y0 ... y(n-1), the decoder inputs are BOS, y0 ... y(n-2), so one forward pass
+returns probabilities for every nucleotide. Training-time validation and
+inference are strictly autoregressive: neither path supplies reference labels
+to the model, and each predicted argmax token becomes the context for the next
+nucleotide.
 
-##### Teacher-forcing input alignment and target visibility
+GPT validation always uses a per-GPU batch size of one. A normal GPT training
+command detects all visible CUDA devices and automatically relaunches with one
+local rank per GPU when needed. During validation, those ranks dynamically
+claim complete transcripts from a shared queue, so a GPU that finishes its
+current transcript immediately takes the next unclaimed one. Non-GPT
+validation remains the original sequential rank-0-only pass. Reference labels
+are compared with the completed generated logits only afterward to compute the
+validation loss and interval metrics.
 
-Teacher-forced validation is deliberate: label-free autoregressive generation
-requires one sequential decoder call per nucleotide and is prohibitively slow
-for large validation sets containing very long transcripts. The parallel path
-is safe only if its target shift and causal mask are understood precisely.
+##### Training teacher-forcing input alignment and target visibility
+
+Teacher forcing is confined to optimization. The following alignment explains
+the parallel training path; validation never enters it and instead uses
+autoregressive generation without reference-label inputs.
 
 Use the following notation:
 
@@ -301,8 +310,8 @@ H2, constructed from BOS, L(y0) + E0, and L(y1) + E1:
 
 In general, one-based head `m` applied to `H_i` is trained against
 `y_(i+m-1)`. These future targets are used only on the loss side of
-cross-entropy; they are not injected into `H_i`. Public validation logits and
-autoregressive inference both use head 1.
+cross-entropy; they are not injected into `H_i`. Autoregressive validation and
+inference both use head 1.
 
 Teacher forcing is restarted independently at every decoder chunk boundary.
 For a chunk beginning at global nucleotide `s`, the alignment is:
@@ -316,7 +325,7 @@ L(y_(s+1)) + E_(s+1)      ──► predict y_(s+2)
 
 The first prediction in a chunk does not receive `y_(s-1)`.
 
-Consequently, teacher-forced validation provides the intended ground-truth
+Consequently, teacher-forced training provides the intended ground-truth
 *previous-state* conditioning, but there is no same-position target leakage:
 the primary prediction for nucleotide `i` receives `y_(i-1)`, never `y_i`.
 Because exon and intron labels form long runs, `y_(i-1)` is often equal to
@@ -332,9 +341,9 @@ The decoder context C and encoder lookahead A are independent configurable
 values. Teacher-forced samples are split into exact chunks of at most C
 nucleotides; the final short chunk is never padded. Each decoder chunk
 cross-attends to its current C encoder states plus up to A following states.
-During inference, cached self-attention retains at most C preceding decoder
-inputs while the visible encoder interval advances one nucleotide at a time
-until it reaches its final right-edge position:
+During autoregressive validation and inference, cached self-attention retains
+at most C preceding decoder inputs while the visible encoder interval advances
+one nucleotide at a time until it reaches its final right-edge position:
 
 ```text
 moving_start = max(0, p - C + 1)
@@ -384,9 +393,9 @@ number of valid token-offset pairs. A head with no valid target contributes
 neither loss nor denominator. This prevents short sequences and final chunks
 from being biased by fabricated targets or padding.
 
-The auxiliary future-token heads are a training and validation objective only.
-Autoregressive inference uses head 1 exclusively, feeds back its argmax class,
-and advances by one nucleotide.
+The auxiliary future-token heads are a training objective only. Autoregressive
+validation and inference use head 1 exclusively, feed back its argmax class,
+and advance by one nucleotide.
 
 The decoder remains intentionally shallow: two layers and width 256 by default,
 with two through four layers permitted. Context size, lookahead, width,
@@ -398,15 +407,16 @@ checkpointing during training so they do not retain dense C-by-(C+A) attention
 weights for every chunk. Activation checkpointing recomputes decoder layers
 during backward, exchanging additional compute for lower peak training memory.
 
-Autoregressive inference remains substantially slower than linear or U-Net
-inference despite key/value caching, because its N decisions are sequential.
+Autoregressive validation and inference remain substantially slower than
+linear or U-Net evaluation despite key/value caching, because their N
+decisions are sequential.
 Each decision still attends to as many as C+A encoder keys, and the already
 materialized backbone output plus returned N-by-5 logits scale with N. The
 rolling K/V update uses semi-internal T5Gemma/DynamicCache attributes; if their
 layout changes, a guarded compatibility path rebuilds only the current bounded
 encoder slice instead of risking stale or misaligned keys.
-Training and validation are parallel teacher-forced passes and do not pay this
-one-token-at-a-time cost.
+Training remains a parallel teacher-forced pass. Validation and inference pay
+the one-token-at-a-time autoregressive cost.
 
 ##### First GPT model experiments
 
@@ -715,7 +725,9 @@ Consequences:
 - Accelerate does not pad the epoch by repeating windows;
 - at most `world_size − 1` windows are dropped when the total is not divisible by the GPU count;
 - each GPU processes chromosome-grouped windows, so it normally assembles a chromosome once and reuses it for its assigned windows;
-- training-time validation is run sequentially on rank 0 over every validation window once.
+- non-GPT training-time validation is run sequentially on rank 0 over every
+  validation window once; GPT validation is the documented multi-GPU dynamic
+  autoregressive exception.
 
 ### Segmentation dataset
 

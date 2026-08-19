@@ -1,5 +1,6 @@
 import types
 import unittest
+from unittest.mock import patch
 
 
 try:
@@ -8,6 +9,7 @@ try:
     import torch.nn.functional as F
 
     from genatator_core.amt_models import (
+        AMTTokenClassifier,
         _install_stable_associative_memory,
         _run_amt_without_padding,
     )
@@ -15,10 +17,66 @@ except ImportError:
     torch = None
     nn = None
     F = None
+    AMTTokenClassifier = None
     _install_stable_associative_memory = None
     _run_amt_without_padding = None
 
 _ModuleBase = nn.Module if nn is not None else object
+
+
+@unittest.skipIf(torch is None, "torch/transformers are not installed")
+class AmtUseDenomConfigTests(unittest.TestCase):
+    class _FakeBaseModel(_ModuleBase):
+        def __init__(self):
+            super().__init__()
+            self.embedding = nn.Embedding(8, 4)
+
+        def get_input_embeddings(self):
+            return self.embedding
+
+    class _RecordingMemoryCell(_ModuleBase):
+        received_kwargs = None
+
+        def __init__(self, **kwargs):
+            super().__init__()
+            type(self).received_kwargs = kwargs
+
+    class _FakeRecurrentWrapper(_ModuleBase):
+        def __init__(self, memory_cell, **kwargs):
+            super().__init__()
+            self.memory_cell = memory_cell
+
+    def test_use_denom_default_and_configured_value_reach_memory_cell(self) -> None:
+        remote_module = types.SimpleNamespace(
+            AssociativeMemoryCell=self._RecordingMemoryCell,
+            AssociativeRecurrentWrapper=self._FakeRecurrentWrapper,
+        )
+        for configured, expected in ((None, True), (False, False)):
+            with self.subTest(configured=configured), patch(
+                "genatator_core.amt_models._load_amt_base_model",
+                return_value=(self._FakeBaseModel(), object(), 4, "encoder.layer"),
+            ), patch(
+                "genatator_core.amt_models.allow_transformers_torch_load_on_legacy_torch"
+            ), patch(
+                "genatator_core.amt_models.AutoModelForCausalLM.from_pretrained",
+                return_value=object(),
+            ), patch(
+                "genatator_core.amt_models._install_stable_associative_memory"
+            ), patch(
+                "genatator_core.amt_models.importlib.import_module",
+                return_value=remote_module,
+            ):
+                amt_kwargs = {} if configured is None else {"use_denom": configured}
+                AMTTokenClassifier(
+                    backbone_path="unused-checkpoint",
+                    backbone_kind="gena",
+                    num_labels=2,
+                    encoder_only=True,
+                    **amt_kwargs,
+                )
+            self.assertIs(
+                self._RecordingMemoryCell.received_kwargs["use_denom"], expected
+            )
 
 
 @unittest.skipIf(torch is None, "torch/transformers are not installed")

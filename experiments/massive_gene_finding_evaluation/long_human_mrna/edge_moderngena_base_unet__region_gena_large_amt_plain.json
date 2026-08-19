@@ -43,6 +43,7 @@
       "use_unet": false,
       "amt": {
         "amt_repo_id": "irodkin/armt-neox-tiny",
+        "use_denom": true,
         "num_mem_tokens": 10,
         "d_mem": 64,
         "segment_size": 502

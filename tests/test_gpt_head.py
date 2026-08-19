@@ -277,27 +277,22 @@ class T5GemmaSegmentationHeadTests(unittest.TestCase):
             )
             self.assertTrue(torch.allclose(call["inputs_embeds"], expected))
 
-    def test_eval_forward_with_labels_is_one_teacher_forced_pass(self):
+    def test_eval_forward_with_labels_rejects_teacher_forcing(self):
         head, decoder = self._head(context=8, lookahead=3)
         head.eval()
         encoder = torch.randn(1, 4, 2)
         mask = torch.ones((1, 4), dtype=torch.bool)
         labels = _five_track_labels([[0, 1, 1, 0]])
 
-        loss, logits = head(
-            encoder,
-            nucleotide_mask=mask,
-            labels=labels,
-            labels_mask=mask,
-        )
+        with self.assertRaisesRegex(RuntimeError, "cannot consume labels"):
+            head(
+                encoder,
+                nucleotide_mask=mask,
+                labels=labels,
+                labels_mask=mask,
+            )
 
-        self.assertIsNotNone(loss)
-        self.assertEqual(tuple(logits.shape), (1, 4, 5))
-        self.assertEqual(len(decoder.calls), 1)
-        self.assertEqual(decoder.calls[0]["inputs_embeds"].shape[1], 4)
-        self.assertFalse(decoder.calls[0]["use_cache"])
-        self.assertIsNone(decoder.calls[0]["self_mask"])
-        self.assertIsNone(decoder.calls[0]["cross_mask"])
+        self.assertEqual(decoder.calls, [])
 
     def test_multi_token_loss_masks_each_offset_at_the_right_edge(self):
         head, _ = self._head(
@@ -661,7 +656,7 @@ class T5GemmaSegmentationHeadTests(unittest.TestCase):
             context_size=4,
             encoder_lookahead=2,
         )
-        head.eval()
+        head.train()
         encoder = torch.randn(1, 4, 8)
         mask = torch.ones((1, 4), dtype=torch.bool)
         prefix = _five_track_labels([[0, 1, 0, 0]])

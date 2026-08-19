@@ -439,6 +439,7 @@ class TranscriptModelBuilderTests(unittest.TestCase):
             use_unet=False,
             amt={
                 "amt_repo_id": "test/amt",
+                "use_denom": False,
                 "num_mem_tokens": 20,
                 "segment_size": 1004,
                 "d_mem": 64,
@@ -462,8 +463,52 @@ class TranscriptModelBuilderTests(unittest.TestCase):
             trust_remote_code=True,
             allow_unsafe_torch_load=True,
             amt_repo_id="test/amt",
+            use_denom=False,
             num_mem_tokens=20,
             segment_size=1004,
+            d_mem=64,
+        )
+
+    def test_amt_gpt_builder_forwards_use_denom_to_amt_token_classifier(self):
+        cfg = self._cfg(
+            "gpt",
+            "gena",
+            vocab_size=32,
+            use_unet=False,
+            amt={
+                "amt_repo_id": "test/amt",
+                "use_denom": False,
+                "num_mem_tokens": 10,
+                "segment_size": 502,
+                "d_mem": 64,
+            },
+            gpt={},
+        )
+        fake_encoder = _FakeAMT(hidden_size=4)
+        with patch.object(
+            model_builders,
+            "allow_transformers_torch_load_on_legacy_torch",
+        ), patch(
+            "genatator_core.gpt_models.AMTTokenClassifier",
+            return_value=fake_encoder,
+        ) as constructor, patch(
+            "genatator_core.gpt_models.T5GemmaSegmentationHead",
+            return_value=nn.Linear(1, 1),
+        ):
+            model_builders.build_model(cfg, task="segmentation")
+
+        constructor.assert_called_once_with(
+            backbone_path="unused-checkpoint",
+            backbone_kind="gena",
+            num_labels=5,
+            trust_remote_code=True,
+            use_unet=False,
+            encoder_only=True,
+            allow_unsafe_torch_load=True,
+            amt_repo_id="test/amt",
+            use_denom=False,
+            num_mem_tokens=10,
+            segment_size=502,
             d_mem=64,
         )
 
