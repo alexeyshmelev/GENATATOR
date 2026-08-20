@@ -15,6 +15,8 @@ from typing import Any, Dict
 from filelock import FileLock
 from transformers import TrainerCallback
 
+from .inference_policy import is_gpt_segmentation
+
 
 _SAFE_PREFIX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _CHECKPOINT_NAME = re.compile(r"^checkpoint-(\d+)$")
@@ -688,6 +690,10 @@ def build_evaluation_config(cfg: Dict[str, Any], *, task: str, run_dir: str | Pa
         dataset_cfg.pop("overlap", None)
         dataset_cfg.pop("target_group", None)
         dataset_cfg["full_transcript_chunks"] = True
+        if is_gpt_segmentation(model_cfg, task):
+            # GPT decoding is autoregressive and directional. It must run once
+            # in the original transcript orientation, never as an RC ensemble.
+            common["use_reverse_complement"] = False
         common.update(
             {
                 "use_cds_heuristic": True,

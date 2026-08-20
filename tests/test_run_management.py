@@ -340,6 +340,24 @@ class RunManagementTests(unittest.TestCase):
             self.assertEqual(written["_generated"]["checkpoint_selection"], "best")
             self.assertTrue((checkpoint / "evaluation_config.json").is_file())
 
+    def test_gpt_segmentation_evaluation_is_forward_only_and_requires_cds_heuristic(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary) / "run"
+            run_dir.mkdir()
+            cfg = self._config(Path(temporary) / "base")
+            cfg["model"]["family"] = "gpt"
+
+            evaluation = build_evaluation_config(
+                cfg,
+                task="segmentation",
+                run_dir=run_dir,
+            )
+
+            self.assertFalse(evaluation["inference"]["use_reverse_complement"])
+            self.assertTrue(evaluation["inference"]["use_cds_heuristic"])
+
     def test_finding_evaluation_uses_test_split_and_fixed_chromosome(self):
         with tempfile.TemporaryDirectory() as temporary:
             run_dir = Path(temporary) / "run"

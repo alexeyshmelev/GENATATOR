@@ -54,7 +54,7 @@ class StaticConfigContractsTest(unittest.TestCase):
                     unexpected.append(path)
         self.assertEqual(unexpected, [])
 
-    def test_experiment_inference_templates_use_batch_one_and_rc(self) -> None:
+    def test_experiment_inference_templates_use_batch_one_and_model_rc_policy(self) -> None:
         paths = sorted((ROOT / "experiments").rglob("*.json"))
         self.assertGreater(len(paths), 0)
         for path in paths:
@@ -62,7 +62,8 @@ class StaticConfigContractsTest(unittest.TestCase):
             inference = cfg.get("inference")
             if isinstance(inference, dict):
                 self.assertEqual(inference["batch_size"], 1, path)
-                self.assertIs(inference["use_reverse_complement"], True, path)
+                expected_rc = cfg.get("model", {}).get("family") != "gpt"
+                self.assertIs(inference["use_reverse_complement"], expected_rc, path)
             for stage in ("edge", "region"):
                 if stage in cfg:
                     self.assertEqual(cfg[stage]["inference"]["batch_size"], 1, path)

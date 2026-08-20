@@ -414,7 +414,8 @@ def test_massive_finding_experiments_are_exact_cartesian_transfers() -> None:
             inference = cfg["inference"]
             assert inference["true_gff"] == MANUAL_PLACEHOLDER, path
             assert inference["batch_size"] == 1, path
-            assert inference["use_reverse_complement"] is True, path
+            expected_rc = cfg.get("model", {}).get("family") != "gpt"
+            assert inference["use_reverse_complement"] is expected_rc, path
             pair_root = (
                 f"runs/massive_gene_finding_evaluation/{setup_name}/{path.stem}"
             )

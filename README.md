@@ -82,7 +82,7 @@ Input is the same kind of reconstructed chromosome window. Output is two nucleot
 
 ### Gene segmentation
 
-Input is one transcript sequence or one non-overlapping chunk of a complete transcript. Output is five nucleotide tracks ordered `5UTR`, `exon`, `intron`, `3UTR`, `CDS`. Training uses exact interval F1 for exon and CDS checkpoint selection. Inference gathers every chunk back into one transcript prediction, optionally averages its reverse complement, writes GFF3, and evaluates against `true_gff` when supplied.
+Input is one transcript sequence or one non-overlapping chunk of a complete transcript. Output is five nucleotide tracks ordered `5UTR`, `exon`, `intron`, `3UTR`, `CDS`. Non-GPT training uses exact interval F1 for exon and CDS checkpoint selection; GPT training selects checkpoints by exon interval F1 because its decoder has no CDS class. Inference gathers every chunk back into one transcript prediction, writes GFF3, and evaluates against `true_gff` when supplied. Non-GPT models may optionally average a reverse-complement pass; GPT inference is always forward-only.
 
 #### GPT generative segmentation head
 
@@ -110,9 +110,10 @@ The decoder models exactly two mutually exclusive internal tokens:
 Training labels must contain exactly one active exon/intron class at every
 valid nucleotide. The GPT head does not predict 5' UTR, 3' UTR, or CDS. Its
 public output still has shape [B, N, 5] in the repository order 5UTR, exon,
-intron, 3UTR, CDS so the shared validation, reverse-complement, exon selection,
-GFF, and CDS-heuristic pipeline remains usable. Unavailable tracks receive a
-large finite negative logit; padding positions remain zero.
+intron, 3UTR, CDS so the shared validation, exon selection, GFF, and
+CDS-heuristic pipeline remains usable. Unavailable tracks receive a large
+finite negative logit; padding positions remain zero. GPT inference never runs
+or averages a reverse-complement model pass.
 
 Training uses teacher forcing. For an exact, unpadded chunk with targets
 y0 ... y(n-1), the decoder inputs are BOS, y0 ... y(n-2), so one forward pass
@@ -128,7 +129,9 @@ claim complete transcripts from a shared queue, so a GPU that finishes its
 current transcript immediately takes the next unclaimed one. Non-GPT
 validation remains the original sequential rank-0-only pass. Reference labels
 are compared with the completed generated logits only afterward to compute the
-validation loss and interval metrics.
+validation loss and interval metrics. GPT validation and checkpoint selection
+use exon interval F1; the sequence-based CDS heuristic runs during standalone
+segmentation inference and GFF generation.
 
 ##### Training teacher-forcing input alignment and target visibility
 
@@ -770,7 +773,7 @@ estimation. Token padding is distinct from model execution: AMT compacts each
 sample before recurrence, and direct U-Net/GPT encoders process only native-size
 backbone chunks.
 
-During complete segmentation inference, every transcript is processed from beginning to end in non-overlapping model-sized chunks. The reverse-complement pass uses the same chunking, its channels and coordinates are restored, and the forward/RC logits are averaged.
+During complete segmentation inference, every transcript is processed from beginning to end in non-overlapping model-sized chunks. For non-GPT models that request reverse-complement averaging, the reverse-complement pass uses the same chunking, its channels and coordinates are restored, and the forward/RC logits are averaged. GPT models always use only the original transcript orientation.
 
 ### Transcript-type dataset
 
@@ -848,13 +851,13 @@ All inference configs enforce:
 "batch_size": 1
 ```
 
-They also expose:
+Non-GPT inference configs also expose:
 
 ```json
 "use_reverse_complement": true
 ```
 
-Reverse-complement averaging is inference-only and defaults to on. Set it to `false` in an inference config for a forward-only run.
+Reverse-complement averaging is inference-only and defaults to on for non-GPT models. Set it to `false` in a non-GPT inference config for a forward-only run. Generated GPT evaluation configs set it to `false`, and the runtime enforces forward-only GPT inference even if an older config requests `true`.
 
 All checked-in inference/evaluation JSON templates live under `experiments/`.
 The task-level `configs/` trees contain training configs only. A training run
@@ -937,8 +940,11 @@ Important inference switches:
 
 `use_cds_heuristic` defaults to on. It replaces the model's directly decoded
 mRNA CDS with the benchmark-compatible longest complete ORF inferred from
-predicted exons. Set it to `false` to keep the model's direct CDS track. GPT
-models do not emit a CDS class, so their CDS annotations require this heuristic.
+predicted exons. Non-GPT models may set it to `false` to keep the model's direct
+CDS track. GPT models do not emit a CDS class, so their inference always forces
+this heuristic on, even if an older config requests `false`. For negative-strand
+transcripts, the heuristic internally reverse-complements the sequence to find
+the ORF; that strand-orientation step is not a second model inference pass.
 
 The script writes a GFF3 file and runs the official segmentation metric when `true_gff` is non-null.
 

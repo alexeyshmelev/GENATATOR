@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
+
+import numpy as np
 
 try:
     import torch
 
-    from genatator_core.infer_common import model_logits_for_inference
+    from genatator_core.infer_common import (
+        _predict_once,
+        model_logits_for_inference,
+        predict_dataset_logits,
+    )
 except ImportError:
     torch = None
     model_logits_for_inference = None
@@ -53,6 +60,61 @@ class GPTInferenceDispatchTests(unittest.TestCase):
         )
         self.assertEqual(tuple(logits.shape), (1, 2, 5))
 
+    def test_gpt_inference_forces_forward_only_even_when_rc_is_requested(self) -> None:
+        cfg = {
+            "model": {"family": "gpt"},
+            "inference": {"use_reverse_complement": True},
+        }
+        expected = [{"row": "forward"}]
+        with patch(
+            "genatator_core.infer_common._predict_once",
+            return_value=expected,
+        ) as predict_once:
+            rows = predict_dataset_logits(cfg, task="segmentation", device="cpu")
+
+        self.assertIs(rows, expected)
+        predict_once.assert_called_once()
+        args, kwargs = predict_once.call_args
+        self.assertEqual(args[1:3], ("segmentation", "cpu"))
+        self.assertIs(kwargs["reverse_complement"], False)
+
+    def test_private_gpt_inference_path_rejects_reverse_complement(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "forbidden for GPT segmentation"):
+            _predict_once(
+                {"model": {"family": "gpt"}},
+                task="segmentation",
+                device="cpu",
+                reverse_complement=True,
+            )
+
+    def test_non_gpt_inference_still_honors_reverse_complement(self) -> None:
+        metadata = object()
+        forward = [
+            {
+                "metadata": metadata,
+                "local_start": 0,
+                "logits": np.asarray([[1.0]], dtype=np.float32),
+            }
+        ]
+        reverse = [
+            {
+                "metadata": metadata,
+                "local_start": 0,
+                "logits": np.asarray([[3.0]], dtype=np.float32),
+            }
+        ]
+        cfg = {
+            "model": {"family": "unet"},
+            "inference": {"use_reverse_complement": True},
+        }
+        with patch(
+            "genatator_core.infer_common._predict_once",
+            side_effect=(forward, reverse),
+        ) as predict_once:
+            rows = predict_dataset_logits(cfg, task="segmentation", device="cpu")
+
+        self.assertEqual(predict_once.call_count, 2)
+        np.testing.assert_allclose(rows[0]["logits"], [[2.0]])
 
 if __name__ == "__main__":
     unittest.main()

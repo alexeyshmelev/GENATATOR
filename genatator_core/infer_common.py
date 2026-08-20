@@ -11,6 +11,10 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from .data import GenatatorCollator, GenatatorDataset, make_tokenizer
+from .inference_policy import (
+    inference_uses_reverse_complement,
+    is_gpt_segmentation,
+)
 from .model_builders import build_model, load_finetuned_weights
 from .train_common import dataset_family_from_model, prepare_nucleotide_tokenizer
 
@@ -220,7 +224,12 @@ def model_logits_for_inference(
     output = model(**tensor_batch)
     return output["logits"] if isinstance(output, dict) else output.logits
 
+
 def _predict_once(cfg: Dict[str, Any], task: str, device: str, reverse_complement: bool) -> List[Dict[str, Any]]:
+    if reverse_complement and is_gpt_segmentation(cfg.get("model", {}), task):
+        raise RuntimeError(
+            "Reverse-complement inference is forbidden for GPT segmentation models"
+        )
     model, tokenizer, nucleotide_tokenizer = prepare_model(cfg, task, device)
     data_cfg = dict(cfg["dataset"])
     data_cfg["model_family"] = dataset_family_from_model(cfg["model"], task=task)
@@ -289,7 +298,7 @@ def _predict_once(cfg: Dict[str, Any], task: str, device: str, reverse_complemen
 
 
 def predict_dataset_logits(cfg: Dict[str, Any], task: str, device: str = "cuda") -> List[Dict[str, Any]]:
-    use_rc = bool(cfg.get("inference", {}).get("use_reverse_complement", True))
+    use_rc = inference_uses_reverse_complement(cfg, task)
     rows = _predict_once(copy.deepcopy(cfg), task, device, reverse_complement=False)
     if not use_rc:
         return rows

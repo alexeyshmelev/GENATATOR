@@ -8,6 +8,7 @@ from genatator_core.config import load_json
 from genatator_core.evaluate_gff import evaluate_segmentation
 from genatator_core.gff import labels_to_segmentation_record, write_segmentation_gff
 from genatator_core.infer_common import predict_dataset_logits, sigmoid
+from genatator_core.inference_policy import segmentation_uses_cds_heuristic
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -20,7 +21,7 @@ rows = predict_dataset_logits(cfg, task="segmentation", device=cfg.get("inferenc
 records = []
 force_nonempty = cfg.get("inference", {}).get("empty_segment_policy", "error") == "best_interval"
 coordinate_mode = cfg.get("inference", {}).get("coordinate_mode", "transcript")
-use_cds_heuristic = bool(cfg.get("inference", {}).get("use_cds_heuristic", True))
+use_cds_heuristic = segmentation_uses_cds_heuristic(cfg)
 logger.info(
     "Segmentation decoding | coordinate_mode=%s use_cds_heuristic=%s",
     coordinate_mode,
