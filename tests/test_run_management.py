@@ -328,6 +328,7 @@ class RunManagementTests(unittest.TestCase):
             self.assertEqual(evaluation["inference"]["batch_size"], 1)
             self.assertTrue(evaluation["inference"]["use_reverse_complement"])
             self.assertTrue(evaluation["inference"]["use_cds_heuristic"])
+            self.assertNotIn("num_transcripts", evaluation["inference"])
             self.assertEqual(evaluation["inference"]["true_gff"], "/tmp/reference.gff")
 
             manager = EvaluationConfigManager(cfg, task="segmentation", run_dir=run_dir)
@@ -357,6 +358,7 @@ class RunManagementTests(unittest.TestCase):
 
             self.assertFalse(evaluation["inference"]["use_reverse_complement"])
             self.assertTrue(evaluation["inference"]["use_cds_heuristic"])
+            self.assertEqual(evaluation["inference"]["num_transcripts"], -1)
 
     def test_finding_evaluation_uses_test_split_and_fixed_chromosome(self):
         with tempfile.TemporaryDirectory() as temporary:

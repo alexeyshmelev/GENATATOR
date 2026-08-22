@@ -694,6 +694,7 @@ def build_evaluation_config(cfg: Dict[str, Any], *, task: str, run_dir: str | Pa
             # GPT decoding is autoregressive and directional. It must run once
             # in the original transcript orientation, never as an RC ensemble.
             common["use_reverse_complement"] = False
+            common["num_transcripts"] = -1
         common.update(
             {
                 "use_cds_heuristic": True,

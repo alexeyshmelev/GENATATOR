@@ -925,9 +925,52 @@ Set the edge and region checkpoint paths in their respective `inference.checkpoi
 
 ### Segmentation
 
+For non-GPT models, or when exactly one GPU is visible, run:
+
 ```bash
 python segmentation/infer.py --config runs/.../evaluation_config.json
 ```
+
+GPT-head inference must be launched with one process per visible GPU. The
+recommended command automatically uses every GPU exposed through
+`CUDA_VISIBLE_DEVICES`:
+
+```bash
+torchrun --standalone --nproc_per_node=gpu \
+  segmentation/infer.py \
+  --config runs/.../evaluation_config.json
+```
+
+On a node with eight allocated GPUs, `--nproc_per_node=8` is an equivalent
+explicit setting. Each rank is bound to its own `cuda:<LOCAL_RANK>` device and
+keeps inference batch size one. Complete transcripts—not genes and not model
+windows—are distributed between ranks. Every chunk belonging to one long
+transcript stays on the same GPU; rank 0 restores the original transcript order,
+writes the single final GFF, and runs the optional metric. A plain `python`
+launch is rejected for a GPT head when multiple GPUs are visible, because it
+would otherwise leave all but GPU 0 unused.
+
+Generated GPT segmentation evaluation configs additionally contain the
+GPT-exclusive option:
+
+```json
+"num_transcripts": -1
+```
+
+`-1` means all transcript/isoform rows selected from the configured validation
+chromosome. A positive integer `X` selects the first `X` transcripts in the
+deterministic filtered dataset order and distributes them across the torchrun
+ranks. This counts transcripts, including separate isoforms of the same gene;
+it does not count unique genes. `0`, values below `-1`, booleans, and
+non-integers are rejected. `X` is also rejected when it exceeds the complete
+number of filtered transcripts available on the validation chromosome. Older
+GPT inference configs without this field behave as if it were `-1`. The option
+is invalid for non-GPT models.
+
+When a positive subset is used while `true_gff` still points to the complete
+chromosome reference, intentionally omitted transcripts are counted as missing
+predictions. For a subset timing or diagnostic run, set `true_gff` to `null`
+unless that full-reference comparison is intentional.
 
 Important inference switches:
 

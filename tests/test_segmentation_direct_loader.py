@@ -273,6 +273,76 @@ class SegmentationDirectLoaderTests(unittest.TestCase):
         self.assertEqual([chunk[3] for chunk in chunks], [0, 4, 8])
         self.assertEqual([chunk[1].shape for chunk in chunks], [(4, 5), (4, 5), (1, 5)])
 
+    def test_gpt_inference_shards_transcripts_before_building_chunks(self) -> None:
+        index = DirectParquetTranscriptIndex(
+            [Path("unused.parquet")],
+            [(0, 0, 0)] * 5,
+            has_status=True,
+        )
+
+        def row_from_disk(row_index: int, *, include_labels: bool = True):
+            sequence = "ACGTA"
+            row = {
+                "dna_sequence": sequence,
+                "metadata": self._metadata(
+                    f"tx_{row_index}",
+                    "shared_gene",
+                    "chr20",
+                    len(sequence),
+                ),
+            }
+            if include_labels:
+                row["labels"] = np.zeros((len(sequence), 5), dtype=np.float32)
+            return row
+
+        dataset = object.__new__(GenatatorDataset)
+        dataset.cfg = {
+            "_gpt_inference_num_transcripts": 5,
+            "_gpt_inference_rank": 1,
+            "_gpt_inference_world_size": 2,
+        }
+        dataset.for_inference = True
+        dataset.task = "segmentation"
+        dataset.full_transcript_chunks = True
+        dataset.row_indices = range(5)
+        dataset.raw = index
+        dataset.model_family = "nucleotide"
+        dataset.max_nucleotides = 2
+        dataset.reverse_complement = False
+        dataset.target_indices = [0, 1, 2, 3, 4]
+
+        with patch.object(index, "read_row", side_effect=row_from_disk):
+            dataset._apply_inference_transcript_selection()
+            dataset._build_transcript_indices()
+
+        self.assertEqual(dataset.inference_total_transcripts, 5)
+        self.assertEqual(dataset.inference_selected_transcripts, 5)
+        self.assertEqual(dataset.inference_assigned_ordinals, [1, 3])
+        self.assertEqual(dataset.row_indices, [1, 3])
+        self.assertEqual({window[0] for window in dataset.windows}, {1, 3})
+        self.assertEqual(
+            [window[0] for window in dataset.windows],
+            [1, 1, 1, 3, 3, 3],
+        )
+
+    def test_gpt_inference_rejects_more_than_the_filtered_chromosome(self) -> None:
+        dataset = object.__new__(GenatatorDataset)
+        dataset.cfg = {
+            "_gpt_inference_num_transcripts": 4,
+            "_gpt_inference_rank": 0,
+            "_gpt_inference_world_size": 1,
+        }
+        dataset.for_inference = True
+        dataset.task = "segmentation"
+        dataset.full_transcript_chunks = True
+        dataset.row_indices = range(3)
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "requested=4 available=3",
+        ):
+            dataset._apply_inference_transcript_selection()
+
     def test_transcript_type_keeps_the_existing_materialized_loader(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

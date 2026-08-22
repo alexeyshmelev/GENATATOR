@@ -37,3 +37,36 @@ def segmentation_uses_cds_heuristic(cfg: Dict[str, Any]) -> bool:
             )
         return True
     return requested
+
+
+def gpt_inference_num_transcripts(cfg: Dict[str, Any], task: str) -> int | None:
+    """Resolve the GPT-only standalone-inference transcript count.
+
+    ``-1`` means every transcript selected by the inference dataset filters.
+    Positive values select the first N transcript rows.  The dataset validates
+    the requested count against the complete filtered chromosome before any
+    per-rank sharding is applied.
+    """
+
+    inference_cfg = cfg.get("inference", {})
+    configured = "num_transcripts" in inference_cfg
+    if not is_gpt_segmentation(cfg.get("model", {}), task):
+        if configured:
+            raise RuntimeError(
+                "inference.num_transcripts is supported only for GPT "
+                "segmentation models"
+            )
+        return None
+
+    value = inference_cfg.get("num_transcripts", -1)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise RuntimeError(
+            "GPT inference.num_transcripts must be an integer equal to -1 or "
+            f"greater than zero, got {value!r}"
+        )
+    if value == -1 or value > 0:
+        return int(value)
+    raise RuntimeError(
+        "GPT inference.num_transcripts must be -1 or greater than zero, "
+        f"got {value}"
+    )

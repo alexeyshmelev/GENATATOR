@@ -12,6 +12,7 @@ from tqdm.auto import tqdm
 
 from .data import GenatatorCollator, GenatatorDataset, make_tokenizer
 from .inference_policy import (
+    gpt_inference_num_transcripts,
     inference_uses_reverse_complement,
     is_gpt_segmentation,
 )
@@ -225,7 +226,15 @@ def model_logits_for_inference(
     return output["logits"] if isinstance(output, dict) else output.logits
 
 
-def _predict_once(cfg: Dict[str, Any], task: str, device: str, reverse_complement: bool) -> List[Dict[str, Any]]:
+def _predict_once(
+    cfg: Dict[str, Any],
+    task: str,
+    device: str,
+    reverse_complement: bool,
+    *,
+    rank: int = 0,
+    world_size: int = 1,
+) -> List[Dict[str, Any]]:
     if reverse_complement and is_gpt_segmentation(cfg.get("model", {}), task):
         raise RuntimeError(
             "Reverse-complement inference is forbidden for GPT segmentation models"
@@ -234,6 +243,28 @@ def _predict_once(cfg: Dict[str, Any], task: str, device: str, reverse_complemen
     data_cfg = dict(cfg["dataset"])
     data_cfg["model_family"] = dataset_family_from_model(cfg["model"], task=task)
     data_cfg["reverse_complement"] = reverse_complement
+    transcript_count = gpt_inference_num_transcripts(cfg, task)
+    if transcript_count is not None:
+        conflicting_limits = [
+            key
+            for key in (
+                "max_rows",
+                "max_windows",
+                "streaming_max_rows",
+                "streaming_max_scanned_rows",
+                "streaming_trim_rows",
+            )
+            if data_cfg.get(key) not in (None, 0)
+        ]
+        if conflicting_limits:
+            raise RuntimeError(
+                "GPT inference.num_transcripts must be validated against the "
+                "complete filtered chromosome and cannot be combined with "
+                f"dataset debug limits: {conflicting_limits}"
+            )
+        data_cfg["_gpt_inference_num_transcripts"] = transcript_count
+        data_cfg["_gpt_inference_rank"] = int(rank)
+        data_cfg["_gpt_inference_world_size"] = int(world_size)
     dataset = GenatatorDataset(data_cfg, task=task, tokenizer=tokenizer, nucleotide_tokenizer=nucleotide_tokenizer, for_inference=True)
     configured_batch_size = int(cfg.get("inference", {}).get("batch_size", 1))
     if configured_batch_size != 1:
@@ -293,16 +324,133 @@ def _predict_once(cfg: Dict[str, Any], task: str, device: str, reverse_complemen
                         "logits": row_logits,
                     })
     if task == "segmentation" and bool(data_cfg.get("full_transcript_chunks", False)):
-        return aggregate_full_segmentation_chunks(rows)
+        gathered = aggregate_full_segmentation_chunks(rows)
+        if transcript_count is not None:
+            ordinals = dataset.inference_assigned_ordinals or []
+            selected_total = dataset.inference_selected_transcripts
+            if selected_total is None or len(gathered) != len(ordinals):
+                raise RuntimeError(
+                    "GPT inference transcript aggregation changed the assigned "
+                    "transcript count: "
+                    f"assigned={len(ordinals)} gathered={len(gathered)}"
+                )
+            for row, ordinal in zip(gathered, ordinals):
+                row["_inference_transcript_ordinal"] = int(ordinal)
+                row["_inference_selected_transcripts"] = int(selected_total)
+        return gathered
     return rows
 
 
-def predict_dataset_logits(cfg: Dict[str, Any], task: str, device: str = "cuda") -> List[Dict[str, Any]]:
+def merge_rank_strided_results(
+    rank_results: List[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """Restore deterministic dataset order after rank-strided transcript work."""
+
+    if not rank_results:
+        return []
+    world_size = len(rank_results)
+    flattened = [row for results in rank_results for row in results]
+    tagged = ["_inference_transcript_ordinal" in row for row in flattened]
+    if any(tagged) and not all(tagged):
+        raise RuntimeError(
+            "Distributed GPT inference results mixed tagged and untagged transcripts"
+        )
+
+    if flattened and all(tagged):
+        selected_totals = {
+            int(row["_inference_selected_transcripts"]) for row in flattened
+        }
+        if len(selected_totals) != 1:
+            raise RuntimeError(
+                "Distributed GPT inference ranks disagree on the selected "
+                f"transcript count: {sorted(selected_totals)}"
+            )
+        total = selected_totals.pop()
+        for rank, results in enumerate(rank_results):
+            expected_ordinals = list(range(rank, total, world_size))
+            actual_ordinals = [
+                int(row["_inference_transcript_ordinal"]) for row in results
+            ]
+            if actual_ordinals != expected_ordinals:
+                raise RuntimeError(
+                    "Distributed GPT inference rank shard is incomplete or out "
+                    f"of order: rank={rank} expected={expected_ordinals} "
+                    f"actual={actual_ordinals}"
+                )
+        merged = sorted(
+            flattened,
+            key=lambda row: int(row["_inference_transcript_ordinal"]),
+        )
+        cleaned: List[Dict[str, Any]] = []
+        for row in merged:
+            item = dict(row)
+            item.pop("_inference_transcript_ordinal", None)
+            item.pop("_inference_selected_transcripts", None)
+            cleaned.append(item)
+        return cleaned
+
+    total = len(flattened)
+    expected_lengths = [len(range(rank, total, world_size)) for rank in range(world_size)]
+    actual_lengths = [len(results) for results in rank_results]
+    if actual_lengths != expected_lengths:
+        raise RuntimeError(
+            "Distributed GPT inference rank shards are not a complete strided "
+            f"partition: expected_lengths={expected_lengths} actual_lengths={actual_lengths}"
+        )
+
+    merged: List[Dict[str, Any]] = []
+    for position in range(max(actual_lengths, default=0)):
+        for results in rank_results:
+            if position < len(results):
+                merged.append(results[position])
+    if len(merged) != total:
+        raise RuntimeError(
+            "Distributed GPT inference result merge changed the transcript count: "
+            f"before={total} after={len(merged)}"
+        )
+    return merged
+
+
+def predict_dataset_logits(
+    cfg: Dict[str, Any],
+    task: str,
+    device: str = "cuda",
+    *,
+    rank: int = 0,
+    world_size: int = 1,
+) -> List[Dict[str, Any]]:
+    rank = int(rank)
+    world_size = int(world_size)
+    if world_size < 1 or rank < 0 or rank >= world_size:
+        raise RuntimeError(
+            f"Invalid inference rank topology: rank={rank} world_size={world_size}"
+        )
+    if world_size > 1 and not is_gpt_segmentation(cfg.get("model", {}), task):
+        raise RuntimeError(
+            "Distributed standalone inference is supported only for GPT "
+            "segmentation models"
+        )
+    # Validate the GPT-only public option before loading a checkpoint.
+    gpt_inference_num_transcripts(cfg, task)
     use_rc = inference_uses_reverse_complement(cfg, task)
-    rows = _predict_once(copy.deepcopy(cfg), task, device, reverse_complement=False)
+    rows = _predict_once(
+        copy.deepcopy(cfg),
+        task,
+        device,
+        reverse_complement=False,
+        rank=rank,
+        world_size=world_size,
+    )
     if not use_rc:
         return rows
-    rc_rows = _predict_once(copy.deepcopy(cfg), task, device, reverse_complement=True)
+    rc_rows = _predict_once(
+        copy.deepcopy(cfg),
+        task,
+        device,
+        reverse_complement=True,
+        rank=rank,
+        world_size=world_size,
+    )
     if len(rows) != len(rc_rows):
         raise RuntimeError(f"RC row count mismatch: forward={len(rows)} rc={len(rc_rows)}")
     merged = []

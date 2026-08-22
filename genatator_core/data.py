@@ -1929,6 +1929,10 @@ class GenatatorDataset(torch.utils.data.Dataset):
         self.windows: Sequence[Any] = []
         self.finding_window_groups: Dict[Tuple[str, str], List[int]] = {}
         self.finding_store: Optional[FindingChromosomeStore] = None
+        self.inference_total_transcripts: Optional[int] = None
+        self.inference_selected_transcripts: Optional[int] = None
+        self.inference_assigned_transcripts: Optional[int] = None
+        self.inference_assigned_ordinals: Optional[List[int]] = None
 
         if task.startswith("finding") and not self.prewindowed:
             groups = load_finding_parquet_groups(cfg)
@@ -1959,6 +1963,7 @@ class GenatatorDataset(torch.utils.data.Dataset):
             if task.startswith("finding"):
                 self._build_prewindowed_finding_indices()
             else:
+                self._apply_inference_transcript_selection()
                 self._build_transcript_indices()
 
         max_windows = cfg.get("max_windows")
@@ -2077,6 +2082,65 @@ class GenatatorDataset(torch.utils.data.Dataset):
         if self.model_family == "nucleotide":
             return make_windows(len(dna), self.max_nucleotides, 0.0)
         return self._bpe_full_transcript_chunk_bounds(dna)
+
+    def _apply_inference_transcript_selection(self) -> None:
+        """Limit and shard complete-transcript inference before chunk creation."""
+
+        requested = self.cfg.get("_gpt_inference_num_transcripts")
+        if requested is None:
+            return
+        if not self.for_inference or self.task != "segmentation":
+            raise RuntimeError(
+                "Internal GPT transcript selection is valid only for standalone "
+                "segmentation inference"
+            )
+        if not self.full_transcript_chunks:
+            raise RuntimeError(
+                "GPT transcript-limited/distributed inference requires "
+                "dataset.full_transcript_chunks=true"
+            )
+        if self.cfg.get("max_windows"):
+            raise RuntimeError(
+                "dataset.max_windows cannot be combined with GPT "
+                "inference.num_transcripts"
+            )
+
+        requested = int(requested)
+        rank = int(self.cfg.get("_gpt_inference_rank", 0))
+        world_size = int(self.cfg.get("_gpt_inference_world_size", 1))
+        if world_size < 1 or rank < 0 or rank >= world_size:
+            raise RuntimeError(
+                "Invalid GPT inference rank topology: "
+                f"rank={rank} world_size={world_size}"
+            )
+
+        total = len(self.row_indices)
+        selected = total if requested == -1 else requested
+        if selected > total:
+            raise RuntimeError(
+                "GPT inference.num_transcripts exceeds the number of transcripts "
+                "selected from the complete validation chromosome: "
+                f"requested={selected} available={total}"
+            )
+
+        original_row_indices = self.row_indices
+        selected_positions = list(range(rank, selected, world_size))
+        self.row_indices = [
+            original_row_indices[position] for position in selected_positions
+        ]
+        self.inference_total_transcripts = int(total)
+        self.inference_selected_transcripts = int(selected)
+        self.inference_assigned_transcripts = len(self.row_indices)
+        self.inference_assigned_ordinals = selected_positions
+        logger.info(
+            "[gpt.inference.transcripts] rank=%d world_size=%d available=%d "
+            "selected=%d assigned=%d ordering=filtered_dataset_row_order",
+            rank,
+            world_size,
+            total,
+            selected,
+            len(self.row_indices),
+        )
 
     def _build_transcript_indices(self) -> None:
         if isinstance(self.raw, DirectParquetTranscriptIndex) and not self.full_transcript_chunks:
