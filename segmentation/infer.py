@@ -60,7 +60,16 @@ def _distributed_runtime(cfg):
         torch.cuda.set_device(local_rank)
         device = f"cuda:{local_rank}"
         if not dist.is_initialized():
-            dist.init_process_group(backend="nccl", timeout=timedelta(hours=48))
+            if not dist.is_gloo_available():
+                raise RuntimeError(
+                    "Distributed GPT inference requires a PyTorch build with "
+                    "Gloo support for CPU result gathering"
+                )
+            # Every rank performs model inference independently on its assigned
+            # CUDA device. Only decoded CPU records are exchanged, so keep the
+            # control/result path on CPU instead of staging Python objects through
+            # NCCL and CUDA.
+            dist.init_process_group(backend="gloo", timeout=timedelta(hours=48))
     elif is_gpt and device.startswith("cuda") and torch.cuda.device_count() > 1:
         raise RuntimeError(
             "GPT inference detected multiple visible GPUs but was launched as one "

@@ -200,7 +200,7 @@ class GPTInferenceDispatchTests(unittest.TestCase):
                 [[row(0), row(3)], [row(1)], [row(2)]]
             )
 
-    def test_torchrun_rank_is_bound_to_its_local_gpu(self) -> None:
+    def test_torchrun_rank_uses_local_gpu_and_gloo_control_group(self) -> None:
         cfg = {
             "model": {"family": "gpt"},
             "inference": {"device": "cuda"},
@@ -217,13 +217,39 @@ class GPTInferenceDispatchTests(unittest.TestCase):
             patch("segmentation.infer.torch.cuda.device_count", return_value=4),
             patch("segmentation.infer.torch.cuda.set_device") as set_device,
             patch("segmentation.infer.dist.is_initialized", return_value=False),
+            patch("segmentation.infer.dist.is_gloo_available", return_value=True),
             patch("segmentation.infer.dist.init_process_group") as init_group,
         ):
             rank, world_size, device = _distributed_runtime(cfg)
 
         self.assertEqual((rank, world_size, device), (2, 4, "cuda:2"))
         set_device.assert_called_once_with(2)
-        self.assertEqual(init_group.call_args.kwargs["backend"], "nccl")
+        self.assertEqual(init_group.call_args.kwargs["backend"], "gloo")
+
+    def test_distributed_gpt_inference_requires_gloo_before_model_work(self) -> None:
+        cfg = {
+            "model": {"family": "gpt"},
+            "inference": {"device": "cuda"},
+        }
+        environment = {
+            "RANK": "0",
+            "WORLD_SIZE": "2",
+            "LOCAL_RANK": "0",
+            "LOCAL_WORLD_SIZE": "2",
+        }
+        with (
+            patch.dict(os.environ, environment, clear=True),
+            patch("segmentation.infer.torch.cuda.is_available", return_value=True),
+            patch("segmentation.infer.torch.cuda.device_count", return_value=2),
+            patch("segmentation.infer.torch.cuda.set_device"),
+            patch("segmentation.infer.dist.is_initialized", return_value=False),
+            patch("segmentation.infer.dist.is_gloo_available", return_value=False),
+            patch("segmentation.infer.dist.init_process_group") as init_group,
+            self.assertRaisesRegex(RuntimeError, "Gloo support"),
+        ):
+            _distributed_runtime(cfg)
+
+        init_group.assert_not_called()
 
     def test_plain_python_gpt_inference_rejects_unused_visible_gpus(self) -> None:
         cfg = {
