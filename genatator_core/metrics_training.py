@@ -133,13 +133,32 @@ def _safe_binary_roc_auc(
     return float(roc_auc_score(references, scores))
 
 
+def finding_auc_means(
+    metrics: Dict[str, float],
+    class_names: Sequence[str],
+    *,
+    prefix: str = "",
+) -> Dict[str, float]:
+    """Average all task channels equally, including undefined-channel zeros.
+
+    Consume the per-channel values from the same completed validation pass;
+    never average batch AUCs or pool the different output channels.
+    """
+    return {
+        f"{prefix}mean_{kind}": float(np.mean([
+            metrics[f"{prefix}{kind}_{name}"] for name in class_names
+        ]))
+        for kind in ("pr_auc", "roc_auc")
+    }
+
+
 def finding_pr_auc_metrics(
     eval_pred: Any,
     *,
     class_names: Sequence[str],
     task_name: str,
 ) -> Dict[str, float]:
-    """Compute ordered PR-AUC and ROC-AUC independently for each finding class.
+    """Compute per-class PR-AUC/ROC-AUC and their unweighted channel means.
 
     Edge channel order is ``TSS+``, ``TSS-``, ``PolyA+``, ``PolyA-``. Region
     channel order is ``intragenic+``, ``intragenic-``. Boundary targets are
@@ -161,6 +180,7 @@ def finding_pr_auc_metrics(
             references,
             scores,
         )
+    metrics.update(finding_auc_means(metrics, class_names))
     return metrics
 
 
@@ -253,13 +273,13 @@ def metric_names_for_task(task: str) -> tuple[str, ...]:
             metric
             for name in EDGE_CLASS_NAMES
             for metric in (f"pr_auc_{name}", f"roc_auc_{name}")
-        )
+        ) + ("mean_pr_auc", "mean_roc_auc")
     if task == "finding_region":
         return tuple(
             metric
             for name in REGION_CLASS_NAMES
             for metric in (f"pr_auc_{name}", f"roc_auc_{name}")
-        )
+        ) + ("mean_pr_auc", "mean_roc_auc")
     if task == "segmentation":
         return ("interval_f1_exon", "interval_f1_CDS")
     if task == "transcript_type":

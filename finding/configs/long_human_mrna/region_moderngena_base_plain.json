@@ -52,8 +52,8 @@
     "save_steps": 2500,
     "save_total_limit": 3,
     "load_best_model_at_end": true,
-    "metric_for_best_model": "loss",
-    "greater_is_better": false,
+    "metric_for_best_model": "mean_roc_auc",
+    "greater_is_better": true,
     "dataloader_num_workers": 0,
     "bf16": true,
     "fp16": false,
@@ -62,7 +62,7 @@
     "save_safetensors": false,
     "logging_interval": 100,
     "eval_accumulation_steps": 1,
-    "patience": 10
+    "patience": 30
   },
   "task": "finding_region"
 }

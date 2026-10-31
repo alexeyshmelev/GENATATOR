@@ -36,7 +36,7 @@ class GPTExperimentConfigTests(unittest.TestCase):
             for family in FAMILIES
             for multi_token_prediction in MULTI_TOKEN_PREDICTIONS
         }
-        paths = sorted(EXPERIMENT_ROOT.glob("*.json"))
+        paths = sorted(EXPERIMENT_ROOT.glob("*_gpt_mtp_*.json"))
         self.assertEqual({path.name for path in paths}, expected_names)
         self.assertEqual(len(paths), 12)
 
@@ -91,7 +91,39 @@ class GPTExperimentConfigTests(unittest.TestCase):
 
         self.assertEqual(len(output_dirs), 12)
 
-    def test_all_moderngena_amt_training_configs_use_fp32(self) -> None:
+    def test_gpt2_configs_mirror_every_gemma_config(self) -> None:
+        output_dirs = set()
+        for root, expected_count in ((ROOT / "segmentation" / "configs", 14),
+                                     (EXPERIMENT_ROOT, 12)):
+            sources = [p for p in root.glob("*.json")
+                       if _load(p).get("model", {}).get("family") == "gpt"
+                       and "_gpt2" not in p.stem]
+            self.assertEqual(len(sources), expected_count)
+            expected_names = {p.name.replace("_gpt", "_gpt2") for p in sources}
+            self.assertEqual({p.name for p in root.glob("*_gpt2*.json")}, expected_names)
+            for source in sources:
+                original = _load(source)
+                mirror_path = source.with_name(source.name.replace("_gpt", "_gpt2"))
+                mirror = _load(mirror_path)
+                gpt = mirror["model"]["gpt"]
+                self.assertEqual(gpt.pop("decoder_type"), "gpt2")
+                max_nt = max(d.get("max_nucleotides") or int(
+                    d["max_bpe_tokens"] * d["average_bpe_token_length"]
+                ) for d in (original["train_dataset"], original["eval_dataset"]))
+                self.assertEqual(gpt.pop("max_position_embeddings"), max_nt)
+                output = mirror["training"]["output_dir"]
+                self.assertNotIn(output, output_dirs)
+                self.assertNotEqual(output, original["training"]["output_dir"])
+                output_dirs.add(output)
+                for field in ("output_dir", "custom_prefix"):
+                    self.assertEqual(mirror["training"][field],
+                                     original["training"][field].replace("_gpt", "_gpt2"))
+                    mirror["training"][field] = original["training"][field]
+                # Includes the complete encoder, losses, MTP horizons, datasets,
+                # precision, training and evaluation policy, not just dimensions.
+                self.assertEqual(mirror, original, mirror_path)
+
+    def test_moderngena_amt_training_precision_is_preserved(self) -> None:
         selected = []
         for task in ("finding", "segmentation", "transcript_type"):
             for path in sorted((ROOT / task / "configs").rglob("*.json")):
@@ -104,10 +136,10 @@ class GPTExperimentConfigTests(unittest.TestCase):
                 if model.get("backbone_kind") != "moderngena" or not uses_amt:
                     continue
                 selected.append(path)
-                self.assertIs(cfg["training"]["bf16"], False, path)
+                self.assertIs(cfg["training"]["bf16"], task == "finding", path)
                 self.assertIs(cfg["training"]["fp16"], False, path)
 
-        self.assertEqual(len(selected), 42)
+        self.assertEqual(len(selected), 44)
 
 
 if __name__ == "__main__":

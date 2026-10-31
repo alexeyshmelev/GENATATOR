@@ -25,6 +25,7 @@ from .metrics_training import (
     SEGMENTATION_CLASS_INDEX,
     _safe_binary_average_precision,
     _safe_binary_roc_auc,
+    finding_auc_means,
     metric_for_task,
     metric_names_for_task,
     segmentation_interval_predictions,
@@ -197,7 +198,7 @@ def filter_training_logs(logs: Dict[str, Any], task: str) -> Dict[str, Any]:
                 if task == "finding_edge"
                 else REGION_CLASS_NAMES
             )
-            allowed = {"eval_loss"} | {
+            allowed = {"eval_loss", "eval_mean_pr_auc", "eval_mean_roc_auc"} | {
                 metric
                 for class_name in class_names
                 for metric in (
@@ -491,6 +492,9 @@ class GenatatorTrainer(Trainer):
                 metrics[f"{metric_key_prefix}_roc_auc_{class_name}"] = float(
                     _safe_binary_roc_auc(refs, scores)
                 )
+            metrics.update(finding_auc_means(
+                metrics, state["class_names"], prefix=f"{metric_key_prefix}_"
+            ))
         elif task == "segmentation":
             for class_name, (tp, fp, fn) in state["counts"].items():
                 metrics[f"{metric_key_prefix}_interval_f1_{class_name}"] = float(f1_from_counts(tp, fp, fn))

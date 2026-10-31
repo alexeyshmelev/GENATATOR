@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Encoder adapters for the T5Gemma nucleotide segmentation head."""
+"""Encoder adapters for the Gemma and GPT-2 nucleotide segmentation heads."""
 
 from typing import Any, Dict
 
@@ -10,7 +10,7 @@ from transformers.modeling_outputs import TokenClassifierOutput
 
 from .amt_models import AMTTokenClassifier
 from .backbones import HiddenStateBackbone
-from .gpt_head import T5GemmaSegmentationHead
+from .gpt_head import T5GemmaSegmentationHead, build_segmentation_head
 from .legacy_rmt import RMTEncoderForLetterLevelTokenClassificationUNETsegmentedRepeater
 
 
@@ -241,7 +241,7 @@ class GenaModernGPTSegmentationModel(_GPTSegmentationModelBase):
         self.nucleotide_embedding = nn.Embedding(
             int(nucleotide_vocab_size), self.hidden_size
         )
-        self.gpt_head = T5GemmaSegmentationHead(
+        self.gpt_head = build_segmentation_head(
             encoder_dim=self.hidden_size * 2,
             num_labels=int(num_labels),
             **dict(gpt_config or {}),
@@ -330,7 +330,7 @@ class RMTGPTSegmentationModel(_GPTSegmentationModelBase):
         self.nucleotide_embedding = nn.Embedding(
             int(nucleotide_vocab_size), self.hidden_size
         )
-        self.gpt_head = T5GemmaSegmentationHead(
+        self.gpt_head = build_segmentation_head(
             encoder_dim=self.hidden_size * 2,
             num_labels=int(num_labels),
             **dict(gpt_config or {}),
@@ -419,7 +419,7 @@ class AMTGPTSegmentationModel(_GPTSegmentationModelBase):
         self.nucleotide_embedding = nn.Embedding(
             int(nucleotide_vocab_size), self.hidden_size
         )
-        self.gpt_head = T5GemmaSegmentationHead(
+        self.gpt_head = build_segmentation_head(
             encoder_dim=self.hidden_size * 2,
             num_labels=int(num_labels),
             **dict(gpt_config or {}),
@@ -492,7 +492,7 @@ class CaduceusGPTSegmentationModel(_GPTSegmentationModelBase):
         self.nucleotide_embedding = nn.Embedding(
             int(nucleotide_vocab_size), self.hidden_size
         )
-        self.gpt_head = T5GemmaSegmentationHead(
+        self.gpt_head = build_segmentation_head(
             encoder_dim=self.hidden_size * 2,
             num_labels=int(num_labels),
             **dict(gpt_config or {}),

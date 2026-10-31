@@ -130,9 +130,9 @@ def _dicts(value):
 
 def test_use_denom_is_explicit_in_every_amt_config_only() -> None:
     expected_by_root = {
-        "experiments": 1408,
+        "experiments": 1411,
         "finding": 64,
-        "segmentation": 8,
+        "segmentation": 12,
         "transcript_type": 12,
     }
     actual_by_root = {name: 0 for name in expected_by_root}
@@ -168,13 +168,18 @@ def test_all_shipped_training_configs_use_requested_contracts() -> None:
             assert cfg.get("true_gff") == "datasets/chr20.gff", path
             assert training.get("custom_prefix") is not None, path
             assert training["max_steps"] == 500_000, path
-            assert training["eval_steps"] == 5000, path
-            assert training["save_steps"] == 5000, path
+            expected_interval = 2500 if task == "finding" else 5000
+            assert training["eval_steps"] == expected_interval, path
+            assert training["save_steps"] == expected_interval, path
             expected_patience = (
                 10
                 if task == "finding" and path.parent.name in FINDING_PATIENCE_10_SETUPS
                 else 25
             )
+            if task == "finding":
+                expected_patience *= 3
+                assert training["metric_for_best_model"] == "mean_roc_auc", path
+                assert training["greater_is_better"] is True, path
             assert training["patience"] == expected_patience, path
             assert training["automatic_restart"] is True, path
             assert "eval_interval" not in training, path
@@ -231,7 +236,7 @@ def test_all_shipped_training_configs_use_requested_contracts() -> None:
             if is_gpt:
                 assert task == "segmentation", path
                 assert "vocab_size" in model, path
-                assert model["gpt"] == {
+                expected_gpt = {
                     "context_size": 8192,
                     "encoder_lookahead": 8192,
                     "decoder_hidden_size": 256,
@@ -243,7 +248,18 @@ def test_all_shipped_training_configs_use_requested_contracts() -> None:
                     "attention_dropout": 0.0,
                     "add_encoder_to_decoder_input": True,
                     "multi_token_prediction": 3,
-                }, path
+                }
+                if path.stem.endswith("_gpt2"):
+                    expected_gpt.update({
+                        "decoder_type": "gpt2",
+                        "max_position_embeddings": max(
+                            int(dataset.get("max_nucleotides") or (
+                                dataset["max_bpe_tokens"] * dataset["average_bpe_token_length"]
+                            ))
+                            for dataset in (cfg["train_dataset"], cfg["eval_dataset"])
+                        ),
+                    })
+                assert model["gpt"] == expected_gpt, path
 
             length_field, expected_length = _expected_context(task, path, model)
             for dataset_name in ("train_dataset", "eval_dataset"):
@@ -328,9 +344,12 @@ def test_config_matrices_and_setup_semantics_are_exact() -> None:
     segmentation_expected |= {
         f"{backbone}_{variant}.json"
         for backbone in backbones
-        for variant in ("gpt", "rmt_gpt", "amt_gpt")
+        for variant in ("gpt", "rmt_gpt", "amt_gpt", "gpt2", "rmt_gpt2", "amt_gpt2")
     }
-    segmentation_expected |= {"caduceus_ph_gpt.json", "caduceus_ps_gpt.json"}
+    segmentation_expected |= {
+        f"caduceus_{kind}_{decoder}.json"
+        for kind in ("ph", "ps") for decoder in ("gpt", "gpt2")
+    }
     segmentation_actual = {
         path.name for path, _ in _training_paths("segmentation")
     }
@@ -439,6 +458,26 @@ def test_massive_finding_experiments_are_exact_cartesian_transfers() -> None:
 
 
 class ShippedConfigSchemaTests(unittest.TestCase):
+    def test_every_finding_training_config_selects_highest_mean_roc_auc(self) -> None:
+        counts = {}
+        for root in (REPO / "finding", REPO / "experiments"):
+            for path in root.rglob("*.json"):
+                cfg = _load(path)
+                if cfg.get("task") not in {"finding_edge", "finding_region"}:
+                    continue
+                if "training" not in cfg:
+                    continue
+                training = cfg["training"]
+                self.assertEqual(training["metric_for_best_model"], "mean_roc_auc", path)
+                self.assertIs(training["greater_is_better"], True, path)
+                expected = 75 if path.parent.name == "long_multispecies_mrna_lncrna" else 30
+                self.assertEqual(training["patience"], expected, path)
+                counts[path.parent.name] = counts.get(path.parent.name, 0) + 1
+        self.assertEqual(counts, {
+            **{name: 44 for name in FINDING_SETUPS},
+            "long_human_mrna_lr1e-5_wd0": 1,
+        })
+
     def test_amt_use_denom_contract(self) -> None:
         test_use_denom_is_explicit_in_every_amt_config_only()
 

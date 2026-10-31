@@ -23,6 +23,7 @@ initialized shallow T5Gemma decoder.  Only offset 1 participates in inference.
 
 from contextlib import contextmanager
 from typing import Iterator
+import warnings
 
 import torch
 import torch.nn as nn
@@ -173,7 +174,7 @@ class T5GemmaSegmentationHead(nn.Module):
         self.add_encoder_to_decoder_input = add_encoder_to_decoder_input
 
         if decoder is None:
-            decoder = self._build_t5gemma_decoder(
+            decoder = self._build_decoder(
                 hidden_size=decoder_hidden_size,
                 intermediate_size=int(
                     decoder_intermediate_size
@@ -198,8 +199,7 @@ class T5GemmaSegmentationHead(nn.Module):
                     "Injected decoder hidden size does not match decoder_hidden_size: "
                     f"{actual_hidden} != {decoder_hidden_size}"
                 )
-            if not hasattr(decoder, "embed_tokens"):
-                raise RuntimeError("The T5Gemma decoder must expose embed_tokens for BOS")
+            self._decoder_token_embedding(decoder)
         self.decoder = decoder
         # Chunked teacher forcing still spans very long samples.  Checkpointing
         # decoder layers prevents all per-chunk layer activations from being
@@ -299,9 +299,20 @@ class T5GemmaSegmentationHead(nn.Module):
         config.decoder._attn_implementation = "sdpa"
         return T5GemmaDecoder(config.decoder)
 
+    def _build_decoder(self, **kwargs) -> nn.Module:
+        return self._build_t5gemma_decoder(**kwargs)
+
+    @staticmethod
+    def _decoder_token_embedding(decoder: nn.Module) -> nn.Module:
+        if hasattr(decoder, "embed_tokens"):
+            return decoder.embed_tokens
+        if hasattr(decoder, "get_input_embeddings"):
+            return decoder.get_input_embeddings()
+        raise RuntimeError("The GPT decoder must expose its token embedding for BOS")
+
     def _bos_embedding(self, *, device: torch.device) -> torch.Tensor:
         token_id = torch.tensor([[self.bos_token_id]], dtype=torch.long, device=device)
-        return self.decoder.embed_tokens(token_id)
+        return self._decoder_token_embedding(self.decoder)(token_id)
 
     @staticmethod
     def _teacher_self_attention_mask() -> dict[str, None]:
@@ -563,12 +574,19 @@ class T5GemmaSegmentationHead(nn.Module):
                 logits_chunks[offset_index].append(chunk_logits)
         return tuple(torch.cat(chunks, dim=1) for chunks in logits_chunks)
 
+    def _check_generation_length(self, length: int) -> None:
+        """Hook for decoders whose position representation has a hard limit."""
+
+    def _prepare_generation_cache(self, past_key_values):
+        return past_key_values
+
     def _generate_single(self, projected_encoder: torch.Tensor) -> torch.Tensor:
         if projected_encoder.ndim != 3 or projected_encoder.shape[0] != 1:
             raise RuntimeError("Generation requires one unpadded sample shaped [1, N, H]")
         length = int(projected_encoder.shape[1])
         if length == 0:
             raise RuntimeError("The GPT head received an empty nucleotide sequence")
+        self._check_generation_length(length)
 
         previous_prediction: torch.Tensor | None = None
         past_key_values = self._new_generation_cache(
@@ -578,6 +596,7 @@ class T5GemmaSegmentationHead(nn.Module):
         previous_encoder_bounds: tuple[int, int] | None = None
         logits: list[torch.Tensor] = []
         for position in range(length):
+            past_key_values = self._prepare_generation_cache(past_key_values)
             if previous_prediction is None:
                 decoder_input = self._bos_embedding(device=projected_encoder.device)
             else:
@@ -859,6 +878,137 @@ class T5GemmaSegmentationHead(nn.Module):
         return logits
 
 
+class GPT2SegmentationHead(T5GemmaSegmentationHead):
+    """Stock GPT-2 with native cross-attention and bounded, continuous history.
+
+    ``context_size`` bounds retained decoder K/V, not absolute positions.
+    ``max_position_embeddings`` must cover the entire generated sample.  Position
+    IDs never wrap or reset during generation.  Teacher forcing, MTP heads and
+    loss alignment are inherited unchanged from the Gemma experiments.
+    """
+
+    def __init__(self, *args, max_position_embeddings: int | None = None, **kwargs):
+        if max_position_embeddings is None or int(max_position_embeddings) <= 0:
+            raise RuntimeError(
+                "GPT-2 requires explicit positive max_position_embeddings covering "
+                "the full nucleotide sample; rolling context does not extend its "
+                "learned absolute position table"
+            )
+        self.max_position_embeddings = int(max_position_embeddings)
+        context_size = int(kwargs.get("context_size", DEFAULT_GPT_CONTEXT_SIZE))
+        if self.max_position_embeddings < context_size:
+            raise RuntimeError("GPT-2 max_position_embeddings must be >= context_size")
+        if self.max_position_embeddings > context_size:
+            warnings.warn(
+                "GPT-2 preserves Gemma's chunk-local teacher-forcing positions: "
+                "learned position rows >= context_size receive no teacher-forcing signal, "
+                "although continuous generation uses them. No position reset or "
+                "training-policy change is applied.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        super().__init__(*args, **kwargs)
+
+    def _build_decoder(
+        self, *, hidden_size, intermediate_size, num_layers, num_attention_heads,
+        num_key_value_heads, context_size, dropout_rate, attention_dropout,
+    ) -> nn.Module:
+        from transformers import GPT2Config, GPT2Model
+
+        if intermediate_size <= 0:
+            raise RuntimeError("decoder_intermediate_size must be positive")
+        if num_key_value_heads != num_attention_heads:
+            raise RuntimeError("Stock GPT-2 requires num_key_value_heads == num_attention_heads")
+        # Stock GPT-2 allocates a full square boolean causal buffer for both
+        # attention modules in every layer, even when SDPA is selected.
+        causal_buffer_bytes = 2 * num_layers * self.max_position_embeddings ** 2
+        if causal_buffer_bytes >= 1024 ** 3:
+            warnings.warn(
+                "Stock GPT-2 causal buffers alone require approximately "
+                f"{causal_buffer_bytes / 1024 ** 3:.2f} GiB per model at "
+                f"max_position_embeddings={self.max_position_embeddings}; rolling "
+                "K/V does not reduce this allocation. GPT-2 internals are unchanged.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        config = GPT2Config(
+            vocab_size=3,
+            n_positions=self.max_position_embeddings,
+            n_embd=hidden_size,
+            n_inner=intermediate_size,
+            n_layer=num_layers,
+            n_head=num_attention_heads,
+            add_cross_attention=True,
+            resid_pdrop=dropout_rate,
+            embd_pdrop=dropout_rate,
+            attn_pdrop=attention_dropout,
+            use_cache=True,
+            pad_token_id=0,
+            eos_token_id=1,
+            bos_token_id=2,
+            tie_word_embeddings=False,
+        )
+        config._attn_implementation = "sdpa"
+        return GPT2Model(config)
+
+    @staticmethod
+    def _teacher_self_attention_mask():
+        return None
+
+    @staticmethod
+    def _unmasked_cross_attention():
+        return None
+
+    @staticmethod
+    def _bounded_generation_self_attention_mask(**kwargs):
+        # Dynamic caches contain only real retained states, never padding.
+        return None
+
+    def _check_generation_length(self, length: int) -> None:
+        if length > self.max_position_embeddings:
+            raise RuntimeError(
+                f"GPT-2 sample length {length} exceeds max_position_embeddings="
+                f"{self.max_position_embeddings}. Learned absolute positions cannot "
+                "extrapolate; refusing to wrap positions, truncate the sample, or "
+                "reset decoder history. Configure an adequate position table "
+                "before training."
+            )
+
+    def _new_generation_cache(self, *, device, dtype):
+        return EncoderDecoderCache(DynamicCache(), DynamicCache())
+
+    def _prepare_generation_cache(self, past_key_values):
+        if past_key_values.self_attention_cache.get_seq_length() < self.context_size:
+            return past_key_values
+        # Retain the most recent C-1 states so the next query makes C.  The
+        # tensor values retain their original learned absolute positions and
+        # earlier cross-attention history; no state is recomputed or reset.
+        keep = self.context_size - 1
+        retained = tuple(
+            tuple(value[..., -keep:, :] if keep else value[..., :0, :] for value in layer)
+            for layer in past_key_values.self_attention_cache.to_legacy_cache()
+        )
+        return EncoderDecoderCache(
+            DynamicCache.from_legacy_cache(retained),
+            past_key_values.cross_attention_cache,
+        )
+
+    def _roll_cross_attention_cache(
+        self, past_key_values, projected_encoder, previous_bounds, current_bounds,
+    ):
+        # Native GPT-2 projects the new physical encoder window.  Invalidating
+        # only cross K/V prevents stale DNA states while preserving self history.
+        return EncoderDecoderCache(past_key_values.self_attention_cache, DynamicCache())
+
+
+def build_segmentation_head(*args, decoder_type: str = "t5gemma", **kwargs):
+    if decoder_type == "t5gemma":
+        return T5GemmaSegmentationHead(*args, **kwargs)
+    if decoder_type == "gpt2":
+        return GPT2SegmentationHead(*args, **kwargs)
+    raise RuntimeError(f"Unsupported GPT decoder_type: {decoder_type!r}")
+
+
 __all__ = [
     "DEFAULT_GPT_CONTEXT_SIZE",
     "DEFAULT_GPT_ENCODER_LOOKAHEAD",
@@ -868,4 +1018,6 @@ __all__ = [
     "INTRON_LABEL_INDEX",
     "UNAVAILABLE_TRACK_LOGIT",
     "T5GemmaSegmentationHead",
+    "GPT2SegmentationHead",
+    "build_segmentation_head",
 ]
