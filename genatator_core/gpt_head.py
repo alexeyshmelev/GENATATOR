@@ -879,34 +879,24 @@ class T5GemmaSegmentationHead(nn.Module):
 
 
 class GPT2SegmentationHead(T5GemmaSegmentationHead):
-    """Stock GPT-2 with native cross-attention and bounded, continuous history.
+    """Stock GPT-2 with learned positions local to a sliding input window.
 
-    ``context_size`` bounds retained decoder K/V, not absolute positions.
-    ``max_position_embeddings`` must cover the entire generated sample.  Position
-    IDs never wrap or reset during generation.  Teacher forcing, MTP heads and
-    loss alignment are inherited unchanged from the Gemma experiments.
+    The position table has exactly ``context_size`` entries. When the decoder
+    window slides, its retained inputs are recomputed at positions 0..C-1 with
+    fresh self- and cross-attention caches. Generated classes remain the input
+    history; BOS is inserted only once per sample. Non-overlapping teacher
+    forcing, MTP heads and losses are inherited unchanged from Gemma.
     """
 
     def __init__(self, *args, max_position_embeddings: int | None = None, **kwargs):
-        if max_position_embeddings is None or int(max_position_embeddings) <= 0:
-            raise RuntimeError(
-                "GPT-2 requires explicit positive max_position_embeddings covering "
-                "the full nucleotide sample; rolling context does not extend its "
-                "learned absolute position table"
-            )
-        self.max_position_embeddings = int(max_position_embeddings)
         context_size = int(kwargs.get("context_size", DEFAULT_GPT_CONTEXT_SIZE))
-        if self.max_position_embeddings < context_size:
-            raise RuntimeError("GPT-2 max_position_embeddings must be >= context_size")
-        if self.max_position_embeddings > context_size:
-            warnings.warn(
-                "GPT-2 preserves Gemma's chunk-local teacher-forcing positions: "
-                "learned position rows >= context_size receive no teacher-forcing signal, "
-                "although continuous generation uses them. No position reset or "
-                "training-policy change is applied.",
-                RuntimeWarning,
-                stacklevel=2,
+        if max_position_embeddings is not None and int(max_position_embeddings) != context_size:
+            raise RuntimeError(
+                "GPT-2 max_position_embeddings must equal context_size for "
+                "window-local positions; update the config rather than sizing "
+                "the position table for the full nucleotide sample"
             )
+        self.max_position_embeddings = context_size
         super().__init__(*args, **kwargs)
 
     def _build_decoder(
@@ -959,46 +949,76 @@ class GPT2SegmentationHead(T5GemmaSegmentationHead):
     def _unmasked_cross_attention():
         return None
 
-    @staticmethod
-    def _bounded_generation_self_attention_mask(**kwargs):
-        # Dynamic caches contain only real retained states, never padding.
-        return None
-
-    def _check_generation_length(self, length: int) -> None:
-        if length > self.max_position_embeddings:
-            raise RuntimeError(
-                f"GPT-2 sample length {length} exceeds max_position_embeddings="
-                f"{self.max_position_embeddings}. Learned absolute positions cannot "
-                "extrapolate; refusing to wrap positions, truncate the sample, or "
-                "reset decoder history. Configure an adequate position table "
-                "before training."
-            )
-
     def _new_generation_cache(self, *, device, dtype):
         return EncoderDecoderCache(DynamicCache(), DynamicCache())
 
-    def _prepare_generation_cache(self, past_key_values):
-        if past_key_values.self_attention_cache.get_seq_length() < self.context_size:
-            return past_key_values
-        # Retain the most recent C-1 states so the next query makes C.  The
-        # tensor values retain their original learned absolute positions and
-        # earlier cross-attention history; no state is recomputed or reset.
-        keep = self.context_size - 1
-        retained = tuple(
-            tuple(value[..., -keep:, :] if keep else value[..., :0, :] for value in layer)
-            for layer in past_key_values.self_attention_cache.to_legacy_cache()
-        )
-        return EncoderDecoderCache(
-            DynamicCache.from_legacy_cache(retained),
-            past_key_values.cross_attention_cache,
-        )
+    def _generate_single(self, projected_encoder: torch.Tensor) -> torch.Tensor:
+        if projected_encoder.ndim != 3 or projected_encoder.shape[0] != 1:
+            raise RuntimeError("Generation requires one unpadded sample shaped [1, N, H]")
+        length = int(projected_encoder.shape[1])
+        if length == 0:
+            raise RuntimeError("The GPT head received an empty nucleotide sequence")
 
-    def _roll_cross_attention_cache(
-        self, past_key_values, projected_encoder, previous_bounds, current_bounds,
-    ):
-        # Native GPT-2 projects the new physical encoder window.  Invalidating
-        # only cross K/V prevents stale DNA states while preserving self history.
-        return EncoderDecoderCache(past_key_values.self_attention_cache, DynamicCache())
+        previous_prediction: torch.Tensor | None = None
+        decoder_window: torch.Tensor | None = None
+        previous_encoder_bounds: tuple[int, int] | None = None
+        past_key_values = self._new_generation_cache(
+            device=projected_encoder.device, dtype=projected_encoder.dtype,
+        )
+        logits: list[torch.Tensor] = []
+        for position in range(length):
+            if previous_prediction is None:
+                decoder_input = self._bos_embedding(device=projected_encoder.device)
+            else:
+                decoder_input = self.label_embedding(previous_prediction)
+            decoder_input = decoder_input.to(dtype=projected_encoder.dtype)
+            if self.add_encoder_to_decoder_input and previous_prediction is not None:
+                decoder_input = decoder_input + projected_encoder[:, position - 1:position, :]
+            # Store input embeddings before GPT-2 adds its learned positions.
+            # Keep any optional DNA addition aligned to its original nucleotide.
+            decoder_window = (
+                decoder_input if decoder_window is None
+                else torch.cat((decoder_window, decoder_input), dim=1)[:, -self.context_size:, :]
+            )
+            encoder_bounds = self._encoder_window_bounds(position, length)
+            encoder_start, encoder_end = encoder_bounds
+            encoder_window = projected_encoder[:, encoder_start:encoder_end, :]
+            window_shifted = position >= self.context_size
+            encoder_changed = (
+                previous_encoder_bounds is not None
+                and encoder_bounds != previous_encoder_bounds
+            )
+            if window_shifted or encoder_changed:
+                # Reassigned positions invalidate every layer's old self K/V.
+                # All retained inputs also attend to the current encoder slice.
+                past_key_values = self._new_generation_cache(
+                    device=projected_encoder.device, dtype=projected_encoder.dtype,
+                )
+                inputs = decoder_window
+                cache_position = torch.arange(inputs.shape[1], device=inputs.device)
+            else:
+                # Before the first shift, cached positions and encoder states
+                # are still valid, so append only the newly generated input.
+                inputs = decoder_input
+                cache_position = torch.tensor([position], device=inputs.device)
+            decoder_output = self.decoder(
+                inputs_embeds=inputs,
+                attention_mask=None,
+                position_ids=cache_position.unsqueeze(0),
+                cache_position=cache_position,
+                encoder_hidden_states=encoder_window,
+                encoder_attention_mask=None,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            # Only the last query predicts the next class. Auxiliary MTP heads
+            # remain training-only and never provide generation feedback.
+            step_logits = self.classifier(decoder_output.last_hidden_state[:, -1:, :])
+            logits.append(step_logits)
+            previous_prediction = step_logits.argmax(dim=-1)
+            past_key_values = decoder_output.past_key_values
+            previous_encoder_bounds = encoder_bounds
+        return torch.cat(logits, dim=1)
 
 
 def build_segmentation_head(*args, decoder_type: str = "t5gemma", **kwargs):

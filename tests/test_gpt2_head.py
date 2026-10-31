@@ -10,7 +10,6 @@ try:
     import torch.nn as nn
     import torch.nn.functional as F
     from transformers import GPT2Model
-    from transformers.cache_utils import DynamicCache, EncoderDecoderCache
     from genatator_core.gpt_head import (
         EXON_LABEL_INDEX,
         INTRON_LABEL_INDEX,
@@ -37,11 +36,13 @@ def _config(**overrides):
         num_key_value_heads=2,
         context_size=3,
         encoder_lookahead=2,
-        max_position_embeddings=16,
+        max_position_embeddings=3,
         add_encoder_to_decoder_input=True,
         multi_token_prediction=3,
     )
     config.update(overrides)
+    if "max_position_embeddings" not in overrides:
+        config["max_position_embeddings"] = config["context_size"]
     return config
 
 
@@ -63,92 +64,87 @@ class GPT2HeadTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(19)
 
-    def test_stock_decoder_and_position_limit_fail_before_decoding(self):
-        head = _head(max_position_embeddings=7)
+    def test_stock_decoder_has_only_window_positions_and_accepts_long_samples(self):
+        head = _head()
         self.assertIs(type(head.decoder), GPT2Model)
         self.assertTrue(head.decoder.config.add_cross_attention)
-        self.assertEqual(tuple(head.decoder.wpe.weight.shape), (7, 8))
+        self.assertEqual(tuple(head.decoder.wpe.weight.shape), (3, 8))
         self.assertEqual(head.decoder.config._attn_implementation, "sdpa")
-        with patch.object(head.decoder, "forward", wraps=head.decoder.forward) as forward:
-            with self.assertRaisesRegex(RuntimeError, "refusing to wrap positions"):
-                head.generate(torch.randn(1, 8, 8), nucleotide_mask=torch.ones(1, 8))
-            forward.assert_not_called()
-        self.assertEqual(
-            head.generate(torch.randn(1, 7, 8), nucleotide_mask=torch.ones(1, 7)).shape,
-            (1, 7, 5),
-        )
+        for length in (1, 3, 4, 11):
+            self.assertEqual(
+                head.generate(torch.randn(1, length, 8), nucleotide_mask=torch.ones(1, length)).shape,
+                (1, length, 5),
+            )
+        with self.assertRaisesRegex(RuntimeError, "empty nucleotide sequence"):
+            head._generate_single(torch.empty(1, 0, 8))
 
     def test_factory_default_and_incompatible_settings(self):
         config = _config()
         config.pop("max_position_embeddings")
         self.assertIs(type(build_segmentation_head(8, **config)), T5GemmaSegmentationHead)
-        with self.assertRaisesRegex(RuntimeError, "explicit positive"):
-            build_segmentation_head(8, decoder_type="gpt2", **config)
+        gpt2 = build_segmentation_head(8, decoder_type="gpt2", **config)
+        self.assertEqual(gpt2.decoder.wpe.num_embeddings, config["context_size"])
         with self.assertRaisesRegex(RuntimeError, "Unsupported GPT decoder_type"):
             build_segmentation_head(8, decoder_type="other", **config)
-        with self.assertRaisesRegex(RuntimeError, "must be >= context_size"):
-            _head(max_position_embeddings=2)
+        for capacity in (2, 16, 270000):
+            with self.assertRaisesRegex(RuntimeError, "must equal context_size"):
+                _head(max_position_embeddings=capacity)
         with self.assertRaisesRegex(RuntimeError, "num_key_value_heads =="):
             _head(num_key_value_heads=1)
 
-    def test_long_position_and_native_allocation_warnings_precede_construction(self):
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            with patch("transformers.GPT2Model", side_effect=RuntimeError("construction stopped")):
-                with self.assertRaisesRegex(RuntimeError, "construction stopped"):
-                    GPT2SegmentationHead(8, **_config(max_position_embeddings=32768))
-        messages = [str(item.message) for item in caught]
-        self.assertTrue(any("receive no teacher-forcing signal" in message for message in messages))
-        self.assertTrue(any("4.00 GiB" in message for message in messages))
-
     @torch.no_grad() if torch is not None else lambda function: function
-    def test_rolling_generation_matches_full_cache_with_sliding_attention_reference(self):
-        # Independent reference keeps ALL self K/V and masks old entries.  It
-        # re-projects encoder K/V every step, catching stale-window cache errors.
-        for context_size in (1, 3):
-            with self.subTest(context_size=context_size):
-                head = _head(context_size=context_size).eval()
+    def test_generation_matches_uncached_window_local_reference(self):
+        # Independent reference rebuilds inputs from generated CLASS IDs and
+        # runs without any cache, even before the first window shift.
+        for context_size, lookahead, add_encoder in (
+            (1, 0, False), (1, 2, True), (3, 0, True),
+            (3, 2, True), (3, 2, False), (12, 2, True),
+        ):
+            with self.subTest(context_size=context_size, lookahead=lookahead, add_encoder=add_encoder):
+                head = _head(context_size=context_size, encoder_lookahead=lookahead,
+                             add_encoder_to_decoder_input=add_encoder).eval()
                 encoder = torch.randn(1, 11, 8)
                 actual = head._generate_single(encoder)
-                self_cache = DynamicCache()
-                previous = None
+                predictions = []
                 expected = []
                 for position in range(encoder.shape[1]):
-                    if previous is None:
-                        inputs = head.decoder.wte(torch.tensor([[2]]))
-                    else:
-                        inputs = head.label_embedding(previous) + encoder[:, position - 1:position]
+                    input_start = max(0, position - context_size + 1)
+                    inputs = []
+                    for original_position in range(input_start, position + 1):
+                        if original_position == 0:
+                            value = head.decoder.wte(torch.tensor([[2]]))
+                        else:
+                            value = head.label_embedding(predictions[original_position - 1])
+                            if add_encoder:
+                                value = value + encoder[:, original_position - 1:original_position]
+                        inputs.append(value)
+                    inputs = torch.cat(inputs, dim=1)
                     start = min(
                         max(0, position - context_size + 1),
-                        max(0, encoder.shape[1] - context_size - 2),
+                        max(0, encoder.shape[1] - context_size - lookahead),
                     )
-                    window = encoder[:, start:start + context_size + 2]
-                    attention_mask = torch.ones(1, position + 1)
-                    attention_mask[:, :max(0, position - context_size + 1)] = 0
+                    window = encoder[:, start:start + context_size + lookahead]
                     output = head.decoder(
                         inputs_embeds=inputs,
-                        position_ids=torch.tensor([[position]]),
-                        cache_position=torch.tensor([position]),
-                        attention_mask=attention_mask,
+                        position_ids=torch.arange(inputs.shape[1]).unsqueeze(0),
                         encoder_hidden_states=window,
-                        past_key_values=EncoderDecoderCache(self_cache, DynamicCache()),
-                        use_cache=True,
+                        use_cache=False,
                     )
-                    self_cache = output.past_key_values.self_attention_cache
-                    logits = head.classifier(output.last_hidden_state)
+                    logits = head.classifier(output.last_hidden_state[:, -1:, :])
                     expected.append(logits)
-                    previous = logits.argmax(-1)
+                    predictions.append(logits.argmax(-1))
                 torch.testing.assert_close(actual, torch.cat(expected, dim=1), atol=1e-6, rtol=1e-5)
 
-    def test_absolute_positions_feedback_bounded_history_and_sample_isolation(self):
+    def test_rebased_positions_recompute_caches_keep_predictions_and_sample_isolation(self):
         head = _head().eval()
         encoder = torch.randn(1, 11, 8)
         calls = []
 
         def record(module, args, kwargs):
             calls.append({
-                "position": kwargs["position_ids"].item(),
+                "positions": kwargs["position_ids"].tolist()[0],
                 "history": kwargs["past_key_values"].self_attention_cache.get_seq_length(),
+                "cross_history": kwargs["past_key_values"].cross_attention_cache.get_seq_length(),
                 "inputs": kwargs["inputs_embeds"].detach().clone(),
                 "encoder": kwargs["encoder_hidden_states"].detach().clone(),
             })
@@ -156,12 +152,14 @@ class GPT2HeadTests(unittest.TestCase):
         hook = head.decoder.register_forward_pre_hook(record, with_kwargs=True)
         actual = head.generate(encoder, nucleotide_mask=torch.ones(1, 11))
         hook.remove()
-        self.assertEqual([call["position"] for call in calls], list(range(11)))
-        self.assertEqual([call["history"] for call in calls], [0, 1] + [2] * 9)
+        self.assertEqual([call["positions"] for call in calls], [[0], [1], [2]] + [[0, 1, 2]] * 8)
+        self.assertEqual([call["history"] for call in calls], [0, 1, 2] + [0] * 8)
+        self.assertEqual([call["cross_history"] for call in calls], [0, 5, 5] + [0] * 8)
         torch.testing.assert_close(calls[0]["inputs"], head.decoder.wte(torch.tensor([[2]])))
         for position in range(1, 11):
-            previous = actual[:, position - 1:position, [INTRON_LABEL_INDEX, EXON_LABEL_INDEX]].argmax(-1)
-            expected = head.label_embedding(previous) + encoder[:, position - 1:position]
+            start = position if position < 3 else position - 2
+            previous = actual[:, start - 1:position, [INTRON_LABEL_INDEX, EXON_LABEL_INDEX]].argmax(-1)
+            expected = head.label_embedding(previous) + encoder[:, start - 1:position]
             torch.testing.assert_close(calls[position]["inputs"], expected)
         torch.testing.assert_close(calls[3]["encoder"], encoder[:, 1:6])
         torch.testing.assert_close(calls[-1]["encoder"], encoder[:, -5:])
@@ -204,8 +202,35 @@ class GPT2HeadTests(unittest.TestCase):
                 self.assertGreater(classifier.weight.grad.abs().sum(), 0)
             else:
                 self.assertEqual(classifier.weight.grad.abs().sum(), 0)
-        # Preserve the existing chunk-local teacher-forcing position policy.
-        self.assertEqual(head.decoder.wpe.weight.grad[head.context_size:].abs().sum(), 0)
+        # Every entry in the local position table receives a training signal.
+        self.assertTrue((head.decoder.wpe.weight.grad.abs().sum(dim=-1) > 0).all())
+
+    def test_teacher_forcing_keeps_nonoverlapping_chunks_bos_and_all_query_losses(self):
+        self.assertIs(GPT2SegmentationHead._teacher_forced_single,
+                      T5GemmaSegmentationHead._teacher_forced_single)
+        head = _head(multi_token_prediction=3).train()
+        encoder = torch.randn(1, 8, 8)
+        targets = torch.tensor([[0, 1, 1, 0, 1, 0, 1, 1]])
+        calls = []
+
+        def record(module, args, kwargs):
+            calls.append(kwargs)
+
+        hook = head.decoder.register_forward_pre_hook(record, with_kwargs=True)
+        outputs = head._teacher_forced_single(encoder, targets)
+        hook.remove()
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(outputs), 3)
+        for output in outputs:
+            self.assertEqual(output.shape, (1, 8, 2))
+        for call, start, end in zip(calls, (0, 3, 6), (3, 6, 8)):
+            self.assertFalse(call["use_cache"])
+            self.assertNotIn("past_key_values", call)
+            self.assertEqual(call["position_ids"].tolist(), [list(range(end - start))])
+            torch.testing.assert_close(call["inputs_embeds"][:, :1], head._bos_embedding(device=encoder.device))
+            expected = head.label_embedding(targets[:, start:end - 1]) + encoder[:, start:end - 1]
+            torch.testing.assert_close(call["inputs_embeds"][:, 1:], expected)
+            torch.testing.assert_close(call["encoder_hidden_states"], encoder[:, start:min(8, start + 5)])
 
     def test_all_encoder_adapters_select_gpt2_without_changing_the_encoder(self):
         tokenizer = types.SimpleNamespace(pad_token_id=0, cls_token_id=10, sep_token_id=11)

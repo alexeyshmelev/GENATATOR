@@ -107,10 +107,8 @@ class GPTExperimentConfigTests(unittest.TestCase):
                 mirror = _load(mirror_path)
                 gpt = mirror["model"]["gpt"]
                 self.assertEqual(gpt.pop("decoder_type"), "gpt2")
-                max_nt = max(d.get("max_nucleotides") or int(
-                    d["max_bpe_tokens"] * d["average_bpe_token_length"]
-                ) for d in (original["train_dataset"], original["eval_dataset"]))
-                self.assertEqual(gpt.pop("max_position_embeddings"), max_nt)
+                self.assertEqual(gpt.pop("max_position_embeddings"), 8192)
+                self.assertEqual(gpt["context_size"], 8192)
                 output = mirror["training"]["output_dir"]
                 self.assertNotIn(output, output_dirs)
                 self.assertNotEqual(output, original["training"]["output_dir"])

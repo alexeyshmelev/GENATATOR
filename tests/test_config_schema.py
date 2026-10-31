@@ -252,12 +252,7 @@ def test_all_shipped_training_configs_use_requested_contracts() -> None:
                 if path.stem.endswith("_gpt2"):
                     expected_gpt.update({
                         "decoder_type": "gpt2",
-                        "max_position_embeddings": max(
-                            int(dataset.get("max_nucleotides") or (
-                                dataset["max_bpe_tokens"] * dataset["average_bpe_token_length"]
-                            ))
-                            for dataset in (cfg["train_dataset"], cfg["eval_dataset"])
-                        ),
+                        "max_position_embeddings": 8192,
                     })
                 assert model["gpt"] == expected_gpt, path
 

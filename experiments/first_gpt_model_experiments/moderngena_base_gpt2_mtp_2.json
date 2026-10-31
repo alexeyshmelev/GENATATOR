@@ -22,7 +22,7 @@
       "add_encoder_to_decoder_input": true,
       "multi_token_prediction": 2,
       "decoder_type": "gpt2",
-      "max_position_embeddings": 73728
+      "max_position_embeddings": 8192
     }
   },
   "train_dataset": {
