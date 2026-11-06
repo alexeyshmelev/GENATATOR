@@ -9,12 +9,12 @@ tokens while expanding BPE states to nucleotides; ``nucleotide_mask`` then
 removes padded/uncovered nucleotide positions before every decoder call.
 
 The decoder deliberately models only two mutually exclusive internal tokens:
-``intron`` and ``exon``.  Training teacher forcing embeds the previous
-ground-truth class id, while validation and inference feed back the offset-1
-head's argmax.  The public output is adapted back to GENATATOR's established
-five-track order so shared metrics and post-processing remain unchanged; 5'
-UTR, 3' UTR, and CDS are unavailable from this decoder, and CDS is supplied by
-the existing inference heuristic.
+``intron`` and ``exon``.  Teacher forcing embeds the previous ground-truth
+class id, while inference feeds back the offset-1 head's argmax.  The public
+output is adapted back to GENATATOR's established five-track order so the
+shared validation and post-processing code can remain unchanged; 5' UTR,
+3' UTR, and CDS are unavailable from this decoder, and CDS is supplied by the
+existing inference heuristic.
 
 Optionally, one decoder state can predict several future tokens.  Each offset
 has an independent linear output head, but all heads share the same freshly
@@ -644,7 +644,7 @@ class T5GemmaSegmentationHead(nn.Module):
                 use_cache=True,
             )
             step_hidden = decoder_output.last_hidden_state[:, -1:, :]
-            # Auxiliary future-token heads are a training objective only.
+            # Auxiliary future-token heads contribute to the teacher-forced loss only.
             step_logits = self.classifier(step_hidden)
             logits.append(step_logits)
             previous_prediction = step_logits.argmax(dim=-1)
@@ -751,17 +751,13 @@ class T5GemmaSegmentationHead(nn.Module):
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
         """Return ``(loss, logits)`` with the repository's segmentation shape.
 
-        Training calls carrying labels use chunked teacher forcing.  Evaluation
-        is strictly autoregressive and must use :meth:`generate`; references are
-        compared with generated logits only after generation has completed.
+        Every call carrying labels uses chunked teacher forcing, irrespective of
+        ``module.training``.  Thus validation is the same single forward-pass
+        objective as training rather than a nucleotide-by-nucleotide decode.
+        Autoregressive decoding is reserved for label-free inference.
         """
 
         self._validate_inputs(encoder_embeddings, nucleotide_mask, labels, labels_mask)
-        if labels is not None and not self.training:
-            raise RuntimeError(
-                "GPT evaluation cannot consume labels or use teacher forcing; "
-                "call generate() without ground-truth tensors"
-            )
         if autoregressive is None:
             autoregressive = labels is None
         if not autoregressive and labels is None:
@@ -1012,7 +1008,7 @@ class GPT2SegmentationHead(T5GemmaSegmentationHead):
                 use_cache=True,
             )
             # Only the last query predicts the next class. Auxiliary MTP heads
-            # remain training-only and never provide generation feedback.
+            # contribute only to the teacher-forced loss.
             step_logits = self.classifier(decoder_output.last_hidden_state[:, -1:, :])
             logits.append(step_logits)
             previous_prediction = step_logits.argmax(dim=-1)

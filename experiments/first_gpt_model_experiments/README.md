@@ -14,10 +14,10 @@ loss weighting, and non-overlapping training chunks are copied unchanged. Omitte
 GPT-2 weights are freshly initialized, just as the Gemma decoder weights are;
 Gemma decoder checkpoints cannot be loaded into a GPT-2 decoder.
 
-## Training: non-overlapping chunks
+## Training and validation: non-overlapping chunks
 
-GPT-2 inherits Gemma's teacher-forcing implementation without changes. Training
-splits the nucleotide sequence into non-overlapping chunks of up to 8,192
+GPT-2 inherits Gemma's teacher-forcing implementation. Training and validation
+split the nucleotide sequence into non-overlapping chunks of up to 8,192
 positions. Each chunk receives BOS followed by its previous ground-truth
 classes, uses local positions starting at zero, and runs with `use_cache=False`.
 Causal attention prevents each next-token prediction from seeing its target.
@@ -63,8 +63,8 @@ After the first 8,192 inputs, every new generated class requires a full
 per step scales as O(C^2) and cross-attention as O(C*E), versus O(C) and O(E)
 for a single cached query (excluding projection costs). This is much slower,
 although parallel processing means it is not necessarily 8,192 times slower
-in wall-clock time. Training still needs one forward pass per non-overlapping
-chunk and does not incur this per-prediction recomputation.
+in wall-clock time. Training and validation need one forward pass per non-overlapping
+chunk and do not incur this per-prediction recomputation.
 
 Stock Transformers 4.55.4 allocates square Boolean causal buffers in each
 self- and cross-attention module. At 8,192 positions these consume about

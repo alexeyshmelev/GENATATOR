@@ -17,7 +17,6 @@ try:
     from genatator_core.train_common import (
         AtomicValidationIndexQueue,
         GenatatorTrainer,
-        _GPT_GROUND_TRUTH_INPUTS,
         _maybe_relaunch_gpt_training,
         gpt_torchrun_relaunch_command,
     )
@@ -134,57 +133,47 @@ class GPTDistributedValidationTests(unittest.TestCase):
             self.assertEqual(sorted(claimed), list(range(31)))
             self.assertEqual(len(claimed), len(set(claimed)))
 
-    def test_validation_calls_generate_without_any_ground_truth(self) -> None:
-        class GenerateOnlyModel:
-            def __init__(self):
-                self.kwargs = None
-
-            def __call__(self, **kwargs):
-                raise AssertionError("teacher-forced forward must never run")
-
-            def generate(self, **kwargs):
-                self.kwargs = kwargs
-                logits = torch.zeros((1, 3, 5), dtype=torch.float32)
-                logits[0, 0, INTRON_LABEL_INDEX] = 3.0
-                logits[0, 1, EXON_LABEL_INDEX] = 3.0
-                logits[0, 2, INTRON_LABEL_INDEX] = 3.0
-                return logits
-
-        labels = torch.zeros((1, 3, 5), dtype=torch.float32)
-        labels[0, 0, INTRON_LABEL_INDEX] = 1.0
-        labels[0, 1, EXON_LABEL_INDEX] = 1.0
-        labels[0, 2, INTRON_LABEL_INDEX] = 1.0
+    def test_validation_uses_labeled_forward_for_loss_and_interval_metrics(self) -> None:
+        labels = torch.zeros(1, 3, 5)
+        labels[0, :, INTRON_LABEL_INDEX] = torch.tensor([1.0, 0.0, 1.0])
+        labels[0, :, EXON_LABEL_INDEX] = torch.tensor([0.0, 1.0, 0.0])
         inputs = {
-            "input_ids": torch.tensor([[5, 6, 7]]),
-            "labels": torch.ones((1, 3, 5)),
-            "labels_mask": torch.ones((1, 3), dtype=torch.bool),
             "letter_level_labels": labels,
-            "letter_level_labels_mask": torch.ones((1, 3), dtype=torch.bool),
-            "pos_weight": torch.ones((1, 1, 5)),
+            "letter_level_labels_mask": torch.ones(1, 3, dtype=torch.bool),
         }
+        model = torch.nn.Module()
+
+        def forward(*, letter_level_labels, letter_level_labels_mask, autoregressive):
+            self.assertIs(letter_level_labels, labels)
+            self.assertIs(letter_level_labels_mask, inputs["letter_level_labels_mask"])
+            self.assertFalse(autoregressive)
+            self.assertFalse(model.training)
+            self.assertFalse(torch.is_grad_enabled())
+            return {"loss": torch.tensor(1.25), "logits": 10 * labels - 5}
+
+        model.forward = Mock(side_effect=forward)
         trainer = object.__new__(GenatatorTrainer)
         trainer.genatator_task = "segmentation"
-        model = GenerateOnlyModel()
+        trainer.model = model
+        trainer.state = SimpleNamespace(global_step=0)
+        trainer._gpt_validation_round = 0
+        trainer.data_collator = lambda batch: batch[0]
+        trainer._prepare_inputs = lambda batch: batch
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ, {"RANK": "0", "WORLD_SIZE": "1"}
+        ):
+            trainer.args = SimpleNamespace(output_dir=directory, per_device_eval_batch_size=1)
+            metrics = trainer._distributed_gpt_evaluate(eval_dataset=[inputs])
 
-        outputs = trainer._gpt_autoregressive_validation_outputs(model, inputs)
-
-        self.assertTrue(torch.isfinite(outputs["loss"]))
-        self.assertEqual(tuple(outputs["logits"].shape), (1, 3, 5))
-        self.assertIsNotNone(model.kwargs)
-        self.assertFalse(_GPT_GROUND_TRUTH_INPUTS.intersection(model.kwargs))
-        self.assertEqual(set(model.kwargs), {"input_ids"})
+        model.forward.assert_called_once()
+        self.assertEqual(metrics["eval_loss"], 1.25)
+        self.assertEqual(metrics["eval_interval_f1_exon"], 1.0)
 
     def test_validation_rejects_more_than_one_transcript_per_gpu(self) -> None:
         trainer = object.__new__(GenatatorTrainer)
-        trainer.genatator_task = "segmentation"
-        inputs = {
-            "input_ids": torch.ones((2, 3), dtype=torch.long),
-            "letter_level_labels": torch.zeros((2, 3, 5)),
-            "letter_level_labels_mask": torch.ones((2, 3), dtype=torch.bool),
-        }
-
-        with self.assertRaisesRegex(RuntimeError, "exactly one transcript per GPU"):
-            trainer._gpt_autoregressive_validation_outputs(Mock(), inputs)
+        trainer.args = SimpleNamespace(per_device_eval_batch_size=2)
+        with self.assertRaisesRegex(RuntimeError, "per_device_eval_batch_size=1"):
+            trainer._distributed_gpt_evaluate(eval_dataset=[{}])
 
     def test_rank_payload_merge_requires_every_transcript_exactly_once(self) -> None:
         trainer = object.__new__(GenatatorTrainer)

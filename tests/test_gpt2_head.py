@@ -282,8 +282,10 @@ class GPT2HeadTests(unittest.TestCase):
         output.loss.backward()
         self.assertIsNotNone(model.gpt_head.decoder.h[0].crossattention.c_attn.weight.grad)
         model.eval()
-        with self.assertRaisesRegex(RuntimeError, "cannot consume labels"):
-            model(**inputs)
+        with torch.no_grad():
+            evaluated = model(**inputs)
+        torch.testing.assert_close(evaluated.loss, output.loss)
+        torch.testing.assert_close(evaluated.logits, output.logits)
         generated = model.generate(**inputs)
         inputs["letter_level_labels"] = 1 - inputs["letter_level_labels"]
         torch.testing.assert_close(generated, model.generate(**inputs))

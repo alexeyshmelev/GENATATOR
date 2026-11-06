@@ -11,7 +11,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from filelock import FileLock
 from torch.utils.data import DataLoader, Sampler, SequentialSampler
 from tqdm.auto import tqdm
@@ -32,7 +31,6 @@ from .metrics_training import (
     sigmoid,
 )
 from .intervals import f1_from_counts, interval_counts
-from .gpt_head import EXON_LABEL_INDEX, INTRON_LABEL_INDEX
 from .model_builders import (
     build_model,
     normalize_memory_wrapper_config,
@@ -52,16 +50,6 @@ logger = logging.getLogger(__name__)
 
 
 _GPT_AUTO_TORCHRUN_ENV = "GENATATOR_GPT_AUTO_TORCHRUN"
-_GPT_GROUND_TRUTH_INPUTS = frozenset(
-    {
-        "labels",
-        "labels_mask",
-        "letter_level_labels",
-        "letter_level_labels_mask",
-        "pos_weight",
-        "transcript_type",
-    }
-)
 
 
 def gpt_torchrun_relaunch_command(
@@ -74,7 +62,7 @@ def gpt_torchrun_relaunch_command(
 ) -> list[str] | None:
     """Build the automatic one-process-per-GPU launch for GPT training.
 
-    GPT validation performs one autoregressive transcript at a time on each
+    GPT validation performs one transcript at a time on each
     rank.  A normal ``python segmentation/train.py`` invocation therefore has
     to become a local torchrun job before any run directory or model is built.
     ``torch.cuda.device_count()`` already respects ``CUDA_VISIBLE_DEVICES``.
@@ -548,84 +536,6 @@ class GenatatorTrainer(Trainer):
             dataset.release_finding_cache()
         return metrics
 
-    def _gpt_autoregressive_validation_outputs(
-        self,
-        model,
-        inputs: Dict[str, Any],
-    ) -> Dict[str, torch.Tensor]:
-        """Generate one transcript without exposing any reference to the model.
-
-        The returned loss is computed *after* autoregressive generation by
-        comparing generated exon/intron logits with the held-out labels.  The
-        labels never enter ``generate`` and therefore can never become decoder
-        context through teacher forcing.
-        """
-
-        if self.genatator_task != "segmentation":
-            raise RuntimeError("GPT validation is implemented only for segmentation")
-        batch_size = self._batch_size_from_inputs(inputs)
-        if batch_size != 1:
-            raise RuntimeError(
-                "GPT validation requires exactly one transcript per GPU; "
-                f"received per-device batch size {batch_size}"
-            )
-        labels, labels_mask = self._labels_and_mask_from_inputs(
-            self.genatator_task,
-            inputs,
-        )
-        generation_inputs = {
-            key: value
-            for key, value in inputs.items()
-            if key not in _GPT_GROUND_TRUTH_INPUTS
-        }
-        leaked = _GPT_GROUND_TRUTH_INPUTS.intersection(generation_inputs)
-        if leaked:
-            raise RuntimeError(
-                "GPT validation attempted to expose ground truth to generate: "
-                f"{sorted(leaked)}"
-            )
-        logits = model.generate(**generation_inputs)
-        if not isinstance(logits, torch.Tensor):
-            raise RuntimeError("GPT generate() must return a logits tensor")
-        if tuple(logits.shape) != tuple(labels.shape):
-            raise RuntimeError(
-                "GPT validation logits must align with held-out segmentation labels; "
-                f"got logits={tuple(logits.shape)} labels={tuple(labels.shape)}"
-            )
-
-        valid_mask = labels_mask.bool()
-        class_targets = torch.stack(
-            (
-                labels[..., INTRON_LABEL_INDEX],
-                labels[..., EXON_LABEL_INDEX],
-            ),
-            dim=-1,
-        )
-        active = class_targets.ge(0.5).sum(dim=-1)
-        malformed = valid_mask & active.ne(1)
-        if bool(malformed.any()):
-            raise RuntimeError(
-                "GPT validation labels must contain exactly one active exon/intron "
-                f"class at every valid nucleotide; found {int(malformed.sum().item())} "
-                "malformed positions"
-            )
-        if not bool(valid_mask.any()):
-            raise RuntimeError("GPT validation transcript has no valid labeled nucleotides")
-        categorical_targets = class_targets.argmax(dim=-1).long()
-        categorical_logits = torch.stack(
-            (
-                logits[..., INTRON_LABEL_INDEX],
-                logits[..., EXON_LABEL_INDEX],
-            ),
-            dim=-1,
-        )
-        loss = F.cross_entropy(
-            categorical_logits[valid_mask].float(),
-            categorical_targets[valid_mask],
-            reduction="mean",
-        )
-        return {"loss": loss, "logits": logits}
-
     @staticmethod
     def _gpt_validation_state_payload(
         state: Dict[str, Any],
@@ -710,7 +620,7 @@ class GenatatorTrainer(Trainer):
         eval_dataset=None,
         metric_key_prefix: str = "eval",
     ) -> Dict[str, float]:
-        """Dynamically schedule one autoregressive transcript per GPU rank."""
+        """Dynamically schedule one transcript per GPU rank."""
 
         dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
         if dataset is None:
@@ -799,7 +709,7 @@ class GenatatorTrainer(Trainer):
         )
         logger.info(
             "[gpt_distributed_validation] rank=%d local_rank=%d world_size=%d "
-            "dataset_size=%d per_device_batch_size=1 teacher_forcing=false",
+            "dataset_size=%d per_device_batch_size=1 teacher_forcing=true",
             rank,
             local_rank,
             world_size,
@@ -817,7 +727,7 @@ class GenatatorTrainer(Trainer):
                         raise RuntimeError(
                             "GPT validation collator violated per-device batch_size=1"
                         )
-                    outputs = self._gpt_autoregressive_validation_outputs(model, inputs)
+                    outputs = model(**inputs, autoregressive=False)
                     self._update_streaming_state(state, inputs, outputs)
                     claimed_indices.append(index)
                     del outputs, inputs, batch
@@ -1320,7 +1230,7 @@ def train_from_config(config_path: str, task: str | None = None) -> None:
     if model_cfg.get("family") == "gpt":
         logger.info(
             "[training.evaluation_memory] gpt_dynamic_distributed_validation=true; "
-            "per_device_batch_size=1 teacher_forcing=false; no distributed all-gather "
+            "per_device_batch_size=1 teacher_forcing=true; no distributed all-gather "
             "of validation logits/labels"
         )
     else:

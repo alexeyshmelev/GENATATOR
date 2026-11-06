@@ -280,7 +280,7 @@ def _predict_once(
                 offset_mapping = batch.pop("offset_mapping")
                 batch.pop("reverse_complement")
                 tensor_batch = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
-                # GPT validation and inference are strictly autoregressive. The
+                # GPT inference is strictly autoregressive. The
                 # materialized benchmark batch still contains reference labels,
                 # so dispatch through generate() to keep them out of decoder
                 # context.
