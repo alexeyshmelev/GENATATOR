@@ -101,6 +101,8 @@ class T5GemmaSegmentationHead(nn.Module):
     aligned projected encoder state.  Cross-attention is unchanged.
     """
 
+    _max_decoder_layers = 8
+
     def __init__(
         self,
         encoder_dim: int,
@@ -137,10 +139,10 @@ class T5GemmaSegmentationHead(nn.Module):
                 "The GPT compatibility interface requires exactly five segmentation "
                 f"labels, got {num_labels}"
             )
-        if not 2 <= num_decoder_layers <= 4:
+        if not 2 <= num_decoder_layers <= self._max_decoder_layers:
             raise RuntimeError(
-                "The segmentation GPT head must remain shallow: "
-                f"num_decoder_layers must be in [2, 4], got {num_decoder_layers}"
+                f"num_decoder_layers must be in [2, {self._max_decoder_layers}], "
+                f"got {num_decoder_layers}"
             )
         if context_size <= 0:
             raise RuntimeError(f"context_size must be positive, got {context_size}")
@@ -883,6 +885,8 @@ class GPT2SegmentationHead(T5GemmaSegmentationHead):
     history; BOS is inserted only once per sample. Non-overlapping teacher
     forcing, MTP heads and losses are inherited unchanged from Gemma.
     """
+
+    _max_decoder_layers = 4
 
     def __init__(self, *args, max_position_embeddings: int | None = None, **kwargs):
         context_size = int(kwargs.get("context_size", DEFAULT_GPT_CONTEXT_SIZE))

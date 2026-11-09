@@ -396,8 +396,8 @@ Training and validation loss include all configured heads. Interval metrics use
 head 1. Standalone inference feeds back only head 1's argmax and advances by
 one nucleotide.
 
-The decoder remains intentionally shallow: two layers and width 256 by default,
-with two through four layers permitted. Context size, lookahead, width,
+The Gemma decoder defaults to two layers and width 256,
+with two through eight layers permitted. Context size, lookahead, width,
 intermediate size, attention heads, dropout, and multi-token prediction depth
 are all configurable inside the model.gpt object. The implementation uses the
 internal T5GemmaDecoder API and therefore requires transformers>=4.53.0.

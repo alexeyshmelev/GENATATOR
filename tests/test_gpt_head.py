@@ -578,16 +578,11 @@ class T5GemmaSegmentationHeadTests(unittest.TestCase):
         self.assertEqual(len(projected.classifiers), 1)
 
         decoder = RecordingDecoder(4)
-        with self.assertRaisesRegex(RuntimeError, "must be in \\[2, 4\\]"):
-            T5GemmaSegmentationHead(
-                encoder_dim=2,
-                decoder_hidden_size=4,
-                num_decoder_layers=5,
-                num_attention_heads=2,
-                context_size=3,
-                encoder_lookahead=3,
-                decoder=decoder,
-            )
+        for depth in (1, 9):
+            with self.subTest(depth=depth), self.assertRaisesRegex(
+                RuntimeError, rf"num_decoder_layers must be in \[2, 8\], got {depth}"
+            ):
+                T5GemmaSegmentationHead(encoder_dim=4, num_decoder_layers=depth)
         with self.assertRaisesRegex(RuntimeError, "positive integer"):
             T5GemmaSegmentationHead(
                 encoder_dim=2,
@@ -612,19 +607,20 @@ class T5GemmaSegmentationHeadTests(unittest.TestCase):
             )
 
     @unittest.skipIf(T5GemmaDecoder is None, "transformers>=4.53 with T5Gemma is not installed")
-    def test_official_tiny_decoder_runs_teacher_forcing_and_generation(self):
+    def test_official_eight_layer_decoder_runs_teacher_forcing_and_generation(self):
         head = T5GemmaSegmentationHead(
             encoder_dim=8,
             num_labels=5,
             decoder_hidden_size=16,
             decoder_intermediate_size=32,
-            num_decoder_layers=2,
+            num_decoder_layers=8,
             num_attention_heads=2,
             num_key_value_heads=1,
             context_size=4,
             encoder_lookahead=4,
             multi_token_prediction=3,
         )
+        self.assertEqual(len(head.decoder.layers), 8)
         self.assertTrue(
             all(layer.gradient_checkpointing for layer in head.decoder.layers)
         )
