@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 from typing import Any, Dict
 import inspect
 import json
@@ -8,10 +9,10 @@ import os
 import sys
 import time
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 import torch
-from filelock import FileLock
 from torch.utils.data import DataLoader, Sampler, SequentialSampler
 from tqdm.auto import tqdm
 from transformers import EarlyStoppingCallback, Trainer, TrainingArguments
@@ -121,52 +122,15 @@ def _maybe_relaunch_gpt_training(model_cfg: Dict[str, Any], config_path: str | P
     os.execvpe(command[0], command, environment)
 
 
-class AtomicValidationIndexQueue:
-    """A filesystem-backed dynamic queue shared by GPT validation ranks."""
+def _claim_gpt_validation_indices(store: torch.distributed.Store, key: str, total: int) -> Iterator[int]:
+    """Claim an index with one atomic operation on the torchrun rendezvous store."""
 
-    def __init__(self, root: str | Path, *, total: int, timeout_seconds: float):
-        self.root = Path(root)
-        self.total = int(total)
-        self.timeout_seconds = float(timeout_seconds)
-        self.counter_path = self.root / "counter.json"
-        self.lock_path = self.root / "counter.lock"
-
-    @classmethod
-    def create(
-        cls,
-        root: str | Path,
-        *,
-        total: int,
-        timeout_seconds: float,
-    ) -> "AtomicValidationIndexQueue":
-        queue = cls(root, total=total, timeout_seconds=timeout_seconds)
-        queue.root.mkdir(parents=True, exist_ok=False)
-        atomic_save_json(
-            {"next_index": 0, "total": queue.total},
-            queue.counter_path,
-        )
-        return queue
-
-    def claim(self, rank: int) -> int | None:
-        """Atomically claim the next transcript, or return ``None`` when empty."""
-
-        with FileLock(str(self.lock_path), timeout=self.timeout_seconds):
-            with open(self.counter_path, encoding="utf-8") as fh:
-                counter = json.load(fh)
-            if int(counter.get("total", -1)) != self.total:
-                raise RuntimeError("GPT validation queue size changed while it was active")
-            index = int(counter["next_index"])
-            if index >= self.total:
-                return None
-            atomic_save_json(
-                {
-                    "last_claimed_by_rank": int(rank),
-                    "next_index": index + 1,
-                    "total": self.total,
-                },
-                self.counter_path,
-            )
-            return index
+    while True:
+        # Store.add initializes an absent counter to zero and returns its NEW value.
+        index = store.add(key, 1) - 1
+        if index >= total:
+            return
+        yield index
 
 
 def filter_training_logs(logs: Dict[str, Any], task: str) -> Dict[str, Any]:
@@ -649,26 +613,19 @@ class GenatatorTrainer(Trainer):
         ready_path = queue_root / "ready.json"
         results_dir = queue_root / "results"
         errors_dir = queue_root / "errors"
-        work_dir = queue_root / "work"
 
         if rank == 0:
             queue_root.mkdir(parents=True, exist_ok=False)
             results_dir.mkdir()
             errors_dir.mkdir()
-            queue = AtomicValidationIndexQueue.create(
-                work_dir,
-                total=dataset_size,
-                timeout_seconds=timeout_seconds,
-            )
-            atomic_save_json(
-                {
-                    "dataset_size": dataset_size,
-                    "round": round_index,
-                    "step": step,
-                    "world_size": world_size,
-                },
-                ready_path,
-            )
+            ready = {
+                "dataset_size": dataset_size,
+                "round": round_index,
+                "step": step,
+                "world_size": world_size,
+                "claim_key": f"genatator/gpt_validation/{uuid4().hex}",
+            }
+            atomic_save_json(ready, ready_path)
         else:
             deadline = time.monotonic() + timeout_seconds
             ready = None
@@ -689,11 +646,15 @@ class GenatatorTrainer(Trainer):
                 time.sleep(0.1)
             if ready is None:
                 raise TimeoutError(f"Timed out waiting for GPT validation queue {ready_path}")
-            queue = AtomicValidationIndexQueue(
-                work_dir,
-                total=dataset_size,
-                timeout_seconds=timeout_seconds,
-            )
+
+        if world_size == 1:
+            indices = range(dataset_size)
+        else:
+            dist = torch.distributed
+            if dist.get_world_size() != world_size:
+                raise RuntimeError("Multi-rank GPT validation requires the training process group")
+            store = dist.distributed_c10d._get_default_store()
+            indices = _claim_gpt_validation_indices(store, ready["claim_key"], dataset_size)
 
         model = (
             self.accelerator.unwrap_model(self.model)
@@ -717,10 +678,7 @@ class GenatatorTrainer(Trainer):
         )
         try:
             with torch.no_grad():
-                while True:
-                    index = queue.claim(rank)
-                    if index is None:
-                        break
+                for index in indices:
                     batch = self.data_collator([dataset[index]])
                     inputs = self._prepare_inputs(batch)
                     if self._batch_size_from_inputs(inputs) != 1:

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
-import threading
 import unittest
-from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -15,7 +15,7 @@ try:
 
     from genatator_core.gpt_head import EXON_LABEL_INDEX, INTRON_LABEL_INDEX
     from genatator_core.train_common import (
-        AtomicValidationIndexQueue,
+        _claim_gpt_validation_indices,
         GenatatorTrainer,
         _maybe_relaunch_gpt_training,
         gpt_torchrun_relaunch_command,
@@ -23,6 +23,52 @@ try:
 except ImportError:
     torch = None
     GenatatorTrainer = None
+
+
+def _run_validation_rank(rank, port, directory):
+    dist = torch.distributed
+    timeout = timedelta(seconds=30)
+    store = dist.TCPStore("127.0.0.1", port, is_master=False, timeout=timeout)
+    # Use real independent TCPStore clients. Validation needs only the store,
+    # so the test does not require NCCL/Gloo or a GPU process group.
+    with (
+        patch.object(dist, "get_world_size", return_value=2),
+        patch.object(dist.distributed_c10d, "_get_default_store", return_value=store),
+        patch("filelock.FileLock.acquire", side_effect=AssertionError("filesystem lock used")),
+        patch.dict(os.environ, {"RANK": str(rank), "WORLD_SIZE": "2"}),
+    ):
+        trainer = object.__new__(GenatatorTrainer)
+        trainer.genatator_task = "segmentation"
+        trainer.model = torch.nn.Module()
+        trainer.state = SimpleNamespace(global_step=7)
+        trainer._gpt_validation_round = 0
+        trainer.args = SimpleNamespace(output_dir=directory, per_device_eval_batch_size=1,
+                                       eval_rank0_timeout_seconds=30)
+        trainer.data_collator = lambda batch: batch[0]
+        trainer._prepare_inputs = lambda batch: batch
+        labels = torch.zeros(1, 1, 5)
+        labels[..., EXON_LABEL_INDEX] = 1
+        for round_index, size in enumerate((17, 1)):
+            seen = []
+
+            def forward(input_ids, letter_level_labels, **kwargs):
+                if size > 1 and not seen:
+                    # Make both ranks claim a live item before either can drain the queue.
+                    store.set(f"first_claim/{rank}", "1")
+                    store.wait(["first_claim/0", "first_claim/1"])
+                seen.append(input_ids.item())
+                return {"loss": input_ids.float().mean(), "logits": 10 * letter_level_labels - 5}
+
+            trainer.model.forward = forward
+            dataset = [{"input_ids": torch.tensor([[i]]), "letter_level_labels": labels,
+                        "letter_level_labels_mask": torch.ones(1, 1, dtype=torch.bool)}
+                       for i in range(size)]
+            metrics = trainer._distributed_gpt_evaluate(eval_dataset=dataset)
+            results = (Path(directory) / "gpt_validation_queue" /
+                       f"eval_step_7_round_{round_index}" / "results")
+            local = json.loads((results / f"rank_{rank:06d}.json").read_text())
+            if local["claimed_indices"] != seen or metrics["eval_loss"] != (size - 1) / 2:
+                raise AssertionError(f"rank {rank}: seen={seen}, payload={local}, metrics={metrics}")
 
 
 @unittest.skipIf(torch is None, "torch/transformers are not installed")
@@ -92,46 +138,30 @@ class GPTDistributedValidationTests(unittest.TestCase):
         repository_root = str(Path(__file__).resolve().parent.parent)
         self.assertEqual(environment["PYTHONPATH"], repository_root)
 
+    @unittest.skipUnless(torch is not None and torch.distributed.is_available(), "requires c10d")
     def test_atomic_queue_assigns_next_transcript_to_first_available_rank(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            queue = AtomicValidationIndexQueue.create(
-                Path(temporary) / "queue",
-                total=5,
-                timeout_seconds=5.0,
-            )
+        store = torch.distributed.HashStore()
+        first, second = (_claim_gpt_validation_indices(store, "eval", 5) for _ in range(2))
+        self.assertEqual(next(first), 0)
+        self.assertEqual(next(second), 1)
+        self.assertEqual(next(second), 2)
+        self.assertEqual(next(first), 3)
+        self.assertEqual(list(second), [4])
+        self.assertEqual(list(first), [])
 
-            self.assertEqual(queue.claim(rank=0), 0)
-            self.assertEqual(queue.claim(rank=1), 1)
-            # Rank 1 finished first, so it claims the next global transcript;
-            # indices are not pre-sharded by rank.
-            self.assertEqual(queue.claim(rank=1), 2)
-            self.assertEqual(queue.claim(rank=0), 3)
-            self.assertEqual(queue.claim(rank=1), 4)
-            self.assertIsNone(queue.claim(rank=0))
-
-    def test_atomic_queue_claims_every_index_once_under_concurrency(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            queue = AtomicValidationIndexQueue.create(
-                Path(temporary) / "queue",
-                total=31,
-                timeout_seconds=5.0,
-            )
-            claimed = []
-            claimed_lock = threading.Lock()
-
-            def consume(rank: int) -> None:
-                while True:
-                    index = queue.claim(rank)
-                    if index is None:
-                        return
-                    with claimed_lock:
-                        claimed.append(index)
-
-            with ThreadPoolExecutor(max_workers=4) as pool:
-                list(pool.map(consume, range(4)))
-
-            self.assertEqual(sorted(claimed), list(range(31)))
-            self.assertEqual(len(claimed), len(set(claimed)))
+    @unittest.skipUnless(torch is not None and torch.distributed.is_available(), "requires c10d")
+    def test_two_validation_processes_cover_each_index_once_in_each_round(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            server = torch.distributed.TCPStore("127.0.0.1", 0, is_master=True)
+            torch.multiprocessing.spawn(_run_validation_rank, args=(server.port, directory),
+                                        nprocs=2)
+            for round_index, size in enumerate((17, 1)):
+                results = (Path(directory) / "gpt_validation_queue" /
+                           f"eval_step_7_round_{round_index}" / "results")
+                rank_indices = [json.loads(path.read_text())["claimed_indices"]
+                                for path in sorted(results.glob("rank_*.json"))]
+                self.assertEqual(len(rank_indices), 2)
+                self.assertEqual(sorted(rank_indices[0] + rank_indices[1]), list(range(size)))
 
     def test_validation_uses_labeled_forward_for_loss_and_interval_metrics(self) -> None:
         labels = torch.zeros(1, 3, 5)

@@ -123,8 +123,9 @@ each predicted argmax token becomes the decoder input for the next nucleotide.
 GPT validation always uses a per-GPU batch size of one. A normal GPT training
 command detects all visible CUDA devices and automatically relaunches with one
 local rank per GPU when needed. During validation, those ranks dynamically
-claim complete transcripts from a shared queue, so a GPU that finishes its
-current transcript immediately takes the next unclaimed one. Non-GPT
+claim dataset indices by atomically incrementing a counter in the torchrun
+rendezvous store. A GPU takes the next available item when it finishes its
+current one; assigning work does not require a shared filesystem lock. Non-GPT
 validation remains the original sequential rank-0-only pass. Each GPT rank
 runs a labeled forward pass in evaluation mode, with gradients disabled.
 GPT validation and checkpoint selection use exon interval F1; the sequence-based
